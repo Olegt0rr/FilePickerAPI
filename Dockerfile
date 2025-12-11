@@ -19,7 +19,7 @@ COPY --from=builder /root/.local /root/.local
 # Copy application code
 COPY main.py ./
 
-# Create files directory
+# Create files directory (fallback if no volume is mounted)
 RUN mkdir -p /app/files
 
 # Make sure scripts in .local are usable
