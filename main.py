@@ -70,11 +70,12 @@ async def list_files():
     file_list = []
     try:
         for item in files_path.iterdir():
+            is_file = item.is_file()
             file_list.append(
                 FileInfo(
                     name=item.name,
-                    size=item.stat().st_size if item.is_file() else 0,
-                    is_file=item.is_file()
+                    size=item.stat().st_size if is_file else 0,
+                    is_file=is_file
                 )
             )
     except Exception as e:
