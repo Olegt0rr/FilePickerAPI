@@ -50,7 +50,12 @@ cd FilePickerAPI
 
 2. Install dependencies:
 ```bash
-pip install -r requirements.txt
+pip install fastapi==0.104.1 uvicorn[standard]==0.24.0 pydantic==2.5.0
+```
+
+Or using the project configuration:
+```bash
+pip install -e .
 ```
 
 3. Run the application:
@@ -116,16 +121,24 @@ The project includes comprehensive test coverage with **100% code coverage**. To
 
 ```bash
 # Install development dependencies
-pip install -r requirements-dev.txt
+pip install pytest==7.4.3 httpx==0.25.2 pytest-cov==4.1.0 ruff==0.1.9
+
+# Run linting checks
+ruff check main.py test_main.py
+ruff format --check main.py test_main.py
 
 # Run tests
 pytest
 
-# Run tests with coverage report
-pytest --cov=main --cov-report=html
+# Run tests with coverage report (already included in pytest.ini config)
 ```
 
-The test suite includes 31 tests covering:
+All configuration is managed through `pyproject.toml`:
+- Dependencies and dev dependencies
+- pytest configuration with coverage settings
+- ruff linter configuration with "ALL" rules
+
+The test suite includes 29 tests covering:
 - All API endpoints (root, list files, download file)
 - Security features (directory traversal protection)
 - CORS configuration
