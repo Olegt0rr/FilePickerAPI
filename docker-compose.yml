@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  filepicker-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount a directory for files
+      - ./files:/app/files
+    environment:
+      # Override these as needed
+      - FILES_DIRECTORY=/app/files
+      - CORS_ORIGINS=*
+    restart: unless-stopped
