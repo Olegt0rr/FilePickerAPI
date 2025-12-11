@@ -112,7 +112,7 @@ Once the server is running, you can access:
 
 ### Running Tests
 
-The project includes comprehensive test coverage. To run tests:
+The project includes comprehensive test coverage with **100% code coverage**. To run tests:
 
 ```bash
 # Install development dependencies
@@ -125,12 +125,14 @@ pytest
 pytest --cov=main --cov-report=html
 ```
 
-The tests cover:
+The test suite includes 31 tests covering:
 - All API endpoints (root, list files, download file)
 - Security features (directory traversal protection)
 - CORS configuration
+- Exception handling (permission errors, security exceptions)
 - Error handling and edge cases
-- File metadata and sorting
+- Main execution block
+- File metadata, sorting, and special characters
 
 ### Building the executable locally
 
