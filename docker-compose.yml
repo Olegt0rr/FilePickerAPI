@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  filepicker-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount a directory for files
+      - ./files:/app/files
+    environment:
+      # Override these as needed
+      - FILES_DIRECTORY=/app/files
+      # WARNING: CORS_ORIGINS=* allows all origins. Change for production!
+      # Example: CORS_ORIGINS=http://localhost:3000,https://yourdomain.com
+      - CORS_ORIGINS=*
+    restart: unless-stopped

@@ -65,6 +65,41 @@ python main.py
 
 API будет доступен по адресу `http://localhost:8000`
 
+### Запуск с Docker
+
+1. Клонируйте репозиторий:
+```bash
+git clone https://github.com/Olegt0rr/FilePickerAPI.git
+cd FilePickerAPI
+```
+
+2. Запустите с помощью Docker Compose:
+```bash
+docker-compose up -d
+```
+
+Или соберите и запустите вручную:
+```bash
+# Собрать образ
+docker build -t filepicker-api .
+
+# Запустить контейнер (Linux/Mac)
+docker run -d -p 8000:8000 -v $(pwd)/files:/app/files filepicker-api
+
+# Запустить контейнер (Windows PowerShell)
+docker run -d -p 8000:8000 -v ${PWD}/files:/app/files filepicker-api
+
+# Запустить контейнер (Windows CMD)
+docker run -d -p 8000:8000 -v %cd%/files:/app/files filepicker-api
+```
+
+API будет доступен по адресу `http://localhost:8000`
+
+**Примечания по Docker:**
+- Директория `./files` монтируется как том для хранения файлов
+- Порт `8000` пробрасывается на хост
+- Переменные окружения можно настроить в `docker-compose.yml` или передать через `-e` в `docker run`
+
 ### Использование Windows исполняемого файла
 
 1. Скачайте последний `FilePickerAPI.exe` из [Releases](../../releases/latest)
