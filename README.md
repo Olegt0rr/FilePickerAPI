@@ -86,6 +86,22 @@ set FILES_DIRECTORY=C:\path\to\your\files
 FilePickerAPI.exe
 ```
 
+### CORS Origins
+
+By default, CORS is enabled for all origins (`*`). For production use, you should restrict this to specific domains by setting the `CORS_ORIGINS` environment variable with comma-separated origins:
+
+**Linux/Mac:**
+```bash
+export CORS_ORIGINS="http://localhost:3000,https://yourdomain.com"
+python main.py
+```
+
+**Windows:**
+```cmd
+set CORS_ORIGINS=http://localhost:3000,https://yourdomain.com
+FilePickerAPI.exe
+```
+
 ## Development
 
 ### API Documentation

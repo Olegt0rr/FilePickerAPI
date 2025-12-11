@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 # Configuration
 FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
 app = FastAPI(
     title="File Picker API",
@@ -23,7 +24,7 @@ app = FastAPI(
 # Enable CORS for frontend applications
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -93,10 +94,20 @@ async def get_file(filename: str):
         File response with the requested file
     """
     # Security: prevent directory traversal
-    if ".." in filename or "/" in filename or "\\" in filename:
+    # Get absolute paths and ensure the file is within the allowed directory
+    base_dir = os.path.abspath(FILES_DIRECTORY)
+    requested_path = os.path.abspath(os.path.join(FILES_DIRECTORY, filename))
+    
+    # Verify the resolved path is within the base directory
+    try:
+        os.path.commonpath([base_dir, requested_path])
+    except ValueError:
         raise HTTPException(status_code=400, detail="Invalid filename")
     
-    file_path = Path(FILES_DIRECTORY) / filename
+    if not requested_path.startswith(base_dir + os.sep) and requested_path != base_dir:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    
+    file_path = Path(requested_path)
     
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -106,7 +117,7 @@ async def get_file(filename: str):
     
     return FileResponse(
         path=file_path,
-        filename=filename,
+        filename=os.path.basename(filename),
         media_type="application/octet-stream"
     )
 
