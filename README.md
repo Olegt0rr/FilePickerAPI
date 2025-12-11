@@ -110,6 +110,28 @@ Once the server is running, you can access:
 - Interactive API docs (Swagger UI): `http://localhost:8000/docs`
 - Alternative API docs (ReDoc): `http://localhost:8000/redoc`
 
+### Running Tests
+
+The project includes comprehensive test coverage. To run tests:
+
+```bash
+# Install development dependencies
+pip install -r requirements-dev.txt
+
+# Run tests
+pytest
+
+# Run tests with coverage report
+pytest --cov=main --cov-report=html
+```
+
+The tests cover:
+- All API endpoints (root, list files, download file)
+- Security features (directory traversal protection)
+- CORS configuration
+- Error handling and edge cases
+- File metadata and sorting
+
 ### Building the executable locally
 
 ```bash
@@ -121,12 +143,20 @@ The executable will be created in the `dist/` directory.
 
 ## GitHub Actions
 
-The repository includes a GitHub Action workflow that automatically builds a Windows executable on:
+The repository includes a GitHub Action workflow that automatically:
+- Runs the test suite on Ubuntu
+- Builds a Windows executable (only if tests pass)
+- Uploads test coverage reports
+- Uploads the Windows executable as an artifact
+
+Workflow triggers:
 - Push to main/master branch
 - Pull requests to main/master branch
 - Manual workflow dispatch
 
-The built executable is uploaded as an artifact and retained for 30 days.
+Artifacts:
+- Windows executable: retained for 30 days
+- Coverage report: retained for 7 days
 
 ## Security
 

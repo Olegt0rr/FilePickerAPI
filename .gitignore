@@ -41,3 +41,9 @@ Thumbs.db
 files/
 *.exe
 *.spec
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
