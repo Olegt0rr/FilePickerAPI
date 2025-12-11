@@ -13,7 +13,8 @@ from pydantic import BaseModel
 
 # Configuration
 FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+cors_origins_str = os.getenv("CORS_ORIGINS", "*")
+CORS_ORIGINS = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()]
 
 app = FastAPI(
     title="File Picker API",
@@ -104,9 +105,6 @@ async def get_file(filename: str):
         if common_path != base_dir:
             raise HTTPException(status_code=400, detail="Invalid filename")
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    
-    if not requested_path.startswith(base_dir + os.sep) and requested_path != base_dir:
         raise HTTPException(status_code=400, detail="Invalid filename")
     
     file_path = Path(requested_path)
