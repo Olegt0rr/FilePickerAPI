@@ -1,5 +1,5 @@
 """
-FastAPI application for file listing and downloading.
+FastAPI приложение для просмотра списка файлов и их загрузки.
 """
 import os
 from pathlib import Path
@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
-# Configuration
+# Конфигурация
 FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
 cors_origins_str = os.getenv("CORS_ORIGINS", "*")
 CORS_ORIGINS = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()] or ["*"]
@@ -22,7 +22,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for frontend applications
+# Включение CORS для фронтенд-приложений
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -33,7 +33,7 @@ app.add_middleware(
 
 
 class FileInfo(BaseModel):
-    """File information model."""
+    """Модель информации о файле."""
     name: str
     size: int
     is_file: bool
@@ -41,7 +41,7 @@ class FileInfo(BaseModel):
 
 @app.get("/")
 async def root():
-    """Root endpoint."""
+    """Корневая конечная точка."""
     return {
         "message": "File Picker API",
         "endpoints": {
@@ -54,10 +54,10 @@ async def root():
 @app.get("/files", response_model=List[FileInfo])
 async def list_files():
     """
-    List all files in the configured directory.
+    Получить список всех файлов в настроенной директории.
     
     Returns:
-        List of file information objects
+        Список объектов с информацией о файлах
     """
     files_path = Path(FILES_DIRECTORY)
     
@@ -87,20 +87,20 @@ async def list_files():
 @app.get("/files/{filename}")
 async def get_file(filename: str):
     """
-    Download a specific file from the configured directory.
+    Скачать определенный файл из настроенной директории.
     
     Args:
-        filename: Name of the file to download
+        filename: Имя файла для загрузки
         
     Returns:
-        File response with the requested file
+        Ответ с запрашиваемым файлом
     """
-    # Security: prevent directory traversal
-    # Get absolute paths and ensure the file is within the allowed directory
+    # Безопасность: предотвращение обхода директорий
+    # Получаем абсолютные пути и проверяем, что файл находится в разрешенной директории
     base_dir = os.path.abspath(FILES_DIRECTORY)
     requested_path = os.path.abspath(os.path.join(FILES_DIRECTORY, filename))
     
-    # Verify the resolved path is within the base directory
+    # Проверяем, что разрешенный путь находится внутри базовой директории
     try:
         common_path = os.path.commonpath([base_dir, requested_path])
         if common_path != base_dir:
@@ -126,7 +126,7 @@ async def get_file(filename: str):
 if __name__ == "__main__":
     import uvicorn
     
-    # Create files directory if it doesn't exist
+    # Создаем директорию для файлов, если она не существует
     Path(FILES_DIRECTORY).mkdir(parents=True, exist_ok=True)
     
     uvicorn.run(app, host="0.0.0.0", port=8000)

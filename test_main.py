@@ -1,5 +1,5 @@
 """
-Comprehensive tests for the File Picker API.
+Комплексные тесты для File Picker API.
 """
 import os
 import sys
@@ -14,7 +14,7 @@ from main import app, FILES_DIRECTORY
 
 
 def reload_app():
-    """Helper function to reload the main module with updated environment variables."""
+    """Вспомогательная функция для перезагрузки главного модуля с обновленными переменными окружения."""
     if 'main' in sys.modules:
         importlib.reload(sys.modules['main'])
     from main import app as test_app
@@ -23,9 +23,9 @@ def reload_app():
 
 @pytest.fixture
 def test_files_dir():
-    """Create a temporary directory with test files."""
+    """Создать временную директорию с тестовыми файлами."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Create test files
+        # Создаем тестовые файлы
         test_file_1 = Path(tmpdir) / "test1.txt"
         test_file_1.write_text("Test content 1")
         
@@ -35,7 +35,7 @@ def test_files_dir():
         test_file_3 = Path(tmpdir) / "document.pdf"
         test_file_3.write_bytes(b"PDF content here")
         
-        # Create a subdirectory
+        # Создаем поддиректорию
         subdir = Path(tmpdir) / "subdir"
         subdir.mkdir()
         
@@ -44,21 +44,21 @@ def test_files_dir():
 
 @pytest.fixture
 def client(test_files_dir, monkeypatch):
-    """Create a test client with a temporary files directory."""
-    # Set environment variable before importing
+    """Создать тестовый клиент с временной директорией файлов."""
+    # Устанавливаем переменную окружения перед импортом
     monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
     monkeypatch.setenv("CORS_ORIGINS", "*")
     
-    # Force reload of the main module to pick up new env vars
+    # Принудительно перезагружаем главный модуль для применения новых переменных окружения
     test_app = reload_app()
     return TestClient(test_app)
 
 
 class TestRootEndpoint:
-    """Tests for the root endpoint."""
+    """Тесты для корневой конечной точки."""
     
     def test_root_returns_api_info(self, client):
-        """Test that root endpoint returns API information."""
+        """Проверить, что корневая конечная точка возвращает информацию об API."""
         response = client.get("/")
         assert response.status_code == 200
         data = response.json()
@@ -70,48 +70,48 @@ class TestRootEndpoint:
 
 
 class TestListFilesEndpoint:
-    """Tests for the list files endpoint."""
+    """Тесты для конечной точки списка файлов."""
     
     def test_list_files_success(self, client):
-        """Test that list files returns correct file information."""
+        """Проверить, что список файлов возвращает корректную информацию о файлах."""
         response = client.get("/files")
         assert response.status_code == 200
         data = response.json()
         
-        # Should return a list
+        # Должен вернуть список
         assert isinstance(data, list)
-        assert len(data) == 4  # 3 files + 1 subdirectory
+        assert len(data) == 4  # 3 файла + 1 поддиректория
         
-        # Check that files are sorted by name
+        # Проверяем, что файлы отсортированы по имени
         names = [item["name"] for item in data]
         assert names == sorted(names)
         
-        # Check file structure
+        # Проверяем структуру файла
         for item in data:
             assert "name" in item
             assert "size" in item
             assert "is_file" in item
     
     def test_list_files_contains_correct_metadata(self, client):
-        """Test that file metadata is correct."""
+        """Проверить, что метаданные файла корректны."""
         response = client.get("/files")
         assert response.status_code == 200
         data = response.json()
         
-        # Find test1.txt
+        # Находим test1.txt
         test1 = next((item for item in data if item["name"] == "test1.txt"), None)
         assert test1 is not None
         assert test1["is_file"] is True
-        assert test1["size"] == 14  # "Test content 1" length
+        assert test1["size"] == 14  # длина "Test content 1"
         
-        # Find subdirectory
+        # Находим поддиректорию
         subdir = next((item for item in data if item["name"] == "subdir"), None)
         assert subdir is not None
         assert subdir["is_file"] is False
         assert subdir["size"] == 0
     
     def test_list_files_nonexistent_directory(self, monkeypatch):
-        """Test listing files when directory doesn't exist."""
+        """Проверить вывод списка файлов, когда директория не существует."""
         monkeypatch.setenv("FILES_DIRECTORY", "/nonexistent/path")
         test_app = reload_app()
         client = TestClient(test_app)
@@ -121,7 +121,7 @@ class TestListFilesEndpoint:
         assert "Files directory not found" in response.json()["detail"]
     
     def test_list_files_when_path_is_file(self, test_files_dir, monkeypatch):
-        """Test listing files when FILES_DIRECTORY points to a file."""
+        """Проверить вывод списка файлов, когда FILES_DIRECTORY указывает на файл."""
         file_path = Path(test_files_dir) / "test1.txt"
         monkeypatch.setenv("FILES_DIRECTORY", str(file_path))
         test_app = reload_app()
@@ -133,10 +133,10 @@ class TestListFilesEndpoint:
 
 
 class TestDownloadFileEndpoint:
-    """Tests for the download file endpoint."""
+    """Тесты для конечной точки загрузки файла."""
     
     def test_download_file_success(self, client):
-        """Test successful file download."""
+        """Проверить успешную загрузку файла."""
         response = client.get("/files/test1.txt")
         assert response.status_code == 200
         assert response.content == b"Test content 1"
@@ -144,79 +144,79 @@ class TestDownloadFileEndpoint:
         assert 'attachment; filename="test1.txt"' in response.headers.get("content-disposition", "")
     
     def test_download_different_file(self, client):
-        """Test downloading a different file."""
+        """Проверить загрузку другого файла."""
         response = client.get("/files/test2.txt")
         assert response.status_code == 200
         assert response.content == b"Test content 2 with more data"
     
     def test_download_binary_file(self, client):
-        """Test downloading a binary file."""
+        """Проверить загрузку бинарного файла."""
         response = client.get("/files/document.pdf")
         assert response.status_code == 200
         assert response.content == b"PDF content here"
     
     def test_download_nonexistent_file(self, client):
-        """Test downloading a file that doesn't exist."""
+        """Проверить загрузку несуществующего файла."""
         response = client.get("/files/nonexistent.txt")
         assert response.status_code == 404
         assert "File not found" in response.json()["detail"]
     
     def test_download_directory(self, client):
-        """Test that directories cannot be downloaded."""
+        """Проверить, что директории нельзя загрузить."""
         response = client.get("/files/subdir")
         assert response.status_code == 400
         assert "Path is not a file" in response.json()["detail"]
 
 
 class TestSecurityDirectoryTraversal:
-    """Tests for directory traversal security."""
+    """Тесты для безопасности обхода директорий."""
     
     def test_directory_traversal_with_dotdot(self, client):
-        """Test that directory traversal with .. is prevented."""
+        """Проверить, что обход директорий с .. предотвращен."""
         response = client.get("/files/../main.py")
-        # Should not be able to access files outside the configured directory
+        # Не должно быть возможности получить доступ к файлам вне настроенной директории
         assert response.status_code == 404
     
     def test_directory_traversal_with_absolute_path(self, client):
-        """Test that absolute paths are handled correctly."""
+        """Проверить, что абсолютные пути обрабатываются корректно."""
         response = client.get("/files//etc/passwd")
         assert response.status_code in [400, 404]
     
     def test_directory_traversal_url_encoded(self, client):
-        """Test that URL-encoded directory traversal attempts are prevented."""
-        # %2E%2E is URL-encoded .. - FastAPI/Starlette decodes this before it reaches our handler
-        # Our security logic validates the resolved absolute path stays within the base directory
+        """Проверить, что попытки обхода директорий через URL-кодирование предотвращены."""
+        # %2E%2E - это URL-кодированный .. - FastAPI/Starlette декодирует это до того, как он достигнет нашего обработчика
+        # Наша логика безопасности проверяет, что разрешенный абсолютный путь остается внутри базовой директории
         response = client.get("/files/%2E%2E%2Fmain.py")
-        # Should not be able to access files outside the directory
+        # Не должно быть возможности получить доступ к файлам вне директории
         assert response.status_code == 404
     
     def test_directory_traversal_complex_path(self, client):
-        """Test complex directory traversal attempts."""
+        """Проверить сложные попытки обхода директорий."""
         response = client.get("/files/subdir/../../main.py")
-        # Should not be able to access files outside the directory
+        # Не должно быть возможности получить доступ к файлам вне директории
         assert response.status_code == 404
     
     def test_valid_filename_works(self, client):
-        """Test that valid filenames still work after security checks."""
+        """Проверить, что валидные имена файлов все еще работают после проверок безопасности."""
         response = client.get("/files/test1.txt")
         assert response.status_code == 200
 
 
 class TestCORSConfiguration:
-    """Tests for CORS configuration."""
+    """Тесты для конфигурации CORS."""
     
     def test_cors_headers_present(self, client):
-        """Test that CORS headers are present."""
+        """Проверить, что заголовки CORS присутствуют."""
         response = client.get("/files", headers={"Origin": "http://example.com"})
         assert "access-control-allow-origin" in response.headers
     
     def test_cors_allows_all_origins_by_default(self, client):
-        """Test that CORS allows all origins by default."""
+        """Проверить, что CORS разрешает все источники по умолчанию."""
         response = client.get("/files", headers={"Origin": "http://example.com"})
         assert response.headers["access-control-allow-origin"] == "*"
     
     def test_cors_custom_origins(self, monkeypatch, test_files_dir):
-        """Test that CORS can be configured with specific origins."""
+        """Проверить, что CORS может быть настроен с конкретными источниками."""
         monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000,https://example.com")
         test_app = reload_app()
@@ -226,7 +226,7 @@ class TestCORSConfiguration:
         assert response.status_code == 200
     
     def test_cors_empty_string_falls_back_to_default(self, monkeypatch, test_files_dir):
-        """Test that empty CORS_ORIGINS falls back to default."""
+        """Проверить, что пустая строка CORS_ORIGINS возвращается к значению по умолчанию."""
         monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "")
         test_app = reload_app()
@@ -234,15 +234,15 @@ class TestCORSConfiguration:
         
         response = client.get("/files", headers={"Origin": "http://example.com"})
         assert response.status_code == 200
-        # Should fall back to allowing all origins
+        # Должно вернуться к разрешению всех источников
         assert "access-control-allow-origin" in response.headers
 
 
 class TestEdgeCases:
-    """Tests for edge cases and error handling."""
+    """Тесты для граничных случаев и обработки ошибок."""
     
     def test_empty_directory(self, monkeypatch):
-        """Test listing files in an empty directory."""
+        """Проверить вывод списка файлов в пустой директории."""
         with tempfile.TemporaryDirectory() as tmpdir:
             monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
             test_app = reload_app()
@@ -253,7 +253,7 @@ class TestEdgeCases:
             assert response.json() == []
     
     def test_filename_with_spaces(self, monkeypatch):
-        """Test downloading a file with spaces in the name."""
+        """Проверить загрузку файла с пробелами в имени."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "file with spaces.txt"
             test_file.write_text("Content")
@@ -267,7 +267,7 @@ class TestEdgeCases:
             assert response.content == b"Content"
     
     def test_filename_with_special_characters(self, monkeypatch):
-        """Test downloading a file with special characters."""
+        """Проверить загрузку файла со специальными символами."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "file-name_123.txt"
             test_file.write_text("Special content")
@@ -281,9 +281,9 @@ class TestEdgeCases:
             assert response.content == b"Special content"
     
     def test_large_file_listing(self, monkeypatch):
-        """Test listing a directory with many files."""
+        """Проверить вывод списка директории с большим количеством файлов."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create 100 test files
+            # Создаем 100 тестовых файлов
             for i in range(100):
                 test_file = Path(tmpdir) / f"file_{i:03d}.txt"
                 test_file.write_text(f"Content {i}")
@@ -296,16 +296,16 @@ class TestEdgeCases:
             assert response.status_code == 200
             data = response.json()
             assert len(data) == 100
-            # Check that files are sorted
+            # Проверяем, что файлы отсортированы
             names = [item["name"] for item in data]
             assert names == sorted(names)
 
 
 class TestAPIDocumentation:
-    """Tests for API documentation endpoints."""
+    """Тесты для конечных точек документации API."""
     
     def test_openapi_schema_accessible(self, client):
-        """Test that OpenAPI schema is accessible."""
+        """Проверить, что схема OpenAPI доступна."""
         response = client.get("/openapi.json")
         assert response.status_code == 200
         schema = response.json()
@@ -314,22 +314,22 @@ class TestAPIDocumentation:
         assert schema["info"]["title"] == "File Picker API"
     
     def test_docs_endpoint_accessible(self, client):
-        """Test that /docs endpoint is accessible."""
+        """Проверить, что конечная точка /docs доступна."""
         response = client.get("/docs")
         assert response.status_code == 200
         assert "swagger" in response.text.lower() or "html" in response.text.lower()
 
 
 class TestExceptionHandling:
-    """Tests for exception handling and error cases."""
+    """Тесты для обработки исключений и ошибочных случаев."""
     
     def test_list_files_permission_error(self, monkeypatch):
-        """Test listing files when permission is denied."""
+        """Проверить вывод списка файлов, когда в доступе отказано."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_dir = Path(tmpdir) / "restricted"
             test_dir.mkdir()
             
-            # Create a file in the directory
+            # Создаем файл в директории
             test_file = test_dir / "test.txt"
             test_file.write_text("content")
             
@@ -337,20 +337,20 @@ class TestExceptionHandling:
             test_app = reload_app()
             client = TestClient(test_app)
             
-            # Remove read permissions
+            # Убираем права на чтение
             test_dir.chmod(0o000)
             
             try:
                 response = client.get("/files")
-                # Should get 500 error due to permission denied
+                # Должны получить ошибку 500 из-за отказа в доступе
                 assert response.status_code == 500
                 assert "Error reading directory" in response.json()["detail"]
             finally:
-                # Restore permissions for cleanup
+                # Восстанавливаем права для очистки
                 test_dir.chmod(0o755)
     
     def test_security_value_error_with_mock(self, monkeypatch):
-        """Test that ValueError in commonpath is caught."""
+        """Проверить, что ValueError в commonpath перехватывается."""
         import unittest.mock as mock
         
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -361,19 +361,19 @@ class TestExceptionHandling:
             test_app = reload_app()
             client = TestClient(test_app)
             
-            # Mock os.path.commonpath to raise ValueError
+            # Мокируем os.path.commonpath для возбуждения ValueError
             with mock.patch('main.os.path.commonpath', side_effect=ValueError("Different drives")):
                 response = client.get("/files/test.txt")
-                # Should get 400 error due to ValueError being caught
+                # Должны получить ошибку 400 из-за перехваченного ValueError
                 assert response.status_code == 400
                 assert "Invalid filename" in response.json()["detail"]
     
     def test_security_common_path_not_equal_base_dir(self, monkeypatch):
-        """Test that files outside base directory are rejected when common_path != base_dir."""
+        """Проверить, что файлы вне базовой директории отклоняются, когда common_path != base_dir."""
         import unittest.mock as mock
         
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create base directory and a file
+            # Создаем базовую директорию и файл
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
             
@@ -381,39 +381,39 @@ class TestExceptionHandling:
             test_app = reload_app()
             client = TestClient(test_app)
             
-            # Mock os.path.commonpath to return a parent directory
-            # This simulates a case where the common path is not the base directory
+            # Мокируем os.path.commonpath для возврата родительской директории
+            # Это симулирует случай, когда общий путь не является базовой директорией
             parent_dir = str(Path(tmpdir).parent)
             with mock.patch('main.os.path.commonpath', return_value=parent_dir):
                 response = client.get("/files/test.txt")
-                # Should get 400 error because common_path != base_dir
+                # Должны получить ошибку 400, потому что common_path != base_dir
                 assert response.status_code == 400
                 assert "Invalid filename" in response.json()["detail"]
 
 
 class TestMainExecution:
-    """Tests for main execution block."""
+    """Тесты для блока выполнения main."""
     
     def test_main_module_directly(self):
-        """Test by executing main.py with __name__ set to '__main__'."""
+        """Проверить выполнение main.py с __name__, установленным в '__main__'."""
         import unittest.mock as mock
         
         with tempfile.TemporaryDirectory() as tmpdir:
             files_dir = Path(tmpdir) / "main_test_dir"
             
-            # Mock uvicorn.run to prevent actually starting the server
+            # Мокируем uvicorn.run, чтобы предотвратить фактический запуск сервера
             with mock.patch.dict(os.environ, {'FILES_DIRECTORY': str(files_dir)}):
                 with mock.patch('uvicorn.run') as mock_run:
-                    # Execute the main.py file with __name__ == '__main__'
+                    # Выполняем файл main.py с __name__ == '__main__'
                     main_file = Path(__file__).parent / 'main.py'
                     with open(main_file, 'r') as f:
                         code = compile(f.read(), str(main_file), 'exec')
                     
-                    # Create namespace with __name__ as '__main__'
+                    # Создаем пространство имен с __name__ как '__main__'
                     namespace = {'__name__': '__main__'}
                     exec(code, namespace)
                     
-                    # Verify uvicorn.run was called
+                    # Проверяем, что uvicorn.run был вызван
                     assert mock_run.called
-                    # Verify directory was created
+                    # Проверяем, что директория была создана
                     assert files_dir.exists()
