@@ -34,9 +34,6 @@ dist/
 build/
 *.egg-info/
 
-# Documentation
-README.md
-
 # Test files
 test_*.py
 

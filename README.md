@@ -83,8 +83,14 @@ docker-compose up -d
 # Собрать образ
 docker build -t filepicker-api .
 
-# Запустить контейнер
+# Запустить контейнер (Linux/Mac)
 docker run -d -p 8000:8000 -v $(pwd)/files:/app/files filepicker-api
+
+# Запустить контейнер (Windows PowerShell)
+docker run -d -p 8000:8000 -v ${PWD}/files:/app/files filepicker-api
+
+# Запустить контейнер (Windows CMD)
+docker run -d -p 8000:8000 -v %cd%/files:/app/files filepicker-api
 ```
 
 API будет доступен по адресу `http://localhost:8000`
