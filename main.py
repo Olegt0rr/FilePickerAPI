@@ -100,7 +100,9 @@ async def get_file(filename: str):
     
     # Verify the resolved path is within the base directory
     try:
-        os.path.commonpath([base_dir, requested_path])
+        common_path = os.path.commonpath([base_dir, requested_path])
+        if common_path != base_dir:
+            raise HTTPException(status_code=400, detail="Invalid filename")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid filename")
     
@@ -117,7 +119,7 @@ async def get_file(filename: str):
     
     return FileResponse(
         path=file_path,
-        filename=os.path.basename(filename),
+        filename=file_path.name,
         media_type="application/octet-stream"
     )
 
