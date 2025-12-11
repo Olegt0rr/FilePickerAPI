@@ -67,11 +67,13 @@ API будет доступен по адресу `http://localhost:8000`
 
 ### Использование Windows исполняемого файла
 
-1. Скачайте последний `FilePickerAPI.exe` из [артефактов GitHub Actions](../../actions)
+1. Скачайте последний `FilePickerAPI.exe` из [Releases](../../releases/latest)
 2. Запустите исполняемый файл:
 ```bash
 FilePickerAPI.exe
 ```
+
+Также можно скачать артефакты из последних [GitHub Actions workflow runs](../../actions)
 
 ## Конфигурация
 
@@ -158,7 +160,11 @@ pyinstaller --onefile --name FilePickerAPI main.py
 
 ## GitHub Actions
 
-Репозиторий включает workflow GitHub Action, который автоматически:
+Репозиторий включает несколько workflow GitHub Actions:
+
+### Build and Test (`.github/workflows/build-exe.yml`)
+
+Автоматически:
 - Запускает набор тестов на Ubuntu
 - Собирает Windows исполняемый файл (только если тесты прошли)
 - Загружает отчеты о покрытии тестами
@@ -172,6 +178,30 @@ pyinstaller --onefile --name FilePickerAPI main.py
 Артефакты:
 - Windows исполняемый файл: хранится 30 дней
 - Отчет о покрытии: хранится 7 дней
+
+### Release (`.github/workflows/release.yml`)
+
+Автоматически создаёт релизы с собранными артефактами:
+- Срабатывает при создании тега версии (формат: `v*.*.*`)
+- Создаёт GitHub Release с описанием
+- Собирает Windows исполняемый файл
+- Прикрепляет исполняемый файл к релизу
+
+**Создание нового релиза:**
+
+```bash
+# Обновите версию в pyproject.toml, если необходимо
+# Создайте и отправьте тег
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+После отправки тега workflow автоматически:
+1. Создаст GitHub Release с именем "Release v1.0.0"
+2. Соберёт Windows исполняемый файл
+3. Прикрепит `FilePickerAPI.exe` к релизу
+
+Пользователи смогут скачать релиз с готовым исполняемым файлом со страницы [Releases](../../releases)
 
 ## Безопасность
 
