@@ -1,25 +1,25 @@
 # FilePickerAPI
 
-FastAPI-based web server for listing and downloading files from a configured directory.
+Веб-сервер на базе FastAPI для просмотра списка и загрузки файлов из настроенной директории.
 
-## Features
+## Возможности
 
-- 🚀 Fast and lightweight API built with FastAPI
-- 📁 List files from a configured directory
-- ⬇️ Download specific files
-- 🔒 Security: prevents directory traversal attacks
-- 🌐 CORS enabled for frontend integration
-- 🪟 Automatic Windows executable build via GitHub Actions
+- 🚀 Быстрый и легковесный API на базе FastAPI
+- 📁 Просмотр списка файлов из настроенной директории
+- ⬇️ Загрузка отдельных файлов
+- 🔒 Безопасность: защита от атак обхода директорий
+- 🌐 CORS включен для интеграции с фронтендом
+- 🪟 Автоматическая сборка Windows исполняемого файла через GitHub Actions
 
 ## API Endpoints
 
 ### `GET /`
-Root endpoint with API information.
+Корневая конечная точка с информацией об API.
 
 ### `GET /files`
-List all files in the configured directory.
+Получить список всех файлов в настроенной директории.
 
-**Response:**
+**Ответ:**
 ```json
 [
   {
@@ -31,53 +31,53 @@ List all files in the configured directory.
 ```
 
 ### `GET /files/{filename}`
-Download a specific file.
+Скачать определенный файл.
 
-**Parameters:**
-- `filename` - Name of the file to download
+**Параметры:**
+- `filename` - Имя файла для загрузки
 
-**Response:** File download (application/octet-stream)
+**Ответ:** Загрузка файла (application/octet-stream)
 
-## Installation
+## Установка
 
-### Running from source
+### Запуск из исходного кода
 
-1. Clone the repository:
+1. Клонируйте репозиторий:
 ```bash
 git clone https://github.com/Olegt0rr/FilePickerAPI.git
 cd FilePickerAPI
 ```
 
-2. Install dependencies:
+2. Установите зависимости:
 ```bash
 pip install fastapi==0.104.1 uvicorn[standard]==0.24.0 pydantic==2.5.0
 ```
 
-Or using the project configuration:
+Или используя конфигурацию проекта:
 ```bash
 pip install -e .
 ```
 
-3. Run the application:
+3. Запустите приложение:
 ```bash
 python main.py
 ```
 
-The API will be available at `http://localhost:8000`
+API будет доступен по адресу `http://localhost:8000`
 
-### Using the Windows executable
+### Использование Windows исполняемого файла
 
-1. Download the latest `FilePickerAPI.exe` from the [GitHub Actions artifacts](../../actions)
-2. Run the executable:
+1. Скачайте последний `FilePickerAPI.exe` из [артефактов GitHub Actions](../../actions)
+2. Запустите исполняемый файл:
 ```bash
 FilePickerAPI.exe
 ```
 
-## Configuration
+## Конфигурация
 
-### Files Directory
+### Директория с файлами
 
-By default, the application serves files from the `./files` directory. You can change this by setting the `FILES_DIRECTORY` environment variable:
+По умолчанию приложение обслуживает файлы из директории `./files`. Вы можете изменить это, установив переменную окружения `FILES_DIRECTORY`:
 
 **Linux/Mac:**
 ```bash
@@ -93,7 +93,7 @@ FilePickerAPI.exe
 
 ### CORS Origins
 
-By default, CORS is enabled for all origins (`*`). For production use, you should restrict this to specific domains by setting the `CORS_ORIGINS` environment variable with comma-separated origins:
+По умолчанию CORS включен для всех источников (`*`). Для производственного использования следует ограничить это определенными доменами, установив переменную окружения `CORS_ORIGINS` со списком источников через запятую:
 
 **Linux/Mac:**
 ```bash
@@ -107,79 +107,79 @@ set CORS_ORIGINS=http://localhost:3000,https://yourdomain.com
 FilePickerAPI.exe
 ```
 
-## Development
+## Разработка
 
-### API Documentation
+### Документация API
 
-Once the server is running, you can access:
-- Interactive API docs (Swagger UI): `http://localhost:8000/docs`
-- Alternative API docs (ReDoc): `http://localhost:8000/redoc`
+После запуска сервера вы можете получить доступ к:
+- Интерактивной документации API (Swagger UI): `http://localhost:8000/docs`
+- Альтернативной документации API (ReDoc): `http://localhost:8000/redoc`
 
-### Running Tests
+### Запуск тестов
 
-The project includes comprehensive test coverage with **100% code coverage**. To run tests:
+Проект включает комплексное покрытие тестами с **100% покрытием кода**. Для запуска тестов:
 
 ```bash
-# Install development dependencies
+# Установите зависимости для разработки
 pip install pytest==7.4.3 httpx==0.25.2 pytest-cov==4.1.0 ruff==0.1.9
 
-# Run linting checks
+# Запустите проверки линтера
 ruff check main.py test_main.py
 ruff format --check main.py test_main.py
 
-# Run tests
+# Запустите тесты
 pytest
 
-# Run tests with coverage report (already included in pytest.ini config)
+# Запустите тесты с отчетом о покрытии (уже включено в конфигурацию pytest.ini)
 ```
 
-All configuration is managed through `pyproject.toml`:
-- Dependencies and dev dependencies
-- pytest configuration with coverage settings
-- ruff linter configuration with "ALL" rules
+Вся конфигурация управляется через `pyproject.toml`:
+- Зависимости и dev-зависимости
+- Конфигурация pytest с настройками покрытия
+- Конфигурация линтера ruff с правилом "ALL"
 
-The test suite includes 29 tests covering:
-- All API endpoints (root, list files, download file)
-- Security features (directory traversal protection)
-- CORS configuration
-- Exception handling (permission errors, security exceptions)
-- Error handling and edge cases
-- Main execution block
-- File metadata, sorting, and special characters
+Набор тестов включает 29 тестов, покрывающих:
+- Все конечные точки API (корневая, список файлов, загрузка файла)
+- Функции безопасности (защита от обхода директорий)
+- Конфигурацию CORS
+- Обработку исключений (ошибки доступа, исключения безопасности)
+- Обработку ошибок и граничные случаи
+- Блок выполнения main
+- Метаданные файлов, сортировку и специальные символы
 
-### Building the executable locally
+### Локальная сборка исполняемого файла
 
 ```bash
 pip install pyinstaller
 pyinstaller --onefile --name FilePickerAPI main.py
 ```
 
-The executable will be created in the `dist/` directory.
+Исполняемый файл будет создан в директории `dist/`.
 
 ## GitHub Actions
 
-The repository includes a GitHub Action workflow that automatically:
-- Runs the test suite on Ubuntu
-- Builds a Windows executable (only if tests pass)
-- Uploads test coverage reports
-- Uploads the Windows executable as an artifact
+Репозиторий включает workflow GitHub Action, который автоматически:
+- Запускает набор тестов на Ubuntu
+- Собирает Windows исполняемый файл (только если тесты прошли)
+- Загружает отчеты о покрытии тестами
+- Загружает Windows исполняемый файл как артефакт
 
-Workflow triggers:
-- Push to main/master branch
-- Pull requests to main/master branch
-- Manual workflow dispatch
+Триггеры workflow:
+- Push в ветку main/master
+- Pull request в ветку main/master
+- Ручной запуск workflow
 
-Artifacts:
-- Windows executable: retained for 30 days
-- Coverage report: retained for 7 days
+Артефакты:
+- Windows исполняемый файл: хранится 30 дней
+- Отчет о покрытии: хранится 7 дней
 
-## Security
+## Безопасность
 
-- Directory traversal protection: all file paths are resolved to absolute paths and validated to ensure they remain within the configured directory
-- Uses `os.path.commonpath()` to verify the requested file path doesn't escape the base directory
-- Only files (not directories) can be downloaded
-- CORS origins can be configured via environment variable for production use (defaults to allowing all origins for development)
+- Защита от обхода директорий: все пути к файлам разрешаются в абсолютные пути и проверяются на то, что они остаются в пределах настроенной директории
+- Использует `os.path.commonpath()` для проверки того, что запрошенный путь к файлу не выходит за пределы базовой директории
+- Только файлы (не директории) могут быть загружены
+- CORS origins можно настроить через переменную окружения для производственного использования (по умолчанию разрешает все источники для разработки)
 
-## License
+## Лицензия
 
 MIT
