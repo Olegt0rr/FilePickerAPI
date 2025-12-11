@@ -14,7 +14,7 @@ from pydantic import BaseModel
 # Configuration
 FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
 cors_origins_str = os.getenv("CORS_ORIGINS", "*")
-CORS_ORIGINS = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()]
+CORS_ORIGINS = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()] or ["*"]
 
 app = FastAPI(
     title="File Picker API",

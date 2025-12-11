@@ -130,9 +130,10 @@ The built executable is uploaded as an artifact and retained for 30 days.
 
 ## Security
 
-- Directory traversal protection: filenames containing `..`, `/`, or `\` are rejected
+- Directory traversal protection: all file paths are resolved to absolute paths and validated to ensure they remain within the configured directory
+- Uses `os.path.commonpath()` to verify the requested file path doesn't escape the base directory
 - Only files (not directories) can be downloaded
-- CORS is enabled by default (can be configured in `main.py` if needed)
+- CORS origins can be configured via environment variable for production use (defaults to allowing all origins for development)
 
 ## License
 
