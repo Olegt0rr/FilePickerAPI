@@ -1,0 +1,71 @@
+[project]
+name = "filepicker-api"
+version = "1.0.0"
+description = "FastAPI приложение для просмотра списка файлов и их загрузки"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.104.1",
+    "uvicorn[standard]==0.24.0",
+    "pydantic==2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.4.3",
+    "httpx==0.25.2",
+    "pytest-cov==4.1.0",
+    "ruff==0.1.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--verbose",
+    "--strict-markers",
+    "--cov=main",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-report=xml",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D203",    # one-blank-line-before-class (несовместимо с D211)
+    "D213",    # multi-line-summary-second-line (несовместимо с D212)
+    "ANN101",  # missing-type-self (не требуется для self)
+    "ANN102",  # missing-type-cls (не требуется для cls)
+    "COM812",  # missing-trailing-comma (может конфликтовать с форматтером)
+    "ISC001",  # single-line-implicit-string-concatenation (может конфликтовать с форматтером)
+    "RUF001",  # ambiguous-unicode-character-string (мы используем русский язык)
+    "RUF002",  # ambiguous-unicode-character-docstring (мы используем русский язык)
+    "RUF003",  # ambiguous-unicode-character-comment (мы используем русский язык)
+    "S104",    # hardcoded-bind-all-interfaces (это ожидаемое поведение для демо-сервера)
+    "BLE001",  # blind-except (нужно для общей обработки ошибок чтения директории)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = [
+    "S101",    # use of assert
+    "S102",    # use of exec (необходимо для тестирования main блока)
+    "ANN",     # missing type annotations in tests
+    "D",       # missing docstrings in tests
+    "PLR2004", # magic value comparison in tests
+    "PTH123",  # open() instead of Path.open() (допустимо в тестах)
+    "SIM117",  # nested with statements (более читабельно в тестах)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
