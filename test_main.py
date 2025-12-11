@@ -2,6 +2,8 @@
 Comprehensive tests for the File Picker API.
 """
 import os
+import sys
+import importlib
 import tempfile
 from pathlib import Path
 
@@ -9,6 +11,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from main import app, FILES_DIRECTORY
+
+
+def reload_app():
+    """Helper function to reload the main module with updated environment variables."""
+    if 'main' in sys.modules:
+        importlib.reload(sys.modules['main'])
+    from main import app as test_app
+    return test_app
 
 
 @pytest.fixture
@@ -40,12 +50,7 @@ def client(test_files_dir, monkeypatch):
     monkeypatch.setenv("CORS_ORIGINS", "*")
     
     # Force reload of the main module to pick up new env vars
-    import sys
-    import importlib
-    if 'main' in sys.modules:
-        importlib.reload(sys.modules['main'])
-    
-    from main import app as test_app
+    test_app = reload_app()
     return TestClient(test_app)
 
 
@@ -108,13 +113,7 @@ class TestListFilesEndpoint:
     def test_list_files_nonexistent_directory(self, monkeypatch):
         """Test listing files when directory doesn't exist."""
         monkeypatch.setenv("FILES_DIRECTORY", "/nonexistent/path")
-        
-        import sys
-        import importlib
-        if 'main' in sys.modules:
-            importlib.reload(sys.modules['main'])
-        
-        from main import app as test_app
+        test_app = reload_app()
         client = TestClient(test_app)
         
         response = client.get("/files")
@@ -125,13 +124,7 @@ class TestListFilesEndpoint:
         """Test listing files when FILES_DIRECTORY points to a file."""
         file_path = Path(test_files_dir) / "test1.txt"
         monkeypatch.setenv("FILES_DIRECTORY", str(file_path))
-        
-        import sys
-        import importlib
-        if 'main' in sys.modules:
-            importlib.reload(sys.modules['main'])
-        
-        from main import app as test_app
+        test_app = reload_app()
         client = TestClient(test_app)
         
         response = client.get("/files")
@@ -179,9 +172,9 @@ class TestSecurityDirectoryTraversal:
     """Tests for directory traversal security."""
     
     def test_directory_traversal_with_dotdot(self, client):
-        """Test that .. is blocked."""
+        """Test that directory traversal with .. is prevented."""
         response = client.get("/files/../main.py")
-        # FastAPI routing returns 404 for paths with ..
+        # Should not be able to access files outside the configured directory
         assert response.status_code == 404
     
     def test_directory_traversal_with_absolute_path(self, client):
@@ -190,8 +183,9 @@ class TestSecurityDirectoryTraversal:
         assert response.status_code in [400, 404]
     
     def test_directory_traversal_url_encoded(self, client):
-        """Test that URL-encoded directory traversal is blocked."""
-        # %2E%2E is URL-encoded ..
+        """Test that URL-encoded directory traversal attempts are prevented."""
+        # %2E%2E is URL-encoded .. - FastAPI/Starlette decodes this before it reaches our handler
+        # Our security logic validates the resolved absolute path stays within the base directory
         response = client.get("/files/%2E%2E%2Fmain.py")
         # Should not be able to access files outside the directory
         assert response.status_code == 404
@@ -225,13 +219,7 @@ class TestCORSConfiguration:
         """Test that CORS can be configured with specific origins."""
         monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000,https://example.com")
-        
-        import sys
-        import importlib
-        if 'main' in sys.modules:
-            importlib.reload(sys.modules['main'])
-        
-        from main import app as test_app
+        test_app = reload_app()
         client = TestClient(test_app)
         
         response = client.get("/files", headers={"Origin": "http://localhost:3000"})
@@ -241,13 +229,7 @@ class TestCORSConfiguration:
         """Test that empty CORS_ORIGINS falls back to default."""
         monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "")
-        
-        import sys
-        import importlib
-        if 'main' in sys.modules:
-            importlib.reload(sys.modules['main'])
-        
-        from main import app as test_app
+        test_app = reload_app()
         client = TestClient(test_app)
         
         response = client.get("/files", headers={"Origin": "http://example.com"})
@@ -263,13 +245,7 @@ class TestEdgeCases:
         """Test listing files in an empty directory."""
         with tempfile.TemporaryDirectory() as tmpdir:
             monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            
-            import sys
-            import importlib
-            if 'main' in sys.modules:
-                importlib.reload(sys.modules['main'])
-            
-            from main import app as test_app
+            test_app = reload_app()
             client = TestClient(test_app)
             
             response = client.get("/files")
@@ -283,13 +259,7 @@ class TestEdgeCases:
             test_file.write_text("Content")
             
             monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            
-            import sys
-            import importlib
-            if 'main' in sys.modules:
-                importlib.reload(sys.modules['main'])
-            
-            from main import app as test_app
+            test_app = reload_app()
             client = TestClient(test_app)
             
             response = client.get("/files/file with spaces.txt")
@@ -303,13 +273,7 @@ class TestEdgeCases:
             test_file.write_text("Special content")
             
             monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            
-            import sys
-            import importlib
-            if 'main' in sys.modules:
-                importlib.reload(sys.modules['main'])
-            
-            from main import app as test_app
+            test_app = reload_app()
             client = TestClient(test_app)
             
             response = client.get("/files/file-name_123.txt")
@@ -325,13 +289,7 @@ class TestEdgeCases:
                 test_file.write_text(f"Content {i}")
             
             monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            
-            import sys
-            import importlib
-            if 'main' in sys.modules:
-                importlib.reload(sys.modules['main'])
-            
-            from main import app as test_app
+            test_app = reload_app()
             client = TestClient(test_app)
             
             response = client.get("/files")
