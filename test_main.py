@@ -394,100 +394,8 @@ class TestExceptionHandling:
 class TestMainExecution:
     """Tests for main execution block."""
     
-    def test_main_execution_creates_directory(self):
-        """Test that the main block creates the files directory."""
-        import subprocess
-        import sys
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            files_dir = Path(tmpdir) / "test_files_dir"
-            
-            # Use coverage to track the subprocess execution
-            test_script = Path(tmpdir) / "run_main.py"
-            test_script.write_text(f"""
-import sys
-import os
-from pathlib import Path
-
-# Set environment before import
-os.environ['FILES_DIRECTORY'] = '{files_dir}'
-
-# Now run the main block
-if __name__ == "__main__":
-    import uvicorn
-    
-    FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
-    # Create files directory if it doesn't exist
-    Path(FILES_DIRECTORY).mkdir(parents=True, exist_ok=True)
-    print(f"DIRECTORY_CREATED={{Path(FILES_DIRECTORY).exists()}}")
-    # Don't actually start the server
-    sys.exit(0)
-""")
-            
-            # Run the script
-            result = subprocess.run(
-                [sys.executable, str(test_script)],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            # Check that directory was created
-            assert "DIRECTORY_CREATED=True" in result.stdout
-            assert files_dir.exists()
-    
-    def test_main_block_with_coverage(self):
-        """Test main block execution with proper coverage tracking."""
-        import subprocess
-        import sys
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            files_dir = Path(tmpdir) / "files_for_coverage"
-            
-            # Create a script that will be run with coverage
-            test_script = Path(tmpdir) / "test_main_run.py"
-            test_script.write_text(f"""
-import sys
-import os
-from pathlib import Path
-
-os.environ['FILES_DIRECTORY'] = '{files_dir}'
-
-# Run main.py as __main__ with coverage
-if __name__ == '__main__':
-    # Read main.py content
-    main_file = '/home/runner/work/FilePickerAPI/FilePickerAPI/main.py'
-    with open(main_file, 'r') as f:
-        main_code = compile(f.read(), main_file, 'exec')
-    
-    # Execute with __name__ == '__main__'
-    import uvicorn
-    original_run = uvicorn.run
-    
-    def mock_run(*args, **kwargs):
-        print("UVICORN_RUN_CALLED")
-        return None
-    
-    uvicorn.run = mock_run
-    exec(main_code, {{'__name__': '__main__'}})
-    uvicorn.run = original_run
-""")
-            
-            # Run with coverage
-            result = subprocess.run(
-                [sys.executable, '-m', 'coverage', 'run', '--source=main', str(test_script)],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                cwd='/home/runner/work/FilePickerAPI/FilePickerAPI'
-            )
-            
-            # Check execution
-            assert "UVICORN_RUN_CALLED" in result.stdout or result.returncode == 0
-            assert files_dir.exists()
-    
     def test_main_module_directly(self):
-        """Test by importing main.py with __name__ set to '__main__'."""
+        """Test by executing main.py with __name__ set to '__main__'."""
         import unittest.mock as mock
         
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -497,9 +405,9 @@ if __name__ == '__main__':
             with mock.patch.dict(os.environ, {'FILES_DIRECTORY': str(files_dir)}):
                 with mock.patch('uvicorn.run') as mock_run:
                     # Execute the main.py file with __name__ == '__main__'
-                    main_file = '/home/runner/work/FilePickerAPI/FilePickerAPI/main.py'
+                    main_file = Path(__file__).parent / 'main.py'
                     with open(main_file, 'r') as f:
-                        code = compile(f.read(), main_file, 'exec')
+                        code = compile(f.read(), str(main_file), 'exec')
                     
                     # Create namespace with __name__ as '__main__'
                     namespace = {'__name__': '__main__'}
