@@ -17,10 +17,10 @@ def reload_app():
 
     С обновленными переменными окружения.
     """
-    # Перезагружаем конфигурацию и обработчики, чтобы они получили
+    # Перезагружаем настройки и обработчики, чтобы они получили
     # новые переменные окружения
-    if "app.config" in sys.modules:
-        importlib.reload(sys.modules["app.config"])
+    if "app.settings" in sys.modules:
+        importlib.reload(sys.modules["app.settings"])
     if "app.handlers.files" in sys.modules:
         importlib.reload(sys.modules["app.handlers.files"])
     if "app" in sys.modules:
@@ -430,8 +430,8 @@ class TestMainExecution:
             with mock.patch.dict(os.environ, {"FILES_DIRECTORY": str(files_dir)}):
                 # Перезагружаем модули для применения новых
                 # переменных окружения
-                if "app.config" in sys.modules:
-                    importlib.reload(sys.modules["app.config"])
+                if "app.settings" in sys.modules:
+                    importlib.reload(sys.modules["app.settings"])
                 if "app" in sys.modules:
                     importlib.reload(sys.modules["app"])
 
