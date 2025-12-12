@@ -15,9 +15,8 @@ dependencies = [
     "pydantic-settings==2.7.1",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-exclude = ["tests", "tests.*"]
+[tool.setuptools]
+packages = ["app", "app.handlers"]
 
 [project.optional-dependencies]
 dev = [
