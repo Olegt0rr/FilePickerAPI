@@ -1,4 +1,4 @@
-"""Entry point for running the File Picker API application."""
+"""Точка входа для запуска приложения File Picker API."""
 
 from pathlib import Path
 

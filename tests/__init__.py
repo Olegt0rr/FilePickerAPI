@@ -1,1 +1,1 @@
-"""Test suite for File Picker API."""
+"""Набор тестов для File Picker API."""

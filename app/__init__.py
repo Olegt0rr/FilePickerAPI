@@ -1,4 +1,4 @@
-"""File Picker API application package."""
+"""Пакет приложения File Picker API."""
 
 from app.main import app
 
