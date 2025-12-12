@@ -20,6 +20,10 @@ def reload_app():
     # Перезагружаем настройки и обработчики, чтобы они получили
     # новые переменные окружения
     if "app.settings" in sys.modules:
+        # Очищаем кэш lru_cache перед перезагрузкой
+        from app.settings import get_settings
+
+        get_settings.cache_clear()
         importlib.reload(sys.modules["app.settings"])
     if "app.handlers.files" in sys.modules:
         importlib.reload(sys.modules["app.handlers.files"])
@@ -431,6 +435,10 @@ class TestMainExecution:
                 # Перезагружаем модули для применения новых
                 # переменных окружения
                 if "app.settings" in sys.modules:
+                    # Очищаем кэш lru_cache перед перезагрузкой
+                    from app.settings import get_settings
+
+                    get_settings.cache_clear()
                     importlib.reload(sys.modules["app.settings"])
                 if "app" in sys.modules:
                     importlib.reload(sys.modules["app"])
