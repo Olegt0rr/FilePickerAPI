@@ -17,9 +17,19 @@ def reload_app():
 
     С обновленными переменными окружения.
     """
-    if "main" in sys.modules:
-        importlib.reload(sys.modules["main"])
-    from main import app as test_app
+    # Перезагружаем настройки и обработчики, чтобы они получили
+    # новые переменные окружения
+    if "app.settings" in sys.modules:
+        # Очищаем кэш lru_cache перед перезагрузкой
+        from app.settings import get_settings
+
+        get_settings.cache_clear()
+        importlib.reload(sys.modules["app.settings"])
+    if "app.handlers.files" in sys.modules:
+        importlib.reload(sys.modules["app.handlers.files"])
+    if "app" in sys.modules:
+        importlib.reload(sys.modules["app"])
+    from app import app as test_app
 
     return test_app
 
@@ -56,23 +66,6 @@ def client(test_files_dir, monkeypatch):
     # новых переменных окружения
     test_app = reload_app()
     return TestClient(test_app)
-
-
-class TestRootEndpoint:
-    """Тесты для корневой конечной точки."""
-
-    def test_root_returns_api_info(self, client):
-        """Проверить, что корневая конечная точка возвращает
-        информацию об API.
-        """
-        response = client.get("/")
-        assert response.status_code == 200
-        data = response.json()
-        assert "message" in data
-        assert "endpoints" in data
-        assert data["message"] == "File Picker API"
-        assert "/files" in data["endpoints"]
-        assert "/files/{filename}" in data["endpoints"]
 
 
 class TestListFilesEndpoint:
@@ -391,7 +384,7 @@ class TestExceptionHandling:
 
             # Мокируем os.path.commonpath для возбуждения ValueError
             with mock.patch(
-                "main.os.path.commonpath",
+                "app.handlers.files.os.path.commonpath",
                 side_effect=ValueError("Different drives"),
             ):
                 response = client.get("/files/test.txt")
@@ -415,7 +408,9 @@ class TestExceptionHandling:
             # Мокируем os.path.commonpath для возврата
             # родительской директории
             parent_dir = str(Path(tmpdir).parent)
-            with mock.patch("main.os.path.commonpath", return_value=parent_dir):
+            with mock.patch(
+                "app.handlers.files.os.path.commonpath", return_value=parent_dir
+            ):
                 response = client.get("/files/test.txt")
                 # Должны получить ошибку 400
                 assert response.status_code == 400
@@ -426,7 +421,7 @@ class TestMainExecution:
     """Тесты для блока выполнения main."""
 
     def test_main_module_directly(self):
-        """Проверить выполнение main.py с __name__,
+        """Проверить выполнение app/__main__.py с __name__,
         установленным в '__main__'.
         """
         from unittest import mock
@@ -437,9 +432,20 @@ class TestMainExecution:
             # Мокируем uvicorn.run, чтобы предотвратить
             # фактический запуск сервера
             with mock.patch.dict(os.environ, {"FILES_DIRECTORY": str(files_dir)}):
+                # Перезагружаем модули для применения новых
+                # переменных окружения
+                if "app.settings" in sys.modules:
+                    # Очищаем кэш lru_cache перед перезагрузкой
+                    from app.settings import get_settings
+
+                    get_settings.cache_clear()
+                    importlib.reload(sys.modules["app.settings"])
+                if "app" in sys.modules:
+                    importlib.reload(sys.modules["app"])
+
                 with mock.patch("uvicorn.run") as mock_run:
-                    # Выполняем файл main.py с __name__ == '__main__'
-                    main_file = Path(__file__).parent / "main.py"
+                    # Выполняем файл app/__main__.py напрямую
+                    main_file = Path(__file__).parent.parent / "app" / "__main__.py"
                     with open(main_file) as f:
                         code = compile(f.read(), str(main_file), "exec")
 

@@ -1,34 +1,15 @@
-"""FastAPI приложение для просмотра списка файлов и их загрузки."""
+"""Обработчики для работы с файлами."""
 
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# Конфигурация
-FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
-cors_origins_str = os.getenv("CORS_ORIGINS", "*")
-CORS_ORIGINS = [
-    origin.strip() for origin in cors_origins_str.split(",") if origin.strip()
-] or ["*"]
+from app.settings import get_settings
 
-app = FastAPI(
-    title="File Picker API",
-    description="API for listing and downloading files from a configured directory",
-    version="1.0.0",
-)
-
-# Включение CORS для фронтенд-приложений
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+router = APIRouter(prefix="/files", tags=["files"])
 
 
 class FileInfo(BaseModel):
@@ -39,19 +20,7 @@ class FileInfo(BaseModel):
     is_file: bool
 
 
-@app.get("/")
-async def root() -> dict[str, str | dict[str, str]]:
-    """Корневая конечная точка."""
-    return {
-        "message": "File Picker API",
-        "endpoints": {
-            "/files": "List all files",
-            "/files/{filename}": "Download a specific file",
-        },
-    }
-
-
-@app.get("/files", response_model=list[FileInfo])
+@router.get("", response_model=list[FileInfo])
 async def list_files() -> list[FileInfo]:
     """Получить список всех файлов в настроенной директории.
 
@@ -59,7 +28,7 @@ async def list_files() -> list[FileInfo]:
         Список объектов с информацией о файлах
 
     """
-    files_path = Path(FILES_DIRECTORY)
+    files_path = Path(get_settings().files_directory)
 
     if not files_path.exists():
         msg = "Files directory not found"
@@ -87,7 +56,7 @@ async def list_files() -> list[FileInfo]:
     return sorted(file_list, key=lambda x: x.name)
 
 
-@app.get("/files/{filename}")
+@router.get("/{filename}")
 async def get_file(filename: str) -> FileResponse:
     """Скачать определенный файл из настроенной директории.
 
@@ -101,8 +70,8 @@ async def get_file(filename: str) -> FileResponse:
     # Безопасность: предотвращение обхода директорий
     # Получаем абсолютные пути и проверяем, что файл находится
     # в разрешенной директории
-    base_dir = Path(FILES_DIRECTORY).resolve()
-    requested_path = (Path(FILES_DIRECTORY) / filename).resolve()
+    base_dir = Path(get_settings().files_directory).resolve()
+    requested_path = (Path(get_settings().files_directory) / filename).resolve()
 
     # Проверяем, что разрешенный путь находится внутри
     # базовой директории
@@ -130,12 +99,3 @@ async def get_file(filename: str) -> FileResponse:
         filename=file_path.name,
         media_type="application/octet-stream",
     )
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    # Создаем директорию для файлов, если она не существует
-    Path(FILES_DIRECTORY).mkdir(parents=True, exist_ok=True)
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)

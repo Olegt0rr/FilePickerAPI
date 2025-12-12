@@ -12,10 +12,11 @@ dependencies = [
     "fastapi==0.124.2",
     "uvicorn[standard]==0.38.0",
     "pydantic==2.12.5",
+    "pydantic-settings==2.7.1",
 ]
 
 [tool.setuptools]
-py-modules = ["main"]
+packages = ["app", "app.handlers"]
 
 [project.optional-dependencies]
 dev = [
@@ -26,14 +27,14 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--verbose",
     "--strict-markers",
-    "--cov=main",
+    "--cov=app",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",

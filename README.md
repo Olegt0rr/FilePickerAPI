@@ -60,7 +60,7 @@ pip install -e .
 
 3. Запустите приложение:
 ```bash
-python main.py
+python -m app
 ```
 
 API будет доступен по адресу `http://localhost:8000`
@@ -119,7 +119,7 @@ FilePickerAPI.exe
 **Linux/Mac:**
 ```bash
 export FILES_DIRECTORY="/path/to/your/files"
-python main.py
+python -m app
 ```
 
 **Windows:**
@@ -135,7 +135,7 @@ FilePickerAPI.exe
 **Linux/Mac:**
 ```bash
 export CORS_ORIGINS="http://localhost:3000,https://yourdomain.com"
-python main.py
+python -m app
 ```
 
 **Windows:**
@@ -161,8 +161,8 @@ FilePickerAPI.exe
 pip install -e .[dev]
 
 # Запустите проверки линтера
-ruff check main.py test_main.py
-ruff format --check main.py test_main.py
+ruff check app tests
+ruff format --check app tests
 
 # Запустите тесты
 pytest
@@ -188,7 +188,7 @@ pytest
 
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --name FilePickerAPI main.py
+pyinstaller --onefile --name FilePickerAPI --add-data "app:app" -m app.__main__
 ```
 
 Исполняемый файл будет создан в директории `dist/`.

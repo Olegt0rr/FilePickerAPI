@@ -20,7 +20,7 @@ WORKDIR /app
 COPY --from=builder /root/.local /root/.local
 
 # Copy application code
-COPY main.py ./
+COPY app ./app
 
 # Create files directory (fallback if no volume is mounted)
 RUN mkdir -p /app/files
@@ -36,4 +36,4 @@ ENV CORS_ORIGINS=*
 EXPOSE 8000
 
 # Run the application
-CMD ["python", "main.py"]
+CMD ["python", "-m", "app"]
