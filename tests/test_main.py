@@ -17,6 +17,12 @@ def reload_app():
 
     С обновленными переменными окружения.
     """
+    # Перезагружаем обработчики, чтобы они получили новые
+    # переменные окружения
+    if "app.handlers.files" in sys.modules:
+        importlib.reload(sys.modules["app.handlers.files"])
+    if "app.handlers.root" in sys.modules:
+        importlib.reload(sys.modules["app.handlers.root"])
     if "app.main" in sys.modules:
         importlib.reload(sys.modules["app.main"])
     from app.main import app as test_app
@@ -391,7 +397,7 @@ class TestExceptionHandling:
 
             # Мокируем os.path.commonpath для возбуждения ValueError
             with mock.patch(
-                "app.main.os.path.commonpath",
+                "app.handlers.files.os.path.commonpath",
                 side_effect=ValueError("Different drives"),
             ):
                 response = client.get("/files/test.txt")
@@ -415,7 +421,9 @@ class TestExceptionHandling:
             # Мокируем os.path.commonpath для возврата
             # родительской директории
             parent_dir = str(Path(tmpdir).parent)
-            with mock.patch("app.main.os.path.commonpath", return_value=parent_dir):
+            with mock.patch(
+                "app.handlers.files.os.path.commonpath", return_value=parent_dir
+            ):
                 response = client.get("/files/test.txt")
                 # Должны получить ошибку 400
                 assert response.status_code == 400
