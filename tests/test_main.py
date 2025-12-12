@@ -21,11 +21,9 @@ def reload_app():
     # переменные окружения
     if "app.handlers.files" in sys.modules:
         importlib.reload(sys.modules["app.handlers.files"])
-    if "app.handlers.root" in sys.modules:
-        importlib.reload(sys.modules["app.handlers.root"])
-    if "app.main" in sys.modules:
-        importlib.reload(sys.modules["app.main"])
-    from app.main import app as test_app
+    if "app" in sys.modules:
+        importlib.reload(sys.modules["app"])
+    from app import app as test_app
 
     return test_app
 
@@ -62,23 +60,6 @@ def client(test_files_dir, monkeypatch):
     # новых переменных окружения
     test_app = reload_app()
     return TestClient(test_app)
-
-
-class TestRootEndpoint:
-    """Тесты для корневой конечной точки."""
-
-    def test_root_returns_api_info(self, client):
-        """Проверить, что корневая конечная точка возвращает
-        информацию об API.
-        """
-        response = client.get("/")
-        assert response.status_code == 200
-        data = response.json()
-        assert "message" in data
-        assert "endpoints" in data
-        assert data["message"] == "File Picker API"
-        assert "/files" in data["endpoints"]
-        assert "/files/{filename}" in data["endpoints"]
 
 
 class TestListFilesEndpoint:
@@ -447,8 +428,8 @@ class TestMainExecution:
             with mock.patch.dict(os.environ, {"FILES_DIRECTORY": str(files_dir)}):
                 # Перезагружаем модуль для применения новых
                 # переменных окружения
-                if "app.main" in sys.modules:
-                    importlib.reload(sys.modules["app.main"])
+                if "app" in sys.modules:
+                    importlib.reload(sys.modules["app"])
 
                 with mock.patch("uvicorn.run") as mock_run:
                     # Выполняем файл app/__main__.py напрямую

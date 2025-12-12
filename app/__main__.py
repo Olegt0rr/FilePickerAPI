@@ -4,7 +4,7 @@ from pathlib import Path
 
 import uvicorn
 
-from app.main import FILES_DIRECTORY, app
+from app import FILES_DIRECTORY, app
 
 if __name__ == "__main__":
     # Создаем директорию для файлов, если она не существует
