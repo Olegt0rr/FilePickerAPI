@@ -10,13 +10,13 @@ if not exist "FilePickerAPI.exe" (
     exit /b 1
 )
 
-REM Start the application without a console window
-start "" /B FilePickerAPI.exe
+REM Start the application minimized in background
+start "" /MIN FilePickerAPI.exe
 
-REM Optional: Create a simple log to confirm startup
-echo FilePickerAPI started in daemon mode at %date% %time% > startup.log
+REM Append to log file to track startup history
+echo FilePickerAPI started in daemon mode at %date% %time% >> startup.log
 
-echo FilePickerAPI has been started in daemon mode (no console window).
+echo FilePickerAPI has been started in daemon mode (minimized window).
 echo Check startup.log for confirmation.
 echo To stop the application, use Task Manager to end FilePickerAPI.exe process.
 
