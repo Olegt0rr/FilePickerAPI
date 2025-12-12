@@ -15,7 +15,7 @@ dev = [
     "pytest==7.4.3",
     "httpx==0.25.2",
     "pytest-cov==4.1.0",
-    "ruff==0.1.9",
+    "ruff>=0.4.0",
 ]
 
 [tool.pytest.ini_options]
@@ -34,15 +34,13 @@ addopts = [
 
 [tool.ruff]
 target-version = "py311"
-line-length = 100
+line-length = 88
 
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
     "D203",    # one-blank-line-before-class (несовместимо с D211)
     "D213",    # multi-line-summary-second-line (несовместимо с D212)
-    "ANN101",  # missing-type-self (не требуется для self)
-    "ANN102",  # missing-type-cls (не требуется для cls)
     "COM812",  # missing-trailing-comma (может конфликтовать с форматтером)
     "ISC001",  # single-line-implicit-string-concatenation (может конфликтовать с форматтером)
     "RUF001",  # ambiguous-unicode-character-string (мы используем русский язык)
@@ -51,6 +49,9 @@ ignore = [
     "S104",    # hardcoded-bind-all-interfaces (это ожидаемое поведение для демо-сервера)
     "BLE001",  # blind-except (нужно для общей обработки ошибок чтения директории)
 ]
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 72
 
 [tool.ruff.lint.per-file-ignores]
 "test_*.py" = [

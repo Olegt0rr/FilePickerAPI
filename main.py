@@ -11,7 +11,9 @@ from pydantic import BaseModel
 # Конфигурация
 FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
 cors_origins_str = os.getenv("CORS_ORIGINS", "*")
-CORS_ORIGINS = [origin.strip() for origin in cors_origins_str.split(",") if origin.strip()] or ["*"]
+CORS_ORIGINS = [
+    origin.strip() for origin in cors_origins_str.split(",") if origin.strip()
+] or ["*"]
 
 app = FastAPI(
     title="File Picker API",
@@ -97,11 +99,13 @@ async def get_file(filename: str) -> FileResponse:
 
     """
     # Безопасность: предотвращение обхода директорий
-    # Получаем абсолютные пути и проверяем, что файл находится в разрешенной директории
+    # Получаем абсолютные пути и проверяем, что файл находится
+    # в разрешенной директории
     base_dir = Path(FILES_DIRECTORY).resolve()
     requested_path = (Path(FILES_DIRECTORY) / filename).resolve()
 
-    # Проверяем, что разрешенный путь находится внутри базовой директории
+    # Проверяем, что разрешенный путь находится внутри
+    # базовой директории
     try:
         common_path = os.path.commonpath([base_dir, requested_path])
         if common_path != str(base_dir):
