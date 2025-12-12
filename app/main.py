@@ -130,12 +130,3 @@ async def get_file(filename: str) -> FileResponse:
         filename=file_path.name,
         media_type="application/octet-stream",
     )
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    # Создаем директорию для файлов, если она не существует
-    Path(FILES_DIRECTORY).mkdir(parents=True, exist_ok=True)
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)

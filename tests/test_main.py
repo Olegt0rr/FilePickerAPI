@@ -17,9 +17,9 @@ def reload_app():
 
     С обновленными переменными окружения.
     """
-    if "main" in sys.modules:
-        importlib.reload(sys.modules["main"])
-    from main import app as test_app
+    if "app.main" in sys.modules:
+        importlib.reload(sys.modules["app.main"])
+    from app.main import app as test_app
 
     return test_app
 
@@ -391,7 +391,7 @@ class TestExceptionHandling:
 
             # Мокируем os.path.commonpath для возбуждения ValueError
             with mock.patch(
-                "main.os.path.commonpath",
+                "app.main.os.path.commonpath",
                 side_effect=ValueError("Different drives"),
             ):
                 response = client.get("/files/test.txt")
@@ -415,7 +415,7 @@ class TestExceptionHandling:
             # Мокируем os.path.commonpath для возврата
             # родительской директории
             parent_dir = str(Path(tmpdir).parent)
-            with mock.patch("main.os.path.commonpath", return_value=parent_dir):
+            with mock.patch("app.main.os.path.commonpath", return_value=parent_dir):
                 response = client.get("/files/test.txt")
                 # Должны получить ошибку 400
                 assert response.status_code == 400
@@ -426,7 +426,7 @@ class TestMainExecution:
     """Тесты для блока выполнения main."""
 
     def test_main_module_directly(self):
-        """Проверить выполнение main.py с __name__,
+        """Проверить выполнение app/__main__.py с __name__,
         установленным в '__main__'.
         """
         from unittest import mock
@@ -437,9 +437,14 @@ class TestMainExecution:
             # Мокируем uvicorn.run, чтобы предотвратить
             # фактический запуск сервера
             with mock.patch.dict(os.environ, {"FILES_DIRECTORY": str(files_dir)}):
+                # Перезагружаем модуль для применения новых
+                # переменных окружения
+                if "app.main" in sys.modules:
+                    importlib.reload(sys.modules["app.main"])
+
                 with mock.patch("uvicorn.run") as mock_run:
-                    # Выполняем файл main.py с __name__ == '__main__'
-                    main_file = Path(__file__).parent / "main.py"
+                    # Выполняем файл app/__main__.py напрямую
+                    main_file = Path(__file__).parent.parent / "app" / "__main__.py"
                     with open(main_file) as f:
                         code = compile(f.read(), str(main_file), "exec")
 

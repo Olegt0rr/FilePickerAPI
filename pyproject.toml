@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["main"]
+packages = ["app"]
 
 [project.optional-dependencies]
 dev = [
@@ -26,14 +26,14 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--verbose",
     "--strict-markers",
-    "--cov=main",
+    "--cov=app",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",

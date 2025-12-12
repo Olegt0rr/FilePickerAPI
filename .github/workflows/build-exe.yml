@@ -28,8 +28,8 @@ jobs:
     
     - name: Run ruff checks
       run: |
-        ruff check main.py test_main.py
-        ruff format --check main.py test_main.py
+        ruff check app tests
+        ruff format --check app tests
     
     - name: Run tests with coverage
       run: |
@@ -65,7 +65,7 @@ jobs:
     
     - name: Build executable with PyInstaller
       run: |
-        pyinstaller --onefile --name FilePickerAPI main.py
+        pyinstaller --onefile --name FilePickerAPI --add-data "app:app" -m app.__main__
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4

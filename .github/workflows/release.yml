@@ -29,7 +29,7 @@ jobs:
     
     - name: Build executable with PyInstaller
       run: |
-        pyinstaller --onefile --name FilePickerAPI main.py
+        pyinstaller --onefile --name FilePickerAPI --add-data "app:app" -m app.__main__
     
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v2
@@ -46,7 +46,7 @@ jobs:
           #### Из исходного кода
           ```bash
           pip install -e .
-          python main.py
+          python -m app
           ```
           
           ### Конфигурация
