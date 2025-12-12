@@ -7,8 +7,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# Конфигурация
-FILES_DIRECTORY = os.getenv("FILES_DIRECTORY", "./files")
+from app.config import settings
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -29,7 +28,7 @@ async def list_files() -> list[FileInfo]:
         Список объектов с информацией о файлах
 
     """
-    files_path = Path(FILES_DIRECTORY)
+    files_path = Path(settings.files_directory)
 
     if not files_path.exists():
         msg = "Files directory not found"
@@ -71,8 +70,8 @@ async def get_file(filename: str) -> FileResponse:
     # Безопасность: предотвращение обхода директорий
     # Получаем абсолютные пути и проверяем, что файл находится
     # в разрешенной директории
-    base_dir = Path(FILES_DIRECTORY).resolve()
-    requested_path = (Path(FILES_DIRECTORY) / filename).resolve()
+    base_dir = Path(settings.files_directory).resolve()
+    requested_path = (Path(settings.files_directory) / filename).resolve()
 
     # Проверяем, что разрешенный путь находится внутри
     # базовой директории

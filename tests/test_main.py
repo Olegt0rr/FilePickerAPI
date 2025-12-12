@@ -17,8 +17,10 @@ def reload_app():
 
     С обновленными переменными окружения.
     """
-    # Перезагружаем обработчики, чтобы они получили новые
-    # переменные окружения
+    # Перезагружаем конфигурацию и обработчики, чтобы они получили
+    # новые переменные окружения
+    if "app.config" in sys.modules:
+        importlib.reload(sys.modules["app.config"])
     if "app.handlers.files" in sys.modules:
         importlib.reload(sys.modules["app.handlers.files"])
     if "app" in sys.modules:
@@ -426,8 +428,10 @@ class TestMainExecution:
             # Мокируем uvicorn.run, чтобы предотвратить
             # фактический запуск сервера
             with mock.patch.dict(os.environ, {"FILES_DIRECTORY": str(files_dir)}):
-                # Перезагружаем модуль для применения новых
+                # Перезагружаем модули для применения новых
                 # переменных окружения
+                if "app.config" in sys.modules:
+                    importlib.reload(sys.modules["app.config"])
                 if "app" in sys.modules:
                     importlib.reload(sys.modules["app"])
 
