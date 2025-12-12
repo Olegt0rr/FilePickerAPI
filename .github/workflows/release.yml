@@ -34,14 +34,21 @@ jobs:
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v2
       with:
-        files: ./dist/FilePickerAPI.exe
+        files: |
+          ./dist/FilePickerAPI.exe
+          ./run_test.bat
+          ./run_production.bat
         body: |
           ## FilePickerAPI ${{ github.ref_name }}
           
           ### Установка
           
           #### Windows
-          Скачайте `FilePickerAPI.exe` и запустите.
+          Скачайте `FilePickerAPI.exe` и один из bat-файлов для запуска:
+          - **`run_test.bat`** - для тестирования (с консольным окном и выводом отладочной информации)
+          - **`run_production.bat`** - для продакшн работы (без консольного окна, в фоновом режиме)
+          
+          Поместите все файлы в одну директорию и запустите нужный bat-файл.
           
           #### Из исходного кода
           ```bash
