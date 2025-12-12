@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "filepicker-api"
 version = "1.0.0"
@@ -9,6 +13,9 @@ dependencies = [
     "uvicorn[standard]==0.38.0",
     "pydantic==2.12.5",
 ]
+
+[tool.setuptools]
+py-modules = ["main"]
 
 [project.optional-dependencies]
 dev = [

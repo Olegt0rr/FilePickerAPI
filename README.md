@@ -55,11 +55,6 @@ cd FilePickerAPI
 
 2. Установите зависимости:
 ```bash
-pip install fastapi==0.124.2 uvicorn[standard]==0.38.0 pydantic==2.12.5
-```
-
-Или используя конфигурацию проекта:
-```bash
 pip install -e .
 ```
 
@@ -163,7 +158,7 @@ FilePickerAPI.exe
 
 ```bash
 # Установите зависимости для разработки
-pip install pytest==9.0.2 httpx==0.28.1 pytest-cov==7.0.0 ruff==0.14.9
+pip install -e .[dev]
 
 # Запустите проверки линтера
 ruff check main.py test_main.py
