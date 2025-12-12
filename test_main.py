@@ -1,6 +1,7 @@
 """
 Комплексные тесты для File Picker API.
 """
+
 import importlib
 import os
 import sys
@@ -23,7 +24,7 @@ def reload_app():
     return test_app
 
 
-@pytest.fixture()
+@pytest.fixture
 def test_files_dir():
     """Создать временную директорию с тестовыми файлами."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -44,14 +45,15 @@ def test_files_dir():
         yield tmpdir
 
 
-@pytest.fixture()
+@pytest.fixture
 def client(test_files_dir, monkeypatch):
     """Создать тестовый клиент с временной директорией файлов."""
     # Устанавливаем переменную окружения перед импортом
     monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
     monkeypatch.setenv("CORS_ORIGINS", "*")
 
-    # Принудительно перезагружаем главный модуль для применения новых переменных окружения
+    # Принудительно перезагружаем главный модуль для применения
+    # новых переменных окружения
     test_app = reload_app()
     return TestClient(test_app)
 
@@ -60,7 +62,9 @@ class TestRootEndpoint:
     """Тесты для корневой конечной точки."""
 
     def test_root_returns_api_info(self, client):
-        """Проверить, что корневая конечная точка возвращает информацию об API."""
+        """Проверить, что корневая конечная точка возвращает
+        информацию об API.
+        """
         response = client.get("/")
         assert response.status_code == 200
         data = response.json()
@@ -75,7 +79,9 @@ class TestListFilesEndpoint:
     """Тесты для конечной точки списка файлов."""
 
     def test_list_files_success(self, client):
-        """Проверить, что список файлов возвращает корректную информацию о файлах."""
+        """Проверить, что список файлов возвращает корректную
+        информацию о файлах.
+        """
         response = client.get("/files")
         assert response.status_code == 200
         data = response.json()
@@ -113,7 +119,9 @@ class TestListFilesEndpoint:
         assert subdir["size"] == 0
 
     def test_list_files_nonexistent_directory(self, monkeypatch):
-        """Проверить вывод списка файлов, когда директория не существует."""
+        """Проверить вывод списка файлов, когда директория
+        не существует.
+        """
         monkeypatch.setenv("FILES_DIRECTORY", "/nonexistent/path")
         test_app = reload_app()
         client = TestClient(test_app)
@@ -123,7 +131,9 @@ class TestListFilesEndpoint:
         assert "Files directory not found" in response.json()["detail"]
 
     def test_list_files_when_path_is_file(self, test_files_dir, monkeypatch):
-        """Проверить вывод списка файлов, когда FILES_DIRECTORY указывает на файл."""
+        """Проверить вывод списка файлов, когда FILES_DIRECTORY
+        указывает на файл.
+        """
         file_path = Path(test_files_dir) / "test1.txt"
         monkeypatch.setenv("FILES_DIRECTORY", str(file_path))
         test_app = reload_app()
@@ -143,7 +153,9 @@ class TestDownloadFileEndpoint:
         assert response.status_code == 200
         assert response.content == b"Test content 1"
         assert response.headers["content-type"] == "application/octet-stream"
-        assert 'attachment; filename="test1.txt"' in response.headers.get("content-disposition", "")
+        assert 'attachment; filename="test1.txt"' in response.headers.get(
+            "content-disposition", ""
+        )
 
     def test_download_different_file(self, client):
         """Проверить загрузку другого файла."""
@@ -176,7 +188,8 @@ class TestSecurityDirectoryTraversal:
     def test_directory_traversal_with_dotdot(self, client):
         """Проверить, что обход директорий с .. предотвращен."""
         response = client.get("/files/../main.py")
-        # Не должно быть возможности получить доступ к файлам вне настроенной директории
+        # Не должно быть возможности получить доступ к файлам
+        # вне настроенной директории
         assert response.status_code == 404
 
     def test_directory_traversal_with_absolute_path(self, client):
@@ -188,7 +201,8 @@ class TestSecurityDirectoryTraversal:
         """Проверить обход директорий через URL-кодирование."""
         # %2E%2E - это URL-кодированный ..
         # FastAPI/Starlette декодирует это до обработчика
-        # Логика безопасности проверяет, что путь остается внутри директории
+        # Логика безопасности проверяет, что путь остается
+        # внутри директории
         response = client.get("/files/%2E%2E%2Fmain.py")
         # Не должно быть доступа к файлам вне директории
         assert response.status_code == 404
@@ -196,11 +210,14 @@ class TestSecurityDirectoryTraversal:
     def test_directory_traversal_complex_path(self, client):
         """Проверить сложные попытки обхода директорий."""
         response = client.get("/files/subdir/../../main.py")
-        # Не должно быть возможности получить доступ к файлам вне директории
+        # Не должно быть возможности получить доступ к файлам
+        # вне директории
         assert response.status_code == 404
 
     def test_valid_filename_works(self, client):
-        """Проверить, что валидные имена файлов все еще работают после проверок безопасности."""
+        """Проверить, что валидные имена файлов все еще работают
+        после проверок безопасности.
+        """
         response = client.get("/files/test1.txt")
         assert response.status_code == 200
 
@@ -214,12 +231,16 @@ class TestCORSConfiguration:
         assert "access-control-allow-origin" in response.headers
 
     def test_cors_allows_all_origins_by_default(self, client):
-        """Проверить, что CORS разрешает все источники по умолчанию."""
+        """Проверить, что CORS разрешает все источники
+        по умолчанию.
+        """
         response = client.get("/files", headers={"Origin": "http://example.com"})
         assert response.headers["access-control-allow-origin"] == "*"
 
     def test_cors_custom_origins(self, monkeypatch, test_files_dir):
-        """Проверить, что CORS может быть настроен с конкретными источниками."""
+        """Проверить, что CORS может быть настроен с конкретными
+        источниками.
+        """
         monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000,https://example.com")
         test_app = reload_app()
@@ -229,7 +250,9 @@ class TestCORSConfiguration:
         assert response.status_code == 200
 
     def test_cors_empty_string_falls_back_to_default(self, monkeypatch, test_files_dir):
-        """Проверить, что пустая строка CORS_ORIGINS возвращается к значению по умолчанию."""
+        """Проверить, что пустая строка CORS_ORIGINS возвращается
+        к значению по умолчанию.
+        """
         monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "")
         test_app = reload_app()
@@ -284,7 +307,9 @@ class TestEdgeCases:
             assert response.content == b"Special content"
 
     def test_large_file_listing(self, monkeypatch):
-        """Проверить вывод списка директории с большим количеством файлов."""
+        """Проверить вывод списка директории с большим количеством
+        файлов.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             # Создаем 100 тестовых файлов
             for i in range(100):
@@ -387,7 +412,8 @@ class TestExceptionHandling:
             test_app = reload_app()
             client = TestClient(test_app)
 
-            # Мокируем os.path.commonpath для возврата родительской директории
+            # Мокируем os.path.commonpath для возврата
+            # родительской директории
             parent_dir = str(Path(tmpdir).parent)
             with mock.patch("main.os.path.commonpath", return_value=parent_dir):
                 response = client.get("/files/test.txt")
@@ -400,13 +426,16 @@ class TestMainExecution:
     """Тесты для блока выполнения main."""
 
     def test_main_module_directly(self):
-        """Проверить выполнение main.py с __name__, установленным в '__main__'."""
+        """Проверить выполнение main.py с __name__,
+        установленным в '__main__'.
+        """
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as tmpdir:
             files_dir = Path(tmpdir) / "main_test_dir"
 
-            # Мокируем uvicorn.run, чтобы предотвратить фактический запуск сервера
+            # Мокируем uvicorn.run, чтобы предотвратить
+            # фактический запуск сервера
             with mock.patch.dict(os.environ, {"FILES_DIRECTORY": str(files_dir)}):
                 with mock.patch("uvicorn.run") as mock_run:
                     # Выполняем файл main.py с __name__ == '__main__'
@@ -414,7 +443,8 @@ class TestMainExecution:
                     with open(main_file) as f:
                         code = compile(f.read(), str(main_file), "exec")
 
-                    # Создаем пространство имен с __name__ как '__main__'
+                    # Создаем пространство имен с __name__
+                    # как '__main__'
                     namespace = {"__name__": "__main__"}
                     exec(code, namespace)
 
