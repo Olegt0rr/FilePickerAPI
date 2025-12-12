@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "filepicker-api"
 version = "1.0.0"
@@ -5,17 +9,20 @@ description = "FastAPI приложение для просмотра списк
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi==0.104.1",
-    "uvicorn[standard]==0.24.0",
-    "pydantic==2.5.0",
+    "fastapi==0.124.2",
+    "uvicorn[standard]==0.38.0",
+    "pydantic==2.12.5",
 ]
+
+[tool.setuptools]
+py-modules = ["main"]
 
 [project.optional-dependencies]
 dev = [
-    "pytest==7.4.3",
-    "httpx==0.25.2",
-    "pytest-cov==4.1.0",
-    "ruff>=0.4.0",
+    "pytest==9.0.2",
+    "httpx==0.28.1",
+    "pytest-cov==7.0.0",
+    "ruff>=0.14.9",
 ]
 
 [tool.pytest.ini_options]
@@ -48,6 +55,8 @@ ignore = [
     "RUF003",  # ambiguous-unicode-character-comment (мы используем русский язык)
     "S104",    # hardcoded-bind-all-interfaces (это ожидаемое поведение для демо-сервера)
     "BLE001",  # blind-except (нужно для общей обработки ошибок чтения директории)
+    "FAST001", # fastapi-redundant-response-model (response_model полезен для документации)
+    "PLC0415", # import-outside-top-level (необходимо для динамической загрузки в тестах)
 ]
 
 [tool.ruff.lint.pycodestyle]

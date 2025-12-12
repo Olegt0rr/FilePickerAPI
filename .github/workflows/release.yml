@@ -24,7 +24,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install fastapi==0.104.1 uvicorn[standard]==0.24.0 pydantic==2.5.0
+        pip install -e .
         pip install pyinstaller
     
     - name: Build executable with PyInstaller
@@ -45,7 +45,7 @@ jobs:
           
           #### Из исходного кода
           ```bash
-          pip install fastapi==0.104.1 uvicorn[standard]==0.24.0 pydantic==2.5.0
+          pip install -e .
           python main.py
           ```
           

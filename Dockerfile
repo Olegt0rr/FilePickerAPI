@@ -4,8 +4,11 @@ FROM python:3.11-slim AS builder
 # Set working directory
 WORKDIR /app
 
-# Install dependencies directly
-RUN pip install --no-cache-dir --user fastapi==0.104.1 uvicorn[standard]==0.24.0 pydantic==2.5.0
+# Copy pyproject.toml for dependency installation
+COPY pyproject.toml ./
+
+# Install dependencies from pyproject.toml
+RUN pip install --no-cache-dir --user .
 
 # Final stage
 FROM python:3.11-slim
