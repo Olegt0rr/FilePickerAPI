@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.settings import get_settings
 
@@ -20,12 +20,25 @@ class FileInfo(BaseModel):
     is_file: bool
 
 
-@router.get("", response_model=list[FileInfo])
-async def list_files() -> list[FileInfo]:
+class FileListResponse(BaseModel):
+    """Модель ответа со списком файлов, отфильтрованных по размеру."""
+
+    available_files: list[FileInfo] = Field(..., serialization_alias="availableFiles")
+    not_available_files: list[FileInfo] = Field(
+        ..., serialization_alias="notAvailableFiles"
+    )
+
+
+@router.get("", response_model=FileListResponse)
+async def list_files() -> FileListResponse:
     """Получить список всех файлов в настроенной директории.
 
+    Файлы разделяются на две категории:
+    - availableFiles: файлы размером меньше 10 МБ
+    - notAvailableFiles: файлы размером 10 МБ и больше
+
     Returns:
-        Список объектов с информацией о файлах
+        Объект с двумя списками файлов
 
     """
     files_path = Path(get_settings().files_directory)
@@ -53,7 +66,15 @@ async def list_files() -> list[FileInfo]:
         msg = f"Error reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
-    return sorted(file_list, key=lambda x: x.name)
+    # Фильтрация файлов по размеру (10 МБ = 10 * 1024 * 1024 байт)
+    ten_mb = 10 * 1024 * 1024
+    available_files = [f for f in file_list if f.size < ten_mb]
+    not_available_files = [f for f in file_list if f.size >= ten_mb]
+
+    return FileListResponse(
+        available_files=sorted(available_files, key=lambda x: x.name),
+        not_available_files=sorted(not_available_files, key=lambda x: x.name),
+    )
 
 
 @router.get("/{filename}")

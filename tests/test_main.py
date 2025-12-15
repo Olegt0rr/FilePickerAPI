@@ -79,16 +79,25 @@ class TestListFilesEndpoint:
         assert response.status_code == 200
         data = response.json()
 
-        # Должен вернуть список
-        assert isinstance(data, list)
-        assert len(data) == 4  # 3 файла + 1 поддиректория
+        # Должен вернуть объект с двумя списками
+        assert isinstance(data, dict)
+        assert "availableFiles" in data
+        assert "notAvailableFiles" in data
+        assert isinstance(data["availableFiles"], list)
+        assert isinstance(data["notAvailableFiles"], list)
 
-        # Проверяем, что файлы отсортированы по имени
-        names = [item["name"] for item in data]
-        assert names == sorted(names)
+        # Все файлы должны быть в availableFiles (все меньше 10 МБ)
+        all_files = data["availableFiles"] + data["notAvailableFiles"]
+        assert len(all_files) == 4  # 3 файла + 1 поддиректория
+
+        # Проверяем, что файлы отсортированы по имени в каждом списке
+        available_names = [item["name"] for item in data["availableFiles"]]
+        assert available_names == sorted(available_names)
+        not_available_names = [item["name"] for item in data["notAvailableFiles"]]
+        assert not_available_names == sorted(not_available_names)
 
         # Проверяем структуру файла
-        for item in data:
+        for item in all_files:
             assert "name" in item
             assert "size" in item
             assert "is_file" in item
@@ -99,14 +108,17 @@ class TestListFilesEndpoint:
         assert response.status_code == 200
         data = response.json()
 
+        # Объединяем все файлы из обоих списков
+        all_files = data["availableFiles"] + data["notAvailableFiles"]
+
         # Находим test1.txt
-        test1 = next((item for item in data if item["name"] == "test1.txt"), None)
+        test1 = next((item for item in all_files if item["name"] == "test1.txt"), None)
         assert test1 is not None
         assert test1["is_file"] is True
         assert test1["size"] == 14  # длина "Test content 1"
 
         # Находим поддиректорию
-        subdir = next((item for item in data if item["name"] == "subdir"), None)
+        subdir = next((item for item in all_files if item["name"] == "subdir"), None)
         assert subdir is not None
         assert subdir["is_file"] is False
         assert subdir["size"] == 0
@@ -135,6 +147,52 @@ class TestListFilesEndpoint:
         response = client.get("/files")
         assert response.status_code == 400
         assert "Files path is not a directory" in response.json()["detail"]
+
+    def test_list_files_filters_by_size(self, monkeypatch):
+        """Проверить, что файлы фильтруются по размеру (10 МБ)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Создаем файл меньше 10 МБ
+            small_file = Path(tmpdir) / "small.txt"
+            small_file.write_bytes(b"x" * 1024)  # 1 КБ
+
+            # Создаем файл ровно 10 МБ
+            exact_10mb = Path(tmpdir) / "exact_10mb.bin"
+            exact_10mb.write_bytes(b"x" * (10 * 1024 * 1024))  # 10 МБ
+
+            # Создаем файл больше 10 МБ
+            large_file = Path(tmpdir) / "large.bin"
+            large_file.write_bytes(b"x" * (15 * 1024 * 1024))  # 15 МБ
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            response = client.get("/files")
+            assert response.status_code == 200
+            data = response.json()
+
+            # Проверяем, что маленький файл в availableFiles
+            available_names = [f["name"] for f in data["availableFiles"]]
+            assert "small.txt" in available_names
+
+            # Проверяем, что большие файлы в notAvailableFiles
+            not_available_names = [f["name"] for f in data["notAvailableFiles"]]
+            assert "exact_10mb.bin" in not_available_names
+            assert "large.bin" in not_available_names
+
+            # Проверяем количество
+            assert len(data["availableFiles"]) == 1
+            assert len(data["notAvailableFiles"]) == 2
+
+    def test_list_files_all_small_files(self, client):
+        """Проверить, что все тестовые файлы меньше 10 МБ."""
+        response = client.get("/files")
+        assert response.status_code == 200
+        data = response.json()
+
+        # Все тестовые файлы маленькие, должны быть в availableFiles
+        assert len(data["availableFiles"]) == 4
+        assert len(data["notAvailableFiles"]) == 0
 
 
 class TestDownloadFileEndpoint:
@@ -269,7 +327,8 @@ class TestEdgeCases:
 
             response = client.get("/files")
             assert response.status_code == 200
-            assert response.json() == []
+            data = response.json()
+            assert data == {"availableFiles": [], "notAvailableFiles": []}
 
     def test_filename_with_spaces(self, monkeypatch):
         """Проверить загрузку файла с пробелами в имени."""
@@ -316,10 +375,13 @@ class TestEdgeCases:
             response = client.get("/files")
             assert response.status_code == 200
             data = response.json()
-            assert len(data) == 100
-            # Проверяем, что файлы отсортированы
-            names = [item["name"] for item in data]
-            assert names == sorted(names)
+            all_files = data["availableFiles"] + data["notAvailableFiles"]
+            assert len(all_files) == 100
+            # Проверяем, что файлы отсортированы в каждом списке
+            available_names = [item["name"] for item in data["availableFiles"]]
+            assert available_names == sorted(available_names)
+            not_available_names = [item["name"] for item in data["notAvailableFiles"]]
+            assert not_available_names == sorted(not_available_names)
 
 
 class TestAPIDocumentation:
