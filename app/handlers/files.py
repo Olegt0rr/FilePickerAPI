@@ -19,24 +19,22 @@ router = APIRouter(prefix="/files", tags=["files"])
 MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
 
 
-def is_file_available(file_info: "FileInfo") -> bool:
-    """Проверить, доступен ли файл для импорта.
+def check_file_availability(file_path: Path, file_size: int) -> bool:
+    """Проверить, доступен ли файл.
 
     Файл считается доступным, если:
     - Размер меньше 10 МБ
     - Формат .txt
 
     Args:
-        file_info: Информация о файле
+        file_path: Путь к файлу
+        file_size: Размер файла в байтах
 
     Returns:
-        True, если файл доступен для импорта
+        True, если файл доступен
 
     """
-    return (
-        file_info.size < MAX_AVAILABLE_FILE_SIZE
-        and Path(file_info.name).suffix.lower() == ".txt"
-    )
+    return file_size < MAX_AVAILABLE_FILE_SIZE and file_path.suffix.lower() == ".txt"
 
 
 class CamelCaseModel(BaseModel):
@@ -124,7 +122,7 @@ async def list_files() -> FileListResponse:
     available_files = []
     unavailable_files = []
     for file_info in file_list:
-        if is_file_available(file_info):
+        if check_file_availability(Path(file_info.name), file_info.size):
             available_files.append(file_info)
         else:
             unavailable_files.append(file_info)
@@ -146,6 +144,10 @@ async def get_file(
 
     Returns:
         Ответ с запрашиваемым файлом
+
+    Raises:
+        HTTPException: 403 если файл недоступен для загрузки
+            (не соответствует критериям availableFiles)
 
     """
     # Безопасность: предотвращение обхода директорий
@@ -174,6 +176,12 @@ async def get_file(
     if not file_path.is_file():
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
+
+    # Проверяем, что файл доступен для загрузки
+    file_size = file_path.stat().st_size
+    if not check_file_availability(file_path, file_size):
+        msg = "File is not available for download"
+        raise HTTPException(status_code=403, detail=msg)
 
     return FileResponse(
         path=file_path,

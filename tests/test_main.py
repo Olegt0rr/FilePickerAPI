@@ -255,10 +255,10 @@ class TestDownloadFileEndpoint:
         assert response.content == b"Test content 2 with more data"
 
     def test_download_binary_file(self, client):
-        """Проверить загрузку бинарного файла."""
+        """Проверить, что недоступный бинарный файл нельзя загрузить."""
         response = client.get("/files/document.pdf")
-        assert response.status_code == 200
-        assert response.content == b"PDF content here"
+        assert response.status_code == 403
+        assert "File is not available for download" in response.json()["detail"]
 
     def test_download_nonexistent_file(self, client):
         """Проверить загрузку несуществующего файла."""
@@ -271,6 +271,55 @@ class TestDownloadFileEndpoint:
         response = client.get("/files/subdir")
         assert response.status_code == 400
         assert "Path is not a file" in response.json()["detail"]
+
+    def test_download_unavailable_large_file(self, monkeypatch):
+        """Проверить, что большие файлы нельзя загрузить."""
+        from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Создаем .txt файл ровно 10 МБ (недоступен)
+            large_txt = Path(tmpdir) / "large.txt"
+            large_txt.write_bytes(b"x" * MAX_AVAILABLE_FILE_SIZE)
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            response = client.get("/files/large.txt")
+            assert response.status_code == 403
+            assert "File is not available for download" in response.json()["detail"]
+
+    def test_download_unavailable_non_txt_file(self, monkeypatch):
+        """Проверить, что не .txt файлы нельзя загрузить."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Создаем маленький .pdf файл (недоступен)
+            small_pdf = Path(tmpdir) / "small.pdf"
+            small_pdf.write_bytes(b"PDF content")
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            response = client.get("/files/small.pdf")
+            assert response.status_code == 403
+            assert "File is not available for download" in response.json()["detail"]
+
+    def test_download_available_file_just_under_limit(self, monkeypatch):
+        """Проверить, что файлы чуть меньше лимита можно загрузить."""
+        from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Создаем .txt файл чуть меньше 10 МБ (доступен)
+            almost_limit = Path(tmpdir) / "almost_limit.txt"
+            almost_limit.write_bytes(b"x" * (MAX_AVAILABLE_FILE_SIZE - 1))
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            response = client.get("/files/almost_limit.txt")
+            assert response.status_code == 200
+            assert len(response.content) == MAX_AVAILABLE_FILE_SIZE - 1
 
 
 class TestSecurityDirectoryTraversal:
