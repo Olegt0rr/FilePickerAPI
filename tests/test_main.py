@@ -34,6 +34,15 @@ def reload_app():
     return test_app
 
 
+def assert_sorted_by_created_at(files: list[dict]) -> None:
+    """Проверить, что файлы отсортированы по дате создания
+    (убывание).
+    """
+    if len(files) > 1:
+        created_times = [item["createdAt"] for item in files]
+        assert created_times == sorted(created_times, reverse=True)
+
+
 @pytest.fixture
 def test_files_dir():
     """Создать временную директорию с тестовыми файлами."""
@@ -97,12 +106,8 @@ class TestListFilesEndpoint:
 
         # Проверяем, что файлы отсортированы по дате создания
         # (новые первыми)
-        if len(data["availableFiles"]) > 1:
-            created_times = [item["createdAt"] for item in data["availableFiles"]]
-            assert created_times == sorted(created_times, reverse=True)
-        if len(data["notAvailableFiles"]) > 1:
-            created_times = [item["createdAt"] for item in data["notAvailableFiles"]]
-            assert created_times == sorted(created_times, reverse=True)
+        assert_sorted_by_created_at(data["availableFiles"])
+        assert_sorted_by_created_at(data["notAvailableFiles"])
 
         # Проверяем структуру файла
         for item in all_files:
@@ -410,14 +415,8 @@ class TestEdgeCases:
             assert len(all_files) == 100
             # Проверяем, что файлы отсортированы по дате создания
             # (новые первыми)
-            if len(data["availableFiles"]) > 1:
-                available_times = [item["createdAt"] for item in data["availableFiles"]]
-                assert available_times == sorted(available_times, reverse=True)
-            if len(data["notAvailableFiles"]) > 1:
-                not_available_times = [
-                    item["createdAt"] for item in data["notAvailableFiles"]
-                ]
-                assert not_available_times == sorted(not_available_times, reverse=True)
+            assert_sorted_by_created_at(data["availableFiles"])
+            assert_sorted_by_created_at(data["notAvailableFiles"])
 
 
 class TestAPIDocumentation:
