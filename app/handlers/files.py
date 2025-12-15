@@ -39,6 +39,24 @@ def is_file_available(file_info: "FileInfo") -> bool:
     )
 
 
+def check_file_availability(file_path: Path, file_size: int) -> bool:
+    """Проверить, доступен ли файл для загрузки.
+
+    Файл считается доступным, если:
+    - Размер меньше 10 МБ
+    - Формат .txt
+
+    Args:
+        file_path: Путь к файлу
+        file_size: Размер файла в байтах
+
+    Returns:
+        True, если файл доступен для загрузки
+
+    """
+    return file_size < MAX_AVAILABLE_FILE_SIZE and file_path.suffix.lower() == ".txt"
+
+
 class CamelCaseModel(BaseModel):
     """Базовая модель с автоматическим преобразованием в camelCase."""
 
@@ -180,17 +198,8 @@ async def get_file(
         raise HTTPException(status_code=400, detail=msg)
 
     # Проверяем, что файл доступен для загрузки
-    stat = file_path.stat()
-    file_info = FileInfo(
-        id=file_path.name,
-        name=file_path.name,
-        size=stat.st_size,
-        created_at=datetime.fromtimestamp(
-            getattr(stat, "st_birthtime", stat.st_mtime), tz=UTC
-        ),
-    )
-
-    if not is_file_available(file_info):
+    file_size = file_path.stat().st_size
+    if not check_file_availability(file_path, file_size):
         msg = "File is not available for download"
         raise HTTPException(status_code=403, detail=msg)
 
