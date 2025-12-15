@@ -114,7 +114,7 @@ class TestListFilesEndpoint:
             assert "id" in item
             assert "name" in item
             assert "size" in item
-            assert "is_file" in item
+            assert "isFile" in item
             assert "createdAt" in item
 
     def test_list_files_contains_correct_metadata(self, client):
@@ -129,7 +129,7 @@ class TestListFilesEndpoint:
         # Находим test1.txt (должен быть в availableFiles)
         test1 = next((item for item in all_files if item["name"] == "test1.txt"), None)
         assert test1 is not None
-        assert test1["is_file"] is True
+        assert test1["isFile"] is True
         assert test1["size"] == 14  # длина "Test content 1"
         assert test1["id"] == "test1.txt"
         assert "createdAt" in test1
@@ -137,7 +137,7 @@ class TestListFilesEndpoint:
         # Находим поддиректорию (должна быть в notAvailableFiles)
         subdir = next((item for item in all_files if item["name"] == "subdir"), None)
         assert subdir is not None
-        assert subdir["is_file"] is False
+        assert subdir["isFile"] is False
         assert subdir["size"] == 0
         assert subdir["id"] == "subdir"
 

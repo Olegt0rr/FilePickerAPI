@@ -38,7 +38,7 @@
       "id": "example.txt",
       "name": "example.txt",
       "size": 1024,
-      "is_file": true,
+      "isFile": true,
       "createdAt": 1765788229.15
     }
   ],
@@ -47,7 +47,7 @@
       "id": "large_file.bin",
       "name": "large_file.bin",
       "size": 15728640,
-      "is_file": true,
+      "isFile": true,
       "createdAt": 1765788229.10
     }
   ]

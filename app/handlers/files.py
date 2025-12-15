@@ -7,7 +7,8 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
 from app.settings import get_settings
 
@@ -17,23 +18,30 @@ router = APIRouter(prefix="/files", tags=["files"])
 MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
 
 
-class FileInfo(BaseModel):
+class CamelCaseModel(BaseModel):
+    """Базовая модель с автоматическим преобразованием в camelCase."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+
+class FileInfo(CamelCaseModel):
     """Модель информации о файле."""
 
     id: str
     name: str
     size: int
     is_file: bool
-    created_at: float = Field(..., serialization_alias="createdAt")
+    created_at: float
 
 
-class FileListResponse(BaseModel):
+class FileListResponse(CamelCaseModel):
     """Модель ответа со списком файлов, отфильтрованных по размеру."""
 
-    available_files: list[FileInfo] = Field(..., serialization_alias="availableFiles")
-    not_available_files: list[FileInfo] = Field(
-        ..., serialization_alias="notAvailableFiles"
-    )
+    available_files: list[FileInfo]
+    not_available_files: list[FileInfo]
 
 
 @router.get("", response_model=FileListResponse)
