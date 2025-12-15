@@ -63,7 +63,7 @@ class FileListResponse(CamelCaseModel):
     """Модель ответа со списком файлов."""
 
     available_files: list[FileInfo]
-    not_available_files: list[FileInfo]
+    unavailable_files: list[FileInfo]
 
 
 @router.get("", response_model=FileListResponse)
@@ -122,16 +122,16 @@ async def list_files() -> FileListResponse:
 
     # Разделение файлов на доступные и недоступные
     available_files = []
-    not_available_files = []
+    unavailable_files = []
     for file_info in file_list:
         if is_file_available(file_info):
             available_files.append(file_info)
         else:
-            not_available_files.append(file_info)
+            unavailable_files.append(file_info)
 
     return FileListResponse(
         available_files=available_files,
-        not_available_files=not_available_files,
+        unavailable_files=unavailable_files,
     )
 
 

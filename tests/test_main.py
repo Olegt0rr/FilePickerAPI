@@ -91,23 +91,23 @@ class TestListFilesEndpoint:
         # Должен вернуть объект с двумя списками
         assert isinstance(data, dict)
         assert "availableFiles" in data
-        assert "notAvailableFiles" in data
+        assert "unavailableFiles" in data
         assert isinstance(data["availableFiles"], list)
-        assert isinstance(data["notAvailableFiles"], list)
+        assert isinstance(data["unavailableFiles"], list)
 
         # Все файлы из обоих списков (директории игнорируются)
-        all_files = data["availableFiles"] + data["notAvailableFiles"]
+        all_files = data["availableFiles"] + data["unavailableFiles"]
         assert len(all_files) == 3  # 3 файла (директория subdir игнорируется)
 
         # Только .txt файлы в availableFiles
         assert len(data["availableFiles"]) == 2  # test1.txt и test2.txt
-        # document.pdf в notAvailableFiles
-        assert len(data["notAvailableFiles"]) == 1
+        # document.pdf в unavailableFiles
+        assert len(data["unavailableFiles"]) == 1
 
         # Проверяем, что файлы отсортированы по дате создания
         # (новые первыми)
         assert_sorted_by_created_at(data["availableFiles"])
-        assert_sorted_by_created_at(data["notAvailableFiles"])
+        assert_sorted_by_created_at(data["unavailableFiles"])
 
         # Проверяем структуру файла
         for item in all_files:
@@ -123,7 +123,7 @@ class TestListFilesEndpoint:
         data = response.json()
 
         # Объединяем все файлы из обоих списков
-        all_files = data["availableFiles"] + data["notAvailableFiles"]
+        all_files = data["availableFiles"] + data["unavailableFiles"]
 
         # Находим test1.txt (должен быть в availableFiles)
         test1 = next((item for item in all_files if item["name"] == "test1.txt"), None)
@@ -132,7 +132,7 @@ class TestListFilesEndpoint:
         assert test1["id"] == "test1.txt"
         assert "createdAt" in test1
 
-        # Находим document.pdf (должен быть в notAvailableFiles)
+        # Находим document.pdf (должен быть в unavailableFiles)
         pdf_file = next(
             (item for item in all_files if item["name"] == "document.pdf"), None
         )
@@ -180,17 +180,17 @@ class TestListFilesEndpoint:
             small_txt.write_bytes(b"x" * 1024)
 
             # Создаем .pdf файл меньше 10 МБ
-            # (не .txt - в notAvailableFiles)
+            # (не .txt - в unavailableFiles)
             small_pdf = Path(tmpdir) / "small.pdf"
             small_pdf.write_bytes(b"x" * 1024)
 
             # Создаем .txt файл ровно 10 МБ
-            # (большой - в notAvailableFiles)
+            # (большой - в unavailableFiles)
             exact_10mb = Path(tmpdir) / "exact_10mb.txt"
             exact_10mb.write_bytes(b"x" * MAX_AVAILABLE_FILE_SIZE)
 
             # Создаем .txt файл больше 10 МБ
-            # (большой - в notAvailableFiles)
+            # (большой - в unavailableFiles)
             large_txt = Path(tmpdir) / "large.txt"
             large_txt.write_bytes(b"x" * int(MAX_AVAILABLE_FILE_SIZE * 1.5))
 
@@ -206,15 +206,15 @@ class TestListFilesEndpoint:
             available_names = [f["name"] for f in data["availableFiles"]]
             assert "small.txt" in available_names
 
-            # Все остальные в notAvailableFiles
-            not_available_names = [f["name"] for f in data["notAvailableFiles"]]
+            # Все остальные в unavailableFiles
+            not_available_names = [f["name"] for f in data["unavailableFiles"]]
             assert "small.pdf" in not_available_names  # не .txt
             assert "exact_10mb.txt" in not_available_names  # большой
             assert "large.txt" in not_available_names  # большой
 
             # Проверяем количество
             assert len(data["availableFiles"]) == 1
-            assert len(data["notAvailableFiles"]) == 3
+            assert len(data["unavailableFiles"]) == 3
 
     def test_list_files_txt_only_in_available(self, client):
         """Проверить, что только .txt файлы в availableFiles."""
@@ -227,9 +227,9 @@ class TestListFilesEndpoint:
         for file in data["availableFiles"]:
             assert file["name"].lower().endswith(".txt")
 
-        # document.pdf в notAvailableFiles (subdir игнорируется)
-        assert len(data["notAvailableFiles"]) == 1
-        not_available_names = [f["name"] for f in data["notAvailableFiles"]]
+        # document.pdf в unavailableFiles (subdir игнорируется)
+        assert len(data["unavailableFiles"]) == 1
+        not_available_names = [f["name"] for f in data["unavailableFiles"]]
         assert "document.pdf" in not_available_names
         # Директории не включаются в результаты
         assert "subdir" not in not_available_names
@@ -368,7 +368,7 @@ class TestEdgeCases:
             response = client.get("/files")
             assert response.status_code == 200
             data = response.json()
-            assert data == {"availableFiles": [], "notAvailableFiles": []}
+            assert data == {"availableFiles": [], "unavailableFiles": []}
 
     def test_filename_with_spaces(self, monkeypatch):
         """Проверить загрузку файла с пробелами в имени."""
@@ -415,12 +415,12 @@ class TestEdgeCases:
             response = client.get("/files")
             assert response.status_code == 200
             data = response.json()
-            all_files = data["availableFiles"] + data["notAvailableFiles"]
+            all_files = data["availableFiles"] + data["unavailableFiles"]
             assert len(all_files) == 100
             # Проверяем, что файлы отсортированы по дате создания
             # (новые первыми)
             assert_sorted_by_created_at(data["availableFiles"])
-            assert_sorted_by_created_at(data["notAvailableFiles"])
+            assert_sorted_by_created_at(data["unavailableFiles"])
 
 
 class TestAPIDocumentation:
