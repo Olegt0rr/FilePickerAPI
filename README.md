@@ -35,7 +35,7 @@
       "id": "example.txt",
       "name": "example.txt",
       "size": 1024,
-      "createdAt": 1765788229.15
+      "createdAt": "2025-12-15T10:30:29.150000Z"
     }
   ],
   "notAvailableFiles": [
@@ -43,13 +43,13 @@
       "id": "large_file.txt",
       "name": "large_file.txt",
       "size": 15728640,
-      "createdAt": 1765788229.10
+      "createdAt": "2025-12-15T10:30:29.100000Z"
     },
     {
       "id": "document.pdf",
       "name": "document.pdf",
       "size": 2048,
-      "createdAt": 1765788229.05
+      "createdAt": "2025-12-15T10:30:29.050000Z"
     }
   ]
 }

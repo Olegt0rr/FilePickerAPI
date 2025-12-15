@@ -1,6 +1,7 @@
 """Обработчики для работы с файлами."""
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -52,7 +53,7 @@ class FileInfo(CamelCaseModel):
     id: str
     name: str
     size: int
-    created_at: float
+    created_at: datetime
 
 
 class FileListResponse(CamelCaseModel):
@@ -98,7 +99,7 @@ async def list_files() -> FileListResponse:
                     id=item.name,
                     name=item.name,
                     size=stat.st_size,
-                    created_at=stat.st_ctime,
+                    created_at=datetime.fromtimestamp(stat.st_ctime, tz=UTC),
                 )
             )
     except Exception as e:
