@@ -304,6 +304,23 @@ class TestDownloadFileEndpoint:
             assert response.status_code == 403
             assert "File is not available for download" in response.json()["detail"]
 
+    def test_download_available_file_just_under_limit(self, monkeypatch):
+        """Проверить, что файлы чуть меньше лимита можно загрузить."""
+        from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Создаем .txt файл чуть меньше 10 МБ (доступен)
+            almost_limit = Path(tmpdir) / "almost_limit.txt"
+            almost_limit.write_bytes(b"x" * (MAX_AVAILABLE_FILE_SIZE - 1))
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            response = client.get("/files/almost_limit.txt")
+            assert response.status_code == 200
+            assert len(response.content) == MAX_AVAILABLE_FILE_SIZE - 1
+
 
 class TestSecurityDirectoryTraversal:
     """Тесты для безопасности обхода директорий."""

@@ -20,7 +20,7 @@ MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
 
 
 def check_file_availability(file_path: Path, file_size: int) -> bool:
-    """Проверить, доступен ли файл для загрузки.
+    """Проверить, доступен ли файл.
 
     Файл считается доступным, если:
     - Размер меньше 10 МБ
@@ -31,7 +31,7 @@ def check_file_availability(file_path: Path, file_size: int) -> bool:
         file_size: Размер файла в байтах
 
     Returns:
-        True, если файл доступен для загрузки
+        True, если файл доступен
 
     """
     return file_size < MAX_AVAILABLE_FILE_SIZE and file_path.suffix.lower() == ".txt"
