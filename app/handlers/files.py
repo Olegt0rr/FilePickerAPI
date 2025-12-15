@@ -19,26 +19,6 @@ router = APIRouter(prefix="/files", tags=["files"])
 MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
 
 
-def is_file_available(file_info: "FileInfo") -> bool:
-    """Проверить, доступен ли файл для импорта.
-
-    Файл считается доступным, если:
-    - Размер меньше 10 МБ
-    - Формат .txt
-
-    Args:
-        file_info: Информация о файле
-
-    Returns:
-        True, если файл доступен для импорта
-
-    """
-    return (
-        file_info.size < MAX_AVAILABLE_FILE_SIZE
-        and Path(file_info.name).suffix.lower() == ".txt"
-    )
-
-
 def check_file_availability(file_path: Path, file_size: int) -> bool:
     """Проверить, доступен ли файл для загрузки.
 
@@ -55,6 +35,23 @@ def check_file_availability(file_path: Path, file_size: int) -> bool:
 
     """
     return file_size < MAX_AVAILABLE_FILE_SIZE and file_path.suffix.lower() == ".txt"
+
+
+def is_file_available(file_info: "FileInfo") -> bool:
+    """Проверить, доступен ли файл для импорта.
+
+    Файл считается доступным, если:
+    - Размер меньше 10 МБ
+    - Формат .txt
+
+    Args:
+        file_info: Информация о файле
+
+    Returns:
+        True, если файл доступен для импорта
+
+    """
+    return check_file_availability(Path(file_info.name), file_info.size)
 
 
 class CamelCaseModel(BaseModel):
