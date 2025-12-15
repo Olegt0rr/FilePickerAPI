@@ -147,6 +147,10 @@ async def get_file(
     Returns:
         Ответ с запрашиваемым файлом
 
+    Raises:
+        HTTPException: 403 если файл недоступен для загрузки
+            (не соответствует критериям availableFiles)
+
     """
     # Безопасность: предотвращение обхода директорий
     # Получаем абсолютные пути и проверяем, что файл находится
@@ -174,6 +178,21 @@ async def get_file(
     if not file_path.is_file():
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
+
+    # Проверяем, что файл доступен для загрузки
+    stat = file_path.stat()
+    file_info = FileInfo(
+        id=file_path.name,
+        name=file_path.name,
+        size=stat.st_size,
+        created_at=datetime.fromtimestamp(
+            getattr(stat, "st_birthtime", stat.st_mtime), tz=UTC
+        ),
+    )
+
+    if not is_file_available(file_info):
+        msg = "File is not available for download"
+        raise HTTPException(status_code=403, detail=msg)
 
     return FileResponse(
         path=file_path,
