@@ -34,6 +34,15 @@ def reload_app():
     return test_app
 
 
+def assert_sorted_by_created_at(files: list[dict]) -> None:
+    """Проверить, что файлы отсортированы по дате создания
+    (убывание).
+    """
+    if len(files) > 1:
+        created_times = [item["createdAt"] for item in files]
+        assert created_times == sorted(created_times, reverse=True)
+
+
 @pytest.fixture
 def test_files_dir():
     """Создать временную директорию с тестовыми файлами."""
@@ -79,19 +88,33 @@ class TestListFilesEndpoint:
         assert response.status_code == 200
         data = response.json()
 
-        # Должен вернуть список
-        assert isinstance(data, list)
-        assert len(data) == 4  # 3 файла + 1 поддиректория
+        # Должен вернуть объект с двумя списками
+        assert isinstance(data, dict)
+        assert "availableFiles" in data
+        assert "unavailableFiles" in data
+        assert isinstance(data["availableFiles"], list)
+        assert isinstance(data["unavailableFiles"], list)
 
-        # Проверяем, что файлы отсортированы по имени
-        names = [item["name"] for item in data]
-        assert names == sorted(names)
+        # Все файлы из обоих списков (директории игнорируются)
+        all_files = data["availableFiles"] + data["unavailableFiles"]
+        assert len(all_files) == 3  # 3 файла (директория subdir игнорируется)
+
+        # Только .txt файлы в availableFiles
+        assert len(data["availableFiles"]) == 2  # test1.txt и test2.txt
+        # document.pdf в unavailableFiles
+        assert len(data["unavailableFiles"]) == 1
+
+        # Проверяем, что файлы отсортированы по дате создания
+        # (новые первыми)
+        assert_sorted_by_created_at(data["availableFiles"])
+        assert_sorted_by_created_at(data["unavailableFiles"])
 
         # Проверяем структуру файла
-        for item in data:
+        for item in all_files:
+            assert "id" in item
             assert "name" in item
             assert "size" in item
-            assert "is_file" in item
+            assert "createdAt" in item
 
     def test_list_files_contains_correct_metadata(self, client):
         """Проверить, что метаданные файла корректны."""
@@ -99,17 +122,27 @@ class TestListFilesEndpoint:
         assert response.status_code == 200
         data = response.json()
 
-        # Находим test1.txt
-        test1 = next((item for item in data if item["name"] == "test1.txt"), None)
-        assert test1 is not None
-        assert test1["is_file"] is True
-        assert test1["size"] == 14  # длина "Test content 1"
+        # Объединяем все файлы из обоих списков
+        all_files = data["availableFiles"] + data["unavailableFiles"]
 
-        # Находим поддиректорию
-        subdir = next((item for item in data if item["name"] == "subdir"), None)
-        assert subdir is not None
-        assert subdir["is_file"] is False
-        assert subdir["size"] == 0
+        # Находим test1.txt (должен быть в availableFiles)
+        test1 = next((item for item in all_files if item["name"] == "test1.txt"), None)
+        assert test1 is not None
+        assert test1["size"] == 14  # длина "Test content 1"
+        assert test1["id"] == "test1.txt"
+        assert "createdAt" in test1
+
+        # Находим document.pdf (должен быть в unavailableFiles)
+        pdf_file = next(
+            (item for item in all_files if item["name"] == "document.pdf"), None
+        )
+        assert pdf_file is not None
+        assert pdf_file["size"] == 16  # длина b"PDF content here"
+        assert pdf_file["id"] == "document.pdf"
+
+        # Директории не должны присутствовать в ответе
+        subdir = next((item for item in all_files if item["name"] == "subdir"), None)
+        assert subdir is None
 
     def test_list_files_nonexistent_directory(self, monkeypatch):
         """Проверить вывод списка файлов, когда директория
@@ -135,6 +168,71 @@ class TestListFilesEndpoint:
         response = client.get("/files")
         assert response.status_code == 400
         assert "Files path is not a directory" in response.json()["detail"]
+
+    def test_list_files_filters_by_size_and_format(self, monkeypatch):
+        """Проверить, что файлы фильтруются по размеру и формату."""
+        from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Создаем .txt файл меньше 10 МБ
+            # (должен быть в availableFiles)
+            small_txt = Path(tmpdir) / "small.txt"
+            small_txt.write_bytes(b"x" * 1024)
+
+            # Создаем .pdf файл меньше 10 МБ
+            # (не .txt - в unavailableFiles)
+            small_pdf = Path(tmpdir) / "small.pdf"
+            small_pdf.write_bytes(b"x" * 1024)
+
+            # Создаем .txt файл ровно 10 МБ
+            # (большой - в unavailableFiles)
+            exact_10mb = Path(tmpdir) / "exact_10mb.txt"
+            exact_10mb.write_bytes(b"x" * MAX_AVAILABLE_FILE_SIZE)
+
+            # Создаем .txt файл больше 10 МБ
+            # (большой - в unavailableFiles)
+            large_txt = Path(tmpdir) / "large.txt"
+            large_txt.write_bytes(b"x" * int(MAX_AVAILABLE_FILE_SIZE * 1.5))
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            response = client.get("/files")
+            assert response.status_code == 200
+            data = response.json()
+
+            # Только маленький .txt файл в availableFiles
+            available_names = [f["name"] for f in data["availableFiles"]]
+            assert "small.txt" in available_names
+
+            # Все остальные в unavailableFiles
+            not_available_names = [f["name"] for f in data["unavailableFiles"]]
+            assert "small.pdf" in not_available_names  # не .txt
+            assert "exact_10mb.txt" in not_available_names  # большой
+            assert "large.txt" in not_available_names  # большой
+
+            # Проверяем количество
+            assert len(data["availableFiles"]) == 1
+            assert len(data["unavailableFiles"]) == 3
+
+    def test_list_files_txt_only_in_available(self, client):
+        """Проверить, что только .txt файлы в availableFiles."""
+        response = client.get("/files")
+        assert response.status_code == 200
+        data = response.json()
+
+        # Только .txt файлы в availableFiles
+        assert len(data["availableFiles"]) == 2  # test1.txt и test2.txt
+        for file in data["availableFiles"]:
+            assert file["name"].lower().endswith(".txt")
+
+        # document.pdf в unavailableFiles (subdir игнорируется)
+        assert len(data["unavailableFiles"]) == 1
+        not_available_names = [f["name"] for f in data["unavailableFiles"]]
+        assert "document.pdf" in not_available_names
+        # Директории не включаются в результаты
+        assert "subdir" not in not_available_names
 
 
 class TestDownloadFileEndpoint:
@@ -269,7 +367,8 @@ class TestEdgeCases:
 
             response = client.get("/files")
             assert response.status_code == 200
-            assert response.json() == []
+            data = response.json()
+            assert data == {"availableFiles": [], "unavailableFiles": []}
 
     def test_filename_with_spaces(self, monkeypatch):
         """Проверить загрузку файла с пробелами в имени."""
@@ -316,10 +415,12 @@ class TestEdgeCases:
             response = client.get("/files")
             assert response.status_code == 200
             data = response.json()
-            assert len(data) == 100
-            # Проверяем, что файлы отсортированы
-            names = [item["name"] for item in data]
-            assert names == sorted(names)
+            all_files = data["availableFiles"] + data["unavailableFiles"]
+            assert len(all_files) == 100
+            # Проверяем, что файлы отсортированы по дате создания
+            # (новые первыми)
+            assert_sorted_by_created_at(data["availableFiles"])
+            assert_sorted_by_created_at(data["unavailableFiles"])
 
 
 class TestAPIDocumentation:
@@ -363,12 +464,57 @@ class TestExceptionHandling:
 
             try:
                 response = client.get("/files")
-                # Должны получить ошибку 500 из-за отказа в доступе
-                assert response.status_code == 500
-                assert "Error reading directory" in response.json()["detail"]
+                # Должны получить ошибку 403 из-за отказа в доступе
+                assert response.status_code == 403
+                assert "Permission denied" in response.json()["detail"]
             finally:
                 # Восстанавливаем права для очистки
                 test_dir.chmod(0o755)
+
+    def test_list_files_oserror(self, monkeypatch):
+        """Проверить обработку OSError при чтении директории."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.txt"
+            test_file.write_text("content")
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            # Мокируем iterdir для возбуждения OSError
+            with mock.patch(
+                "pathlib.Path.iterdir",
+                side_effect=OSError("Disk error"),
+            ):
+                response = client.get("/files")
+                # Должны получить ошибку 500 из-за OSError
+                assert response.status_code == 500
+                assert "OS error" in response.json()["detail"]
+
+    def test_list_files_unexpected_error(self, monkeypatch):
+        """Проверить обработку неожиданных исключений."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.txt"
+            test_file.write_text("content")
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            # Мокируем iterdir для возбуждения произвольного Exception
+            with mock.patch(
+                "pathlib.Path.iterdir",
+                side_effect=RuntimeError("Unexpected error"),
+            ):
+                response = client.get("/files")
+                # Должны получить ошибку 500 из-за неожиданного
+                # исключения
+                assert response.status_code == 500
+                assert "Unexpected error" in response.json()["detail"]
 
     def test_security_value_error_with_mock(self, monkeypatch):
         """Проверить, что ValueError в commonpath перехватывается."""
