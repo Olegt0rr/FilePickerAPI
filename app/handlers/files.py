@@ -37,23 +37,6 @@ def check_file_availability(file_path: Path, file_size: int) -> bool:
     return file_size < MAX_AVAILABLE_FILE_SIZE and file_path.suffix.lower() == ".txt"
 
 
-def is_file_available(file_info: "FileInfo") -> bool:
-    """Проверить, доступен ли файл для импорта.
-
-    Файл считается доступным, если:
-    - Размер меньше 10 МБ
-    - Формат .txt
-
-    Args:
-        file_info: Информация о файле
-
-    Returns:
-        True, если файл доступен для импорта
-
-    """
-    return check_file_availability(Path(file_info.name), file_info.size)
-
-
 class CamelCaseModel(BaseModel):
     """Базовая модель с автоматическим преобразованием в camelCase."""
 
@@ -139,7 +122,7 @@ async def list_files() -> FileListResponse:
     available_files = []
     unavailable_files = []
     for file_info in file_list:
-        if is_file_available(file_info):
+        if check_file_availability(Path(file_info.name), file_info.size):
             available_files.append(file_info)
         else:
             unavailable_files.append(file_info)
