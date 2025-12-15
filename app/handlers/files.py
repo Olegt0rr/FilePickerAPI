@@ -107,8 +107,14 @@ async def list_files() -> FileListResponse:
                     ),
                 )
             )
+    except PermissionError as e:
+        msg = f"Permission denied when reading directory: {e!s}"
+        raise HTTPException(status_code=403, detail=msg) from e
+    except OSError as e:
+        msg = f"OS error when reading directory: {e!s}"
+        raise HTTPException(status_code=500, detail=msg) from e
     except Exception as e:
-        msg = f"Error reading directory: {e!s}"
+        msg = f"Unexpected error when reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
     # Сортировка файлов по дате создания (новые первыми)
