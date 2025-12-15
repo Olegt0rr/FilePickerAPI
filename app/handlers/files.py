@@ -48,7 +48,15 @@ class CamelCaseModel(BaseModel):
 
 
 class FileInfo(CamelCaseModel):
-    """Модель информации о файле."""
+    """Модель информации о файле.
+
+    Attributes:
+        id: Идентификатор файла (имя файла)
+        name: Имя файла
+        size: Размер файла в байтах
+        created_at: Дата и время создания файла в формате ISO 8601 (UTC)
+
+    """
 
     id: str
     name: str
