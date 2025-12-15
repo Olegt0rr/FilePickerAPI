@@ -2,8 +2,10 @@
 
 import os
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -18,9 +20,11 @@ MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
 class FileInfo(BaseModel):
     """Модель информации о файле."""
 
+    id: str
     name: str
     size: int
     is_file: bool
+    created_at: float = Field(..., serialization_alias="createdAt")
 
 
 class FileListResponse(BaseModel):
@@ -37,11 +41,13 @@ async def list_files() -> FileListResponse:
     """Получить список всех файлов в настроенной директории.
 
     Файлы разделяются на две категории:
-    - availableFiles: файлы размером меньше 10 МБ
-    - notAvailableFiles: файлы размером 10 МБ и больше
+    - availableFiles: файлы .txt размером меньше 10 МБ
+    - notAvailableFiles: файлы других форматов или размером
+      10 МБ и больше
 
     Returns:
-        Объект с двумя списками файлов
+        Объект с двумя списками файлов, отсортированными по дате
+        создания (новые первыми)
 
     """
     files_path = Path(get_settings().files_directory)
@@ -58,33 +64,51 @@ async def list_files() -> FileListResponse:
     try:
         for item in files_path.iterdir():
             is_file = item.is_file()
+            stat = item.stat()
             file_list.append(
                 FileInfo(
+                    id=item.name,
                     name=item.name,
-                    size=item.stat().st_size if is_file else 0,
+                    size=stat.st_size if is_file else 0,
                     is_file=is_file,
+                    created_at=stat.st_ctime,
                 )
             )
     except Exception as e:
         msg = f"Error reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
-    # Фильтрация файлов по размеру
-    available_files = [f for f in file_list if f.size < MAX_AVAILABLE_FILE_SIZE]
-    not_available_files = [f for f in file_list if f.size >= MAX_AVAILABLE_FILE_SIZE]
+    # Фильтрация файлов: только .txt файлы меньше 10 МБ доступны
+    # для импорта
+    available_files = [
+        f
+        for f in file_list
+        if f.size < MAX_AVAILABLE_FILE_SIZE and f.name.lower().endswith(".txt")
+    ]
+    not_available_files = [
+        f
+        for f in file_list
+        if f.size >= MAX_AVAILABLE_FILE_SIZE or not f.name.lower().endswith(".txt")
+    ]
 
     return FileListResponse(
-        available_files=sorted(available_files, key=lambda x: x.name),
-        not_available_files=sorted(not_available_files, key=lambda x: x.name),
+        available_files=sorted(
+            available_files, key=lambda x: x.created_at, reverse=True
+        ),
+        not_available_files=sorted(
+            not_available_files, key=lambda x: x.created_at, reverse=True
+        ),
     )
 
 
-@router.get("/{filename}")
-async def get_file(filename: str) -> FileResponse:
+@router.get("/{fileId}")
+async def get_file(
+    file_id: Annotated[str, PathParam(alias="fileId")],
+) -> FileResponse:
     """Скачать определенный файл из настроенной директории.
 
     Args:
-        filename: Имя файла для загрузки
+        file_id: ID файла для загрузки (имя файла)
 
     Returns:
         Ответ с запрашиваемым файлом
@@ -94,7 +118,7 @@ async def get_file(filename: str) -> FileResponse:
     # Получаем абсолютные пути и проверяем, что файл находится
     # в разрешенной директории
     base_dir = Path(get_settings().files_directory).resolve()
-    requested_path = (Path(get_settings().files_directory) / filename).resolve()
+    requested_path = (Path(get_settings().files_directory) / file_id).resolve()
 
     # Проверяем, что разрешенный путь находится внутри
     # базовой директории

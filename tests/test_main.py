@@ -86,21 +86,31 @@ class TestListFilesEndpoint:
         assert isinstance(data["availableFiles"], list)
         assert isinstance(data["notAvailableFiles"], list)
 
-        # Все файлы должны быть в availableFiles (все меньше 10 МБ)
+        # Все файлы из обоих списков
         all_files = data["availableFiles"] + data["notAvailableFiles"]
         assert len(all_files) == 4  # 3 файла + 1 поддиректория
 
-        # Проверяем, что файлы отсортированы по имени в каждом списке
-        available_names = [item["name"] for item in data["availableFiles"]]
-        assert available_names == sorted(available_names)
-        not_available_names = [item["name"] for item in data["notAvailableFiles"]]
-        assert not_available_names == sorted(not_available_names)
+        # Только .txt файлы в availableFiles
+        assert len(data["availableFiles"]) == 2  # test1.txt и test2.txt
+        # document.pdf и subdir в notAvailableFiles
+        assert len(data["notAvailableFiles"]) == 2
+
+        # Проверяем, что файлы отсортированы по дате создания
+        # (новые первыми)
+        if len(data["availableFiles"]) > 1:
+            created_times = [item["createdAt"] for item in data["availableFiles"]]
+            assert created_times == sorted(created_times, reverse=True)
+        if len(data["notAvailableFiles"]) > 1:
+            created_times = [item["createdAt"] for item in data["notAvailableFiles"]]
+            assert created_times == sorted(created_times, reverse=True)
 
         # Проверяем структуру файла
         for item in all_files:
+            assert "id" in item
             assert "name" in item
             assert "size" in item
             assert "is_file" in item
+            assert "createdAt" in item
 
     def test_list_files_contains_correct_metadata(self, client):
         """Проверить, что метаданные файла корректны."""
@@ -111,17 +121,20 @@ class TestListFilesEndpoint:
         # Объединяем все файлы из обоих списков
         all_files = data["availableFiles"] + data["notAvailableFiles"]
 
-        # Находим test1.txt
+        # Находим test1.txt (должен быть в availableFiles)
         test1 = next((item for item in all_files if item["name"] == "test1.txt"), None)
         assert test1 is not None
         assert test1["is_file"] is True
         assert test1["size"] == 14  # длина "Test content 1"
+        assert test1["id"] == "test1.txt"
+        assert "createdAt" in test1
 
-        # Находим поддиректорию
+        # Находим поддиректорию (должна быть в notAvailableFiles)
         subdir = next((item for item in all_files if item["name"] == "subdir"), None)
         assert subdir is not None
         assert subdir["is_file"] is False
         assert subdir["size"] == 0
+        assert subdir["id"] == "subdir"
 
     def test_list_files_nonexistent_directory(self, monkeypatch):
         """Проверить вывод списка файлов, когда директория
@@ -148,22 +161,30 @@ class TestListFilesEndpoint:
         assert response.status_code == 400
         assert "Files path is not a directory" in response.json()["detail"]
 
-    def test_list_files_filters_by_size(self, monkeypatch):
-        """Проверить, что файлы фильтруются по размеру (10 МБ)."""
+    def test_list_files_filters_by_size_and_format(self, monkeypatch):
+        """Проверить, что файлы фильтруются по размеру и формату."""
         from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Создаем файл меньше 10 МБ
-            small_file = Path(tmpdir) / "small.txt"
-            small_file.write_bytes(b"x" * 1024)  # 1 КБ
+            # Создаем .txt файл меньше 10 МБ
+            # (должен быть в availableFiles)
+            small_txt = Path(tmpdir) / "small.txt"
+            small_txt.write_bytes(b"x" * 1024)
 
-            # Создаем файл ровно 10 МБ
-            exact_10mb = Path(tmpdir) / "exact_10mb.bin"
+            # Создаем .pdf файл меньше 10 МБ
+            # (не .txt - в notAvailableFiles)
+            small_pdf = Path(tmpdir) / "small.pdf"
+            small_pdf.write_bytes(b"x" * 1024)
+
+            # Создаем .txt файл ровно 10 МБ
+            # (большой - в notAvailableFiles)
+            exact_10mb = Path(tmpdir) / "exact_10mb.txt"
             exact_10mb.write_bytes(b"x" * MAX_AVAILABLE_FILE_SIZE)
 
-            # Создаем файл больше 10 МБ
-            large_file = Path(tmpdir) / "large.bin"
-            large_file.write_bytes(b"x" * int(MAX_AVAILABLE_FILE_SIZE * 1.5))
+            # Создаем .txt файл больше 10 МБ
+            # (большой - в notAvailableFiles)
+            large_txt = Path(tmpdir) / "large.txt"
+            large_txt.write_bytes(b"x" * int(MAX_AVAILABLE_FILE_SIZE * 1.5))
 
             monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
             test_app = reload_app()
@@ -173,28 +194,36 @@ class TestListFilesEndpoint:
             assert response.status_code == 200
             data = response.json()
 
-            # Проверяем, что маленький файл в availableFiles
+            # Только маленький .txt файл в availableFiles
             available_names = [f["name"] for f in data["availableFiles"]]
             assert "small.txt" in available_names
 
-            # Проверяем, что большие файлы в notAvailableFiles
+            # Все остальные в notAvailableFiles
             not_available_names = [f["name"] for f in data["notAvailableFiles"]]
-            assert "exact_10mb.bin" in not_available_names
-            assert "large.bin" in not_available_names
+            assert "small.pdf" in not_available_names  # не .txt
+            assert "exact_10mb.txt" in not_available_names  # большой
+            assert "large.txt" in not_available_names  # большой
 
             # Проверяем количество
             assert len(data["availableFiles"]) == 1
-            assert len(data["notAvailableFiles"]) == 2
+            assert len(data["notAvailableFiles"]) == 3
 
-    def test_list_files_all_small_files(self, client):
-        """Проверить, что все тестовые файлы меньше 10 МБ."""
+    def test_list_files_txt_only_in_available(self, client):
+        """Проверить, что только .txt файлы в availableFiles."""
         response = client.get("/files")
         assert response.status_code == 200
         data = response.json()
 
-        # Все тестовые файлы маленькие, должны быть в availableFiles
-        assert len(data["availableFiles"]) == 4
-        assert len(data["notAvailableFiles"]) == 0
+        # Только .txt файлы в availableFiles
+        assert len(data["availableFiles"]) == 2  # test1.txt и test2.txt
+        for file in data["availableFiles"]:
+            assert file["name"].lower().endswith(".txt")
+
+        # document.pdf и subdir в notAvailableFiles
+        assert len(data["notAvailableFiles"]) == 2
+        not_available_names = [f["name"] for f in data["notAvailableFiles"]]
+        assert "document.pdf" in not_available_names
+        assert "subdir" in not_available_names
 
 
 class TestDownloadFileEndpoint:
@@ -379,11 +408,16 @@ class TestEdgeCases:
             data = response.json()
             all_files = data["availableFiles"] + data["notAvailableFiles"]
             assert len(all_files) == 100
-            # Проверяем, что файлы отсортированы в каждом списке
-            available_names = [item["name"] for item in data["availableFiles"]]
-            assert available_names == sorted(available_names)
-            not_available_names = [item["name"] for item in data["notAvailableFiles"]]
-            assert not_available_names == sorted(not_available_names)
+            # Проверяем, что файлы отсортированы по дате создания
+            # (новые первыми)
+            if len(data["availableFiles"]) > 1:
+                available_times = [item["createdAt"] for item in data["availableFiles"]]
+                assert available_times == sorted(available_times, reverse=True)
+            if len(data["notAvailableFiles"]) > 1:
+                not_available_times = [
+                    item["createdAt"] for item in data["notAvailableFiles"]
+                ]
+                assert not_available_times == sorted(not_available_times, reverse=True)
 
 
 class TestAPIDocumentation:
