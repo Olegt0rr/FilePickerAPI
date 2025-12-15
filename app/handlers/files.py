@@ -18,6 +18,25 @@ router = APIRouter(prefix="/files", tags=["files"])
 MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
 
 
+def is_file_available(file_info: "FileInfo") -> bool:
+    """Проверить, доступен ли файл для импорта.
+
+    Файл считается доступным, если:
+    - Размер меньше 10 МБ
+    - Формат .txt
+
+    Args:
+        file_info: Информация о файле
+
+    Returns:
+        True, если файл доступен для импорта
+
+    """
+    return file_info.size < MAX_AVAILABLE_FILE_SIZE and file_info.name.lower().endswith(
+        ".txt"
+    )
+
+
 class CamelCaseModel(BaseModel):
     """Базовая модель с автоматическим преобразованием в camelCase."""
 
@@ -86,18 +105,14 @@ async def list_files() -> FileListResponse:
         msg = f"Error reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
-    # Фильтрация файлов: только .txt файлы меньше 10 МБ доступны
-    # для импорта
-    available_files = [
-        f
-        for f in file_list
-        if f.size < MAX_AVAILABLE_FILE_SIZE and f.name.lower().endswith(".txt")
-    ]
-    not_available_files = [
-        f
-        for f in file_list
-        if f.size >= MAX_AVAILABLE_FILE_SIZE or not f.name.lower().endswith(".txt")
-    ]
+    # Разделение файлов на доступные и недоступные
+    available_files = []
+    not_available_files = []
+    for file_info in file_list:
+        if is_file_available(file_info):
+            available_files.append(file_info)
+        else:
+            not_available_files.append(file_info)
 
     return FileListResponse(
         available_files=sorted(
