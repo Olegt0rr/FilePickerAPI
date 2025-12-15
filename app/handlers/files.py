@@ -8,7 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException
 from fastapi import Path as PathParam
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from app.settings import get_settings
@@ -48,20 +48,14 @@ class CamelCaseModel(BaseModel):
 
 
 class FileInfo(CamelCaseModel):
-    """Модель информации о файле.
+    """Модель информации о файле."""
 
-    Attributes:
-        id: Идентификатор файла (имя файла)
-        name: Имя файла
-        size: Размер файла в байтах
-        created_at: Дата и время создания файла в формате ISO 8601 (UTC)
-
-    """
-
-    id: str
-    name: str
-    size: int
-    created_at: datetime
+    id: str = Field(description="Идентификатор файла (имя файла)")
+    name: str = Field(description="Имя файла")
+    size: int = Field(description="Размер файла в байтах")
+    created_at: datetime = Field(
+        description="Дата и время создания файла в формате ISO 8601 (UTC)"
+    )
 
 
 class FileListResponse(CamelCaseModel):
@@ -114,6 +108,9 @@ async def list_files() -> FileListResponse:
         msg = f"Error reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
+    # Сортировка файлов по дате создания (новые первыми)
+    file_list.sort(key=lambda x: x.created_at, reverse=True)
+
     # Разделение файлов на доступные и недоступные
     available_files = []
     not_available_files = []
@@ -124,12 +121,8 @@ async def list_files() -> FileListResponse:
             not_available_files.append(file_info)
 
     return FileListResponse(
-        available_files=sorted(
-            available_files, key=lambda x: x.created_at, reverse=True
-        ),
-        not_available_files=sorted(
-            not_available_files, key=lambda x: x.created_at, reverse=True
-        ),
+        available_files=available_files,
+        not_available_files=not_available_files,
     )
 
 
