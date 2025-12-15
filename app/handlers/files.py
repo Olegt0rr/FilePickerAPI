@@ -11,6 +11,9 @@ from app.settings import get_settings
 
 router = APIRouter(prefix="/files", tags=["files"])
 
+# Максимальный размер файла для импорта (10 МБ)
+MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
+
 
 class FileInfo(BaseModel):
     """Модель информации о файле."""
@@ -66,10 +69,9 @@ async def list_files() -> FileListResponse:
         msg = f"Error reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
-    # Фильтрация файлов по размеру (10 МБ = 10 * 1024 * 1024 байт)
-    ten_mb = 10 * 1024 * 1024
-    available_files = [f for f in file_list if f.size < ten_mb]
-    not_available_files = [f for f in file_list if f.size >= ten_mb]
+    # Фильтрация файлов по размеру
+    available_files = [f for f in file_list if f.size < MAX_AVAILABLE_FILE_SIZE]
+    not_available_files = [f for f in file_list if f.size >= MAX_AVAILABLE_FILE_SIZE]
 
     return FileListResponse(
         available_files=sorted(available_files, key=lambda x: x.name),

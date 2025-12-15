@@ -150,6 +150,8 @@ class TestListFilesEndpoint:
 
     def test_list_files_filters_by_size(self, monkeypatch):
         """Проверить, что файлы фильтруются по размеру (10 МБ)."""
+        from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
+
         with tempfile.TemporaryDirectory() as tmpdir:
             # Создаем файл меньше 10 МБ
             small_file = Path(tmpdir) / "small.txt"
@@ -157,11 +159,11 @@ class TestListFilesEndpoint:
 
             # Создаем файл ровно 10 МБ
             exact_10mb = Path(tmpdir) / "exact_10mb.bin"
-            exact_10mb.write_bytes(b"x" * (10 * 1024 * 1024))  # 10 МБ
+            exact_10mb.write_bytes(b"x" * MAX_AVAILABLE_FILE_SIZE)
 
             # Создаем файл больше 10 МБ
             large_file = Path(tmpdir) / "large.bin"
-            large_file.write_bytes(b"x" * (15 * 1024 * 1024))  # 15 МБ
+            large_file.write_bytes(b"x" * int(MAX_AVAILABLE_FILE_SIZE * 1.5))
 
             monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
             test_app = reload_app()
