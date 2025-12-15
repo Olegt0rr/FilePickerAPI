@@ -33,8 +33,9 @@ def is_file_available(file_info: "FileInfo") -> bool:
         True, если файл доступен для импорта
 
     """
-    return file_info.size < MAX_AVAILABLE_FILE_SIZE and file_info.name.lower().endswith(
-        ".txt"
+    return (
+        file_info.size < MAX_AVAILABLE_FILE_SIZE
+        and Path(file_info.name).suffix.lower() == ".txt"
     )
 
 
