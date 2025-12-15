@@ -57,7 +57,7 @@ class FileInfo(CamelCaseModel):
 
 
 class FileListResponse(CamelCaseModel):
-    """Модель ответа со списком файлов, отфильтрованных по размеру."""
+    """Модель ответа со списком файлов."""
 
     available_files: list[FileInfo]
     not_available_files: list[FileInfo]
