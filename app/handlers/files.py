@@ -102,7 +102,9 @@ async def list_files() -> FileListResponse:
                     id=item.name,
                     name=item.name,
                     size=stat.st_size,
-                    created_at=datetime.fromtimestamp(stat.st_ctime, tz=UTC),
+                    created_at=datetime.fromtimestamp(
+                        getattr(stat, "st_birthtime", stat.st_mtime), tz=UTC
+                    ),
                 )
             )
     except Exception as e:
