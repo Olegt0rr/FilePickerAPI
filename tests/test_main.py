@@ -464,12 +464,57 @@ class TestExceptionHandling:
 
             try:
                 response = client.get("/files")
-                # Должны получить ошибку 500 из-за отказа в доступе
-                assert response.status_code == 500
-                assert "Error reading directory" in response.json()["detail"]
+                # Должны получить ошибку 403 из-за отказа в доступе
+                assert response.status_code == 403
+                assert "Permission denied" in response.json()["detail"]
             finally:
                 # Восстанавливаем права для очистки
                 test_dir.chmod(0o755)
+
+    def test_list_files_oserror(self, monkeypatch):
+        """Проверить обработку OSError при чтении директории."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.txt"
+            test_file.write_text("content")
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            # Мокируем iterdir для возбуждения OSError
+            with mock.patch(
+                "pathlib.Path.iterdir",
+                side_effect=OSError("Disk error"),
+            ):
+                response = client.get("/files")
+                # Должны получить ошибку 500 из-за OSError
+                assert response.status_code == 500
+                assert "OS error" in response.json()["detail"]
+
+    def test_list_files_unexpected_error(self, monkeypatch):
+        """Проверить обработку неожиданных исключений."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "test.txt"
+            test_file.write_text("content")
+
+            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
+            test_app = reload_app()
+            client = TestClient(test_app)
+
+            # Мокируем iterdir для возбуждения произвольного Exception
+            with mock.patch(
+                "pathlib.Path.iterdir",
+                side_effect=RuntimeError("Unexpected error"),
+            ):
+                response = client.get("/files")
+                # Должны получить ошибку 500 из-за неожиданного
+                # исключения
+                assert response.status_code == 500
+                assert "Unexpected error" in response.json()["detail"]
 
     def test_security_value_error_with_mock(self, monkeypatch):
         """Проверить, что ValueError в commonpath перехватывается."""
