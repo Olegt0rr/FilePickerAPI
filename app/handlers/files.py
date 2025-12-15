@@ -52,7 +52,6 @@ class FileInfo(CamelCaseModel):
     id: str
     name: str
     size: int
-    is_file: bool
     created_at: float
 
 
@@ -90,14 +89,15 @@ async def list_files() -> FileListResponse:
     file_list = []
     try:
         for item in files_path.iterdir():
-            is_file = item.is_file()
+            # Игнорируем директории, обрабатываем только файлы
+            if not item.is_file():
+                continue
             stat = item.stat()
             file_list.append(
                 FileInfo(
                     id=item.name,
                     name=item.name,
-                    size=stat.st_size if is_file else 0,
-                    is_file=is_file,
+                    size=stat.st_size,
                     created_at=stat.st_ctime,
                 )
             )

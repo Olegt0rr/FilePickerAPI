@@ -35,17 +35,21 @@
       "id": "example.txt",
       "name": "example.txt",
       "size": 1024,
-      "isFile": true,
       "createdAt": 1765788229.15
     }
   ],
   "notAvailableFiles": [
     {
-      "id": "large_file.bin",
-      "name": "large_file.bin",
+      "id": "large_file.txt",
+      "name": "large_file.txt",
       "size": 15728640,
-      "isFile": true,
       "createdAt": 1765788229.10
+    },
+    {
+      "id": "document.pdf",
+      "name": "document.pdf",
+      "size": 2048,
+      "createdAt": 1765788229.05
     }
   ]
 }

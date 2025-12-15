@@ -95,14 +95,14 @@ class TestListFilesEndpoint:
         assert isinstance(data["availableFiles"], list)
         assert isinstance(data["notAvailableFiles"], list)
 
-        # Все файлы из обоих списков
+        # Все файлы из обоих списков (директории игнорируются)
         all_files = data["availableFiles"] + data["notAvailableFiles"]
-        assert len(all_files) == 4  # 3 файла + 1 поддиректория
+        assert len(all_files) == 3  # 3 файла (директория subdir игнорируется)
 
         # Только .txt файлы в availableFiles
         assert len(data["availableFiles"]) == 2  # test1.txt и test2.txt
-        # document.pdf и subdir в notAvailableFiles
-        assert len(data["notAvailableFiles"]) == 2
+        # document.pdf в notAvailableFiles
+        assert len(data["notAvailableFiles"]) == 1
 
         # Проверяем, что файлы отсортированы по дате создания
         # (новые первыми)
@@ -114,7 +114,6 @@ class TestListFilesEndpoint:
             assert "id" in item
             assert "name" in item
             assert "size" in item
-            assert "isFile" in item
             assert "createdAt" in item
 
     def test_list_files_contains_correct_metadata(self, client):
@@ -129,17 +128,21 @@ class TestListFilesEndpoint:
         # Находим test1.txt (должен быть в availableFiles)
         test1 = next((item for item in all_files if item["name"] == "test1.txt"), None)
         assert test1 is not None
-        assert test1["isFile"] is True
         assert test1["size"] == 14  # длина "Test content 1"
         assert test1["id"] == "test1.txt"
         assert "createdAt" in test1
 
-        # Находим поддиректорию (должна быть в notAvailableFiles)
+        # Находим document.pdf (должен быть в notAvailableFiles)
+        pdf_file = next(
+            (item for item in all_files if item["name"] == "document.pdf"), None
+        )
+        assert pdf_file is not None
+        assert pdf_file["size"] == 16  # длина b"PDF content here"
+        assert pdf_file["id"] == "document.pdf"
+
+        # Директории не должны присутствовать в ответе
         subdir = next((item for item in all_files if item["name"] == "subdir"), None)
-        assert subdir is not None
-        assert subdir["isFile"] is False
-        assert subdir["size"] == 0
-        assert subdir["id"] == "subdir"
+        assert subdir is None
 
     def test_list_files_nonexistent_directory(self, monkeypatch):
         """Проверить вывод списка файлов, когда директория
@@ -224,11 +227,12 @@ class TestListFilesEndpoint:
         for file in data["availableFiles"]:
             assert file["name"].lower().endswith(".txt")
 
-        # document.pdf и subdir в notAvailableFiles
-        assert len(data["notAvailableFiles"]) == 2
+        # document.pdf в notAvailableFiles (subdir игнорируется)
+        assert len(data["notAvailableFiles"]) == 1
         not_available_names = [f["name"] for f in data["notAvailableFiles"]]
         assert "document.pdf" in not_available_names
-        assert "subdir" in not_available_names
+        # Директории не включаются в результаты
+        assert "subdir" not in not_available_names
 
 
 class TestDownloadFileEndpoint:
