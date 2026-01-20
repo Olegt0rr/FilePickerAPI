@@ -64,30 +64,19 @@ class FileListResponse(CamelCaseModel):
     unavailable_files: list[FileInfo]
 
 
-@router.get("", response_model=FileListResponse)
-async def list_files() -> FileListResponse:
-    """Получить список всех файлов в настроенной директории.
+def _collect_file_info(files_path: Path) -> list[FileInfo]:
+    """Собрать информацию о всех .txt файлах в директории.
 
-    Только файлы .txt возвращаются в ответе. Файлы
-    разделяются на две категории:
-    - availableFiles: файлы .txt размером меньше 10 МБ
-    - notAvailableFiles: файлы .txt размером 10 МБ и больше
+    Args:
+        files_path: Путь к директории с файлами
 
     Returns:
-        Объект с двумя списками файлов, отсортированными по дате
-        создания (новые первыми)
+        Список FileInfo объектов для всех .txt файлов
+
+    Raises:
+        HTTPException: При ошибках доступа к файловой системе
 
     """
-    files_path = Path(get_settings().files_directory)
-
-    if not files_path.exists():
-        msg = "Files directory not found"
-        raise HTTPException(status_code=404, detail=msg)
-
-    if not files_path.is_dir():
-        msg = "Files path is not a directory"
-        raise HTTPException(status_code=400, detail=msg)
-
     file_list = []
     try:
         for item in files_path.iterdir():
@@ -118,10 +107,21 @@ async def list_files() -> FileListResponse:
         msg = f"Unexpected error when reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
-    # Сортировка файлов по дате создания (новые первыми)
-    file_list.sort(key=lambda x: x.created_at, reverse=True)
+    return file_list
 
-    # Разделение файлов на доступные и недоступные
+
+def _categorize_files(
+    file_list: list[FileInfo],
+) -> tuple[list[FileInfo], list[FileInfo]]:
+    """Разделить файлы на доступные и недоступные.
+
+    Args:
+        file_list: Список всех файлов
+
+    Returns:
+        Кортеж (доступные_файлы, недоступные_файлы)
+
+    """
     available_files = []
     unavailable_files = []
     for file_info in file_list:
@@ -129,6 +129,42 @@ async def list_files() -> FileListResponse:
             available_files.append(file_info)
         else:
             unavailable_files.append(file_info)
+
+    return available_files, unavailable_files
+
+
+@router.get("", response_model=FileListResponse)
+async def list_files() -> FileListResponse:
+    """Получить список всех файлов в настроенной директории.
+
+    Только файлы .txt возвращаются в ответе. Файлы
+    разделяются на две категории:
+    - availableFiles: файлы .txt размером меньше 10 МБ
+    - notAvailableFiles: файлы .txt размером 10 МБ и больше
+
+    Returns:
+        Объект с двумя списками файлов, отсортированными по дате
+        создания (новые первыми)
+
+    """
+    files_path = Path(get_settings().files_directory)
+
+    if not files_path.exists():
+        msg = "Files directory not found"
+        raise HTTPException(status_code=404, detail=msg)
+
+    if not files_path.is_dir():
+        msg = "Files path is not a directory"
+        raise HTTPException(status_code=400, detail=msg)
+
+    # Собрать информацию о всех .txt файлах
+    file_list = _collect_file_info(files_path)
+
+    # Сортировка файлов по дате создания (новые первыми)
+    file_list.sort(key=lambda x: x.created_at, reverse=True)
+
+    # Разделение файлов на доступные и недоступные
+    available_files, unavailable_files = _categorize_files(file_list)
 
     return FileListResponse(
         available_files=available_files,
