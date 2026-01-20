@@ -95,14 +95,17 @@ class TestListFilesEndpoint:
         assert isinstance(data["availableFiles"], list)
         assert isinstance(data["unavailableFiles"], list)
 
-        # Все файлы из обоих списков (директории игнорируются)
+        # Все файлы из обоих списков
+        # (директории и не-.txt файлы игнорируются)
         all_files = data["availableFiles"] + data["unavailableFiles"]
-        assert len(all_files) == 3  # 3 файла (директория subdir игнорируется)
+        # 2 .txt файла (директория subdir и
+        # document.pdf игнорируются)
+        assert len(all_files) == 2
 
         # Только .txt файлы в availableFiles
         assert len(data["availableFiles"]) == 2  # test1.txt и test2.txt
-        # document.pdf в unavailableFiles
-        assert len(data["unavailableFiles"]) == 1
+        # Больших .txt файлов нет, поэтому unavailableFiles пустой
+        assert len(data["unavailableFiles"]) == 0
 
         # Проверяем, что файлы отсортированы по дате создания
         # (новые первыми)
@@ -132,13 +135,11 @@ class TestListFilesEndpoint:
         assert test1["id"] == "test1.txt"
         assert "createdAt" in test1
 
-        # Находим document.pdf (должен быть в unavailableFiles)
+        # document.pdf не должен присутствовать (не .txt файл)
         pdf_file = next(
             (item for item in all_files if item["name"] == "document.pdf"), None
         )
-        assert pdf_file is not None
-        assert pdf_file["size"] == 16  # длина b"PDF content here"
-        assert pdf_file["id"] == "document.pdf"
+        assert pdf_file is None
 
         # Директории не должны присутствовать в ответе
         subdir = next((item for item in all_files if item["name"] == "subdir"), None)
@@ -206,15 +207,16 @@ class TestListFilesEndpoint:
             available_names = [f["name"] for f in data["availableFiles"]]
             assert "small.txt" in available_names
 
-            # Все остальные в unavailableFiles
+            # Все большие .txt файлы в unavailableFiles
             not_available_names = [f["name"] for f in data["unavailableFiles"]]
-            assert "small.pdf" in not_available_names  # не .txt
+            # small.pdf не включается (не .txt файл)
+            assert "small.pdf" not in not_available_names
             assert "exact_10mb.txt" in not_available_names  # большой
             assert "large.txt" in not_available_names  # большой
 
-            # Проверяем количество
+            # Проверяем количество (small.pdf игнорируется)
             assert len(data["availableFiles"]) == 1
-            assert len(data["unavailableFiles"]) == 3
+            assert len(data["unavailableFiles"]) == 2
 
     def test_list_files_txt_only_in_available(self, client):
         """Проверить, что только .txt файлы в availableFiles."""
@@ -227,10 +229,12 @@ class TestListFilesEndpoint:
         for file in data["availableFiles"]:
             assert file["name"].lower().endswith(".txt")
 
-        # document.pdf в unavailableFiles (subdir игнорируется)
-        assert len(data["unavailableFiles"]) == 1
+        # document.pdf игнорируется (не .txt файл),
+        # subdir игнорируется (директория)
+        assert len(data["unavailableFiles"]) == 0
         not_available_names = [f["name"] for f in data["unavailableFiles"]]
-        assert "document.pdf" in not_available_names
+        # document.pdf не включается (не .txt файл)
+        assert "document.pdf" not in not_available_names
         # Директории не включаются в результаты
         assert "subdir" not in not_available_names
 

@@ -68,10 +68,10 @@ class FileListResponse(CamelCaseModel):
 async def list_files() -> FileListResponse:
     """Получить список всех файлов в настроенной директории.
 
-    Файлы разделяются на две категории:
+    Только файлы .txt возвращаются в ответе. Файлы
+    разделяются на две категории:
     - availableFiles: файлы .txt размером меньше 10 МБ
-    - notAvailableFiles: файлы других форматов или размером
-      10 МБ и больше
+    - notAvailableFiles: файлы .txt размером 10 МБ и больше
 
     Returns:
         Объект с двумя списками файлов, отсортированными по дате
@@ -93,6 +93,9 @@ async def list_files() -> FileListResponse:
         for item in files_path.iterdir():
             # Игнорируем директории, обрабатываем только файлы
             if not item.is_file():
+                continue
+            # Игнорируем файлы, которые не являются .txt
+            if item.suffix.lower() != ".txt":
                 continue
             stat = item.stat()
             file_list.append(
