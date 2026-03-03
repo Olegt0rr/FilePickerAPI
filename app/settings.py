@@ -10,7 +10,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-    files_directory: str = "./files"
+    files_directory: str = r"\\localmq.neadru.local\Payments\5000\CENTER\RSB"
     cors_origins: str = "*"
 
     @property
