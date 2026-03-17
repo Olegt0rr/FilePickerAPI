@@ -132,22 +132,6 @@ FilePickerAPI.exe
 
 ## Конфигурация
 
-### Директория с файлами
-
-По умолчанию приложение обслуживает файлы из директории `./files`. Вы можете изменить это, установив переменную окружения `FILES_DIRECTORY`:
-
-**Linux/Mac:**
-```bash
-export FILES_DIRECTORY="/path/to/your/files"
-python -m app
-```
-
-**Windows:**
-```cmd
-set FILES_DIRECTORY=C:\path\to\your\files
-FilePickerAPI.exe
-```
-
 ### CORS Origins
 
 По умолчанию CORS включен для всех источников (`*`). Для производственного использования следует ограничить это определенными доменами, установив переменную окружения `CORS_ORIGINS` со списком источников через запятую:

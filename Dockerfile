@@ -29,7 +29,6 @@ RUN mkdir -p /app/files
 ENV PATH=/root/.local/bin:$PATH
 
 # Environment variables (can be overridden at runtime)
-ENV FILES_DIRECTORY=/app/files
 ENV CORS_ORIGINS=*
 
 # Expose port
