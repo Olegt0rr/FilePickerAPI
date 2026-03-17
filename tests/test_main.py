@@ -3,7 +3,6 @@
 """
 
 import importlib
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -12,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-def reload_app():
+def reload_app(files_directory=None):
     """Вспомогательная функция для перезагрузки главного модуля.
 
     С обновленными переменными окружения.
@@ -29,6 +28,10 @@ def reload_app():
         importlib.reload(sys.modules["app.handlers.files"])
     if "app" in sys.modules:
         importlib.reload(sys.modules["app"])
+    import app.settings as settings_module
+
+    if files_directory is not None:
+        settings_module.Settings.files_directory = files_directory
     from app import app as test_app
 
     return test_app
@@ -68,12 +71,11 @@ def test_files_dir():
 def client(test_files_dir, monkeypatch):
     """Создать тестовый клиент с временной директорией файлов."""
     # Устанавливаем переменную окружения перед импортом
-    monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
     monkeypatch.setenv("CORS_ORIGINS", "*")
 
     # Принудительно перезагружаем главный модуль для применения
     # новых переменных окружения
-    test_app = reload_app()
+    test_app = reload_app(files_directory=test_files_dir)
     return TestClient(test_app)
 
 
@@ -145,32 +147,30 @@ class TestListFilesEndpoint:
         subdir = next((item for item in all_files if item["name"] == "subdir"), None)
         assert subdir is None
 
-    def test_list_files_nonexistent_directory(self, monkeypatch):
+    def test_list_files_nonexistent_directory(self):
         """Проверить вывод списка файлов, когда директория
         не существует.
         """
-        monkeypatch.setenv("FILES_DIRECTORY", "/nonexistent/path")
-        test_app = reload_app()
+        test_app = reload_app(files_directory="/nonexistent/path")
         client = TestClient(test_app)
 
         response = client.get("/files")
         assert response.status_code == 404
         assert "Files directory not found" in response.json()["detail"]
 
-    def test_list_files_when_path_is_file(self, test_files_dir, monkeypatch):
+    def test_list_files_when_path_is_file(self, test_files_dir):
         """Проверить вывод списка файлов, когда FILES_DIRECTORY
         указывает на файл.
         """
         file_path = Path(test_files_dir) / "test1.txt"
-        monkeypatch.setenv("FILES_DIRECTORY", str(file_path))
-        test_app = reload_app()
+        test_app = reload_app(files_directory=str(file_path))
         client = TestClient(test_app)
 
         response = client.get("/files")
         assert response.status_code == 400
         assert "Files path is not a directory" in response.json()["detail"]
 
-    def test_list_files_filters_by_size_and_format(self, monkeypatch):
+    def test_list_files_filters_by_size_and_format(self):
         """Проверить, что файлы фильтруются по размеру и формату."""
         from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
 
@@ -195,8 +195,7 @@ class TestListFilesEndpoint:
             large_txt = Path(tmpdir) / "large.txt"
             large_txt.write_bytes(b"x" * int(MAX_AVAILABLE_FILE_SIZE * 1.5))
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files")
@@ -276,7 +275,7 @@ class TestDownloadFileEndpoint:
         assert response.status_code == 400
         assert "Path is not a file" in response.json()["detail"]
 
-    def test_download_unavailable_large_file(self, monkeypatch):
+    def test_download_unavailable_large_file(self):
         """Проверить, что большие файлы нельзя загрузить."""
         from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
 
@@ -285,30 +284,28 @@ class TestDownloadFileEndpoint:
             large_txt = Path(tmpdir) / "large.txt"
             large_txt.write_bytes(b"x" * MAX_AVAILABLE_FILE_SIZE)
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files/large.txt")
             assert response.status_code == 403
             assert "File is not available for download" in response.json()["detail"]
 
-    def test_download_unavailable_non_txt_file(self, monkeypatch):
+    def test_download_unavailable_non_txt_file(self):
         """Проверить, что не .txt файлы нельзя загрузить."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Создаем маленький .pdf файл (недоступен)
             small_pdf = Path(tmpdir) / "small.pdf"
             small_pdf.write_bytes(b"PDF content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files/small.pdf")
             assert response.status_code == 403
             assert "File is not available for download" in response.json()["detail"]
 
-    def test_download_available_file_just_under_limit(self, monkeypatch):
+    def test_download_available_file_just_under_limit(self):
         """Проверить, что файлы чуть меньше лимита можно загрузить."""
         from app.handlers.files import MAX_AVAILABLE_FILE_SIZE
 
@@ -317,8 +314,7 @@ class TestDownloadFileEndpoint:
             almost_limit = Path(tmpdir) / "almost_limit.txt"
             almost_limit.write_bytes(b"x" * (MAX_AVAILABLE_FILE_SIZE - 1))
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files/almost_limit.txt")
@@ -385,9 +381,8 @@ class TestCORSConfiguration:
         """Проверить, что CORS может быть настроен с конкретными
         источниками.
         """
-        monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000,https://example.com")
-        test_app = reload_app()
+        test_app = reload_app(files_directory=test_files_dir)
         client = TestClient(test_app)
 
         response = client.get("/files", headers={"Origin": "http://localhost:3000"})
@@ -397,9 +392,8 @@ class TestCORSConfiguration:
         """Проверить, что пустая строка CORS_ORIGINS возвращается
         к значению по умолчанию.
         """
-        monkeypatch.setenv("FILES_DIRECTORY", test_files_dir)
         monkeypatch.setenv("CORS_ORIGINS", "")
-        test_app = reload_app()
+        test_app = reload_app(files_directory=test_files_dir)
         client = TestClient(test_app)
 
         response = client.get("/files", headers={"Origin": "http://example.com"})
@@ -411,11 +405,10 @@ class TestCORSConfiguration:
 class TestEdgeCases:
     """Тесты для граничных случаев и обработки ошибок."""
 
-    def test_empty_directory(self, monkeypatch):
+    def test_empty_directory(self):
         """Проверить вывод списка файлов в пустой директории."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files")
@@ -423,35 +416,33 @@ class TestEdgeCases:
             data = response.json()
             assert data == {"availableFiles": [], "unavailableFiles": []}
 
-    def test_filename_with_spaces(self, monkeypatch):
+    def test_filename_with_spaces(self):
         """Проверить загрузку файла с пробелами в имени."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "file with spaces.txt"
             test_file.write_text("Content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files/file with spaces.txt")
             assert response.status_code == 200
             assert response.content == b"Content"
 
-    def test_filename_with_special_characters(self, monkeypatch):
+    def test_filename_with_special_characters(self):
         """Проверить загрузку файла со специальными символами."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "file-name_123.txt"
             test_file.write_text("Special content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files/file-name_123.txt")
             assert response.status_code == 200
             assert response.content == b"Special content"
 
-    def test_large_file_listing(self, monkeypatch):
+    def test_large_file_listing(self):
         """Проверить вывод списка директории с большим количеством
         файлов.
         """
@@ -461,8 +452,7 @@ class TestEdgeCases:
                 test_file = Path(tmpdir) / f"file_{i:03d}.txt"
                 test_file.write_text(f"Content {i}")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             response = client.get("/files")
@@ -498,7 +488,7 @@ class TestAPIDocumentation:
 class TestExceptionHandling:
     """Тесты для обработки исключений и ошибочных случаев."""
 
-    def test_list_files_permission_error(self, monkeypatch):
+    def test_list_files_permission_error(self):
         """Проверить вывод списка файлов, когда в доступе отказано."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_dir = Path(tmpdir) / "restricted"
@@ -508,8 +498,7 @@ class TestExceptionHandling:
             test_file = test_dir / "test.txt"
             test_file.write_text("content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", str(test_dir))
-            test_app = reload_app()
+            test_app = reload_app(files_directory=str(test_dir))
             client = TestClient(test_app)
 
             # Убираем права на чтение
@@ -524,7 +513,7 @@ class TestExceptionHandling:
                 # Восстанавливаем права для очистки
                 test_dir.chmod(0o755)
 
-    def test_list_files_oserror(self, monkeypatch):
+    def test_list_files_oserror(self):
         """Проверить обработку OSError при чтении директории."""
         from unittest import mock
 
@@ -532,8 +521,7 @@ class TestExceptionHandling:
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             # Мокируем iterdir для возбуждения OSError
@@ -546,7 +534,7 @@ class TestExceptionHandling:
                 assert response.status_code == 500
                 assert "OS error" in response.json()["detail"]
 
-    def test_list_files_unexpected_error(self, monkeypatch):
+    def test_list_files_unexpected_error(self):
         """Проверить обработку неожиданных исключений."""
         from unittest import mock
 
@@ -554,8 +542,7 @@ class TestExceptionHandling:
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             # Мокируем iterdir для возбуждения произвольного Exception
@@ -569,7 +556,7 @@ class TestExceptionHandling:
                 assert response.status_code == 500
                 assert "Unexpected error" in response.json()["detail"]
 
-    def test_security_value_error_with_mock(self, monkeypatch):
+    def test_security_value_error_with_mock(self):
         """Проверить, что ValueError в commonpath перехватывается."""
         from unittest import mock
 
@@ -577,8 +564,7 @@ class TestExceptionHandling:
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             # Мокируем os.path.commonpath для возбуждения ValueError
@@ -591,7 +577,7 @@ class TestExceptionHandling:
                 assert response.status_code == 400
                 assert "Invalid filename" in response.json()["detail"]
 
-    def test_security_common_path_not_equal_base_dir(self, monkeypatch):
+    def test_security_common_path_not_equal_base_dir(self):
         """Проверить отклонение файлов вне базовой директории."""
         from unittest import mock
 
@@ -600,8 +586,7 @@ class TestExceptionHandling:
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
 
-            monkeypatch.setenv("FILES_DIRECTORY", tmpdir)
-            test_app = reload_app()
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             # Мокируем os.path.commonpath для возврата
@@ -628,32 +613,21 @@ class TestMainExecution:
         with tempfile.TemporaryDirectory() as tmpdir:
             files_dir = Path(tmpdir) / "main_test_dir"
 
-            # Мокируем uvicorn.run, чтобы предотвратить
-            # фактический запуск сервера
-            with mock.patch.dict(os.environ, {"FILES_DIRECTORY": str(files_dir)}):
-                # Перезагружаем модули для применения новых
-                # переменных окружения
-                if "app.settings" in sys.modules:
-                    # Очищаем кэш lru_cache перед перезагрузкой
-                    from app.settings import get_settings
+            # Перезагружаем модули и патчим files_directory
+            reload_app(files_directory=str(files_dir))
 
-                    get_settings.cache_clear()
-                    importlib.reload(sys.modules["app.settings"])
-                if "app" in sys.modules:
-                    importlib.reload(sys.modules["app"])
+            with mock.patch("uvicorn.run") as mock_run:
+                # Выполняем файл app/__main__.py напрямую
+                main_file = Path(__file__).parent.parent / "app" / "__main__.py"
+                with open(main_file) as f:
+                    code = compile(f.read(), str(main_file), "exec")
 
-                with mock.patch("uvicorn.run") as mock_run:
-                    # Выполняем файл app/__main__.py напрямую
-                    main_file = Path(__file__).parent.parent / "app" / "__main__.py"
-                    with open(main_file) as f:
-                        code = compile(f.read(), str(main_file), "exec")
+                # Создаем пространство имен с __name__
+                # как '__main__'
+                namespace = {"__name__": "__main__"}
+                exec(code, namespace)
 
-                    # Создаем пространство имен с __name__
-                    # как '__main__'
-                    namespace = {"__name__": "__main__"}
-                    exec(code, namespace)
-
-                    # Проверяем, что uvicorn.run был вызван
-                    assert mock_run.called
-                    # Проверяем, что директория была создана
-                    assert files_dir.exists()
+                # Проверяем, что uvicorn.run был вызван
+                assert mock_run.called
+                # Проверяем, что директория была создана
+                assert files_dir.exists()
