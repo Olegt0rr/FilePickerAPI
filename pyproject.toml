@@ -58,8 +58,8 @@ ignore = [
     "BLE001",  # blind-except (нужно для общей обработки ошибок чтения директории)
     "FAST001", # fastapi-redundant-response-model (response_model полезен для документации)
     "PLC0415", # import-outside-top-level (необходимо для динамической загрузки в тестах)
-    "ASYNC240", # pathlib-in-async (приложение использует стандартный uvicorn без trio/anyio)
 ]
+
 
 [tool.ruff.lint.pycodestyle]
 max-doc-length = 72
@@ -73,6 +73,9 @@ max-doc-length = 72
     "PLR2004", # magic value comparison in tests
     "PTH123",  # open() instead of Path.open() (допустимо в тестах)
     "SIM117",  # nested with statements (более читабельно в тестах)
+]
+"app/handlers/files.py" = [
+    "ASYNC240", # pathlib-in-async (синхронные операции ввода-вывода в этом обработчике считаются допустимыми)
 ]
 
 [tool.ruff.lint.pydocstyle]
