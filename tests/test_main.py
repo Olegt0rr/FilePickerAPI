@@ -159,8 +159,8 @@ class TestListFilesEndpoint:
         assert "Files directory not found" in response.json()["detail"]
 
     def test_list_files_when_path_is_file(self, test_files_dir):
-        """Проверить вывод списка файлов, когда FILES_DIRECTORY
-        указывает на файл.
+        """Проверить вывод списка файлов,
+        когда путь указывает на файл.
         """
         file_path = Path(test_files_dir) / "test1.txt"
         test_app = reload_app(files_directory=str(file_path))

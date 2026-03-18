@@ -52,7 +52,6 @@ jobs:
           ```
           
           ### Конфигурация
-          - `FILES_DIRECTORY` - директория с файлами (по умолчанию: `./files`)
           - `CORS_ORIGINS` - разрешенные CORS origins (по умолчанию: `*`)
           
           Полная документация: https://github.com/Olegt0rr/FilePickerAPI#readme
