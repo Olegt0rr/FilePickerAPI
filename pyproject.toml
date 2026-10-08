@@ -88,6 +88,9 @@ max-doc-length = 72
     "PTH123",  # open() instead of Path.open() (допустимо в тестах)
     "SIM117",  # nested with statements (более читабельно в тестах)
 ]
+"scripts/*.py" = [
+    "INP001",  # implicit-namespace-package (scripts - набор CLI-скриптов, не пакет)
+]
 
 [tool.ruff.lint.pydocstyle]
 convention = "pep257"

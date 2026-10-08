@@ -29,10 +29,11 @@ jobs:
       with:
         sparse-checkout: .github/scripts
 
-    - name: Download build
+    # Сборки всех филиалов: dist/FilePickerAPI-<филиал>/FilePickerAPI
+    - name: Download builds
       uses: actions/download-artifact@v8
       with:
-        name: FilePickerAPI-Windows
+        pattern: FilePickerAPI-*
         path: dist/
 
     # Подписываем каждый неподписанный PE-файл сборки (exe, dll, pyd): при
@@ -47,10 +48,10 @@ jobs:
         TIMESTAMP_URL: http://timestamp.digicert.com
       run: ./.github/scripts/sign.ps1
 
-    - name: Upload signed build
+    - name: Upload signed builds
       uses: actions/upload-artifact@v7
       with:
-        name: FilePickerAPI-Windows-signed
+        name: signed-builds
         path: dist/
         retention-days: 30
 
@@ -61,27 +62,34 @@ jobs:
       contents: write
 
     steps:
-    - name: Download artifact
+    - name: Download signed builds
       uses: actions/download-artifact@v8
       with:
-        name: FilePickerAPI-Windows-signed
+        name: signed-builds
         path: ./dist/
     
-    - name: Pack distribution
-      run: cd dist && zip -r FilePickerAPI-Windows.zip FilePickerAPI
+    # Архив на каждый филиал: FilePickerAPI-<филиал>.zip с папкой
+    # FilePickerAPI внутри, как и раньше
+    - name: Pack distributions
+      run: |
+        mkdir release
+        for dir in dist/FilePickerAPI-*/; do
+          name="$(basename "$dir")"
+          (cd "$dir" && zip -r "../../release/${name}.zip" FilePickerAPI)
+        done
+        ls -l release
     
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v3
       with:
-        files: |
-          ./dist/FilePickerAPI-Windows.zip
+        files: ./release/*.zip
         body: |
           ## FilePickerAPI ${{ github.ref_name }}
           
           ### Установка
           
           #### Windows
-          Скачайте `FilePickerAPI-Windows.zip` и распакуйте его в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`). Все `exe`/`dll`/`pyd` в архиве подписаны.
+          Для каждого филиала собран свой архив `FilePickerAPI-<код филиала>.zip`: директория с файлами зашита в сборку. Скачайте архив своего филиала и распакуйте его в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`). Все `exe`/`dll`/`pyd` в архиве подписаны.
 
           Для запуска используйте один из bat-файлов из архива:
           - **`run_test.bat`** - для тестирования (с консольным окном и выводом отладочной информации)
@@ -94,7 +102,7 @@ jobs:
           ```
 
           ### Конфигурация
-          - Директория с файлами зашита в сборку и не настраивается
+          - Директория с файлами зашита в сборку филиала (см. `branches.toml`) и не настраивается
           - `CORS_ORIGINS` - разрешенные CORS origins (по умолчанию: `*`)
 
           Полная документация: https://github.com/Olegt0rr/FilePickerAPI#readme

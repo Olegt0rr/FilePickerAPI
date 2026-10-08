@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     
     steps:
     - uses: actions/checkout@v7
@@ -31,8 +33,16 @@ jobs:
     
     - name: Run ruff checks
       run: |
-        ruff check app tests
-        ruff format --check app tests
+        ruff check app tests scripts
+        ruff format --check app tests scripts
+    
+    # Список филиалов для матрицы сборки. Вывод сохраняем в переменную
+    # до echo: иначе ошибка в branches.toml потерялась бы в подстановке.
+    - name: Read branch list from branches.toml
+      id: matrix
+      run: |
+        matrix="$(python scripts/branches.py matrix)"
+        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
     
     - name: Run tests with coverage
       run: |
@@ -46,11 +56,18 @@ jobs:
         path: htmlcov/
         retention-days: 7
 
+  # Отдельная сборка под каждый филиал из branches.toml: код один и тот
+  # же, отличается только зашитая директория с файлами.
   build:
+    name: build (${{ matrix.name }})
     runs-on: windows-latest
     needs: test
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.test.outputs.matrix) }}
     
     steps:
     - uses: actions/checkout@v7
@@ -67,6 +84,27 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e .[build]
 
+    - name: Configure files directory for branch ${{ matrix.name }}
+      env:
+        BRANCH_NAME: ${{ matrix.name }}
+      run: |
+        python scripts/branches.py configure "$env:BRANCH_NAME"
+
+    - name: Verify files directory for branch ${{ matrix.name }}
+      shell: python
+      env:
+        EXPECTED_DIRECTORY: ${{ matrix.files_directory }}
+      run: |
+        import os
+        import runpy
+
+        # Читаем сгенерированный файл через runpy, а не импортом app:
+        # импорт выполнил бы app/__init__.py (FastAPI, настройки, .env).
+        actual = runpy.run_path("app/_build_config.py")["FILES_DIRECTORY"]
+        expected = os.environ["EXPECTED_DIRECTORY"]
+        print("files_directory =", actual)
+        assert actual == expected, f"expected {expected!r}, got {actual!r}"
+
     # Кэш Nuitka (скомпилированные C-модули, скачанные утилиты): без него
     # каждый push/PR заново компилирует всё дерево зависимостей.
     # Релизная сборка (по тегу) идёт на подпись, поэтому собирается с нуля,
@@ -79,6 +117,9 @@ jobs:
         path: ~\AppData\Local\Nuitka\Nuitka\Cache
         # Ключ уникален для коммита: actions/cache не перезаписывает
         # существующий ключ, а restore-keys подхватит предыдущий кэш.
+        # Один ключ на все филиалы: сборки отличаются только
+        # app._build_config, поэтому сохраняет кэш первый завершившийся
+        # джоб, а не каждый филиал свою почти одинаковую копию.
         key: nuitka-${{ runner.os }}-${{ github.sha }}
         restore-keys: nuitka-${{ runner.os }}-
 
@@ -107,6 +148,7 @@ jobs:
           --output-folder-name=FilePickerAPI `
           --output-filename=FilePickerAPI.exe `
           --include-package=app `
+          --include-module=app._build_config `
           --include-package=uvicorn `
           --product-name=FilePickerAPI `
           --file-description="File Picker API" `
@@ -121,7 +163,7 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
-        name: FilePickerAPI-Windows
+        name: FilePickerAPI-${{ matrix.name }}
         path: dist/
         retention-days: 30
 
@@ -139,10 +181,11 @@ jobs:
       with:
         sparse-checkout: .github/scripts
 
-    - name: Download build
+    # Сборки всех филиалов: dist/FilePickerAPI-<филиал>/FilePickerAPI
+    - name: Download builds
       uses: actions/download-artifact@v8
       with:
-        name: FilePickerAPI-Windows
+        pattern: FilePickerAPI-*
         path: dist/
 
     - name: Sign with a throwaway certificate

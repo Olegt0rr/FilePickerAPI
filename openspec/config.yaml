@@ -18,7 +18,7 @@ context: |
     .env, аргументы, конфиги рядом с exe, параметры bat-файлов. Поэтому
     Settings.files_directory — ClassVar, а не поле настроек. Варианты
     «один exe + путь в конфиге рядом» отклоняются, даже если ускоряют
-    сборку. Смена пути — только через исходники и новую сборку.
+    сборку. Смена пути — только через branches.toml и новую сборку.
 
   ## Технологический стек
   - Python 3.11 (target-version py311), пакет `app` (`python -m app`)
@@ -36,9 +36,17 @@ context: |
   - app/__init__.py — создание FastAPI-приложения, CORS, подключение роутеров
   - app/__main__.py — точка входа: создаёт директорию файлов и запускает
     Uvicorn на 0.0.0.0:8000
-  - app/settings.py — настройки (pydantic-settings, кэш через lru_cache)
+  - app/settings.py — настройки (pydantic-settings, кэш через lru_cache);
+    путь к файлам — из app/_build_config.py (генерируется при сборке,
+    не хранится в git), без него — ./files
+  - branches.toml — филиалы и их директории; под каждый CI собирает
+    отдельную сборку
+  - scripts/branches.py — проверка branches.toml, матрица для CI
+    (matrix) и запись пути филиала перед сборкой (configure <филиал>)
   - app/handlers/ — роутеры; бизнес-логика файлов в app/handlers/files.py
-  - tests/test_main.py — все тесты (pytest + fastapi.testclient)
+  - tests/test_main.py — тесты API и настроек (pytest + fastapi.testclient)
+  - tests/test_branches.py — тесты branches.toml, scripts/branches.py и
+    источника пути к файлам
 
   ## Соглашения
   - Комментарии, docstring-и, сообщения коммитов и документация — на русском;
@@ -51,17 +59,18 @@ context: |
   - Ошибки возвращаются через HTTPException с осмысленным `detail`
 
   ## Проверки перед коммитом
-  - ruff check app tests
-  - ruff format --check app tests
+  - ruff check app tests scripts
+  - ruff format --check app tests scripts
   - pytest
 
   ## CI/CD
   - .github/workflows/build-exe.yml: ruff + pytest на Ubuntu, затем сборка
-    Nuitka на Windows и пробная подпись одноразовым сертификатом
+    Nuitka на Windows под каждый филиал из branches.toml (артефакты
+    FilePickerAPI-<филиал>) и пробная подпись одноразовым сертификатом
     (sign-smoke, .github/scripts/sign.ps1)
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
     подписывает в окружении code-signing и публикует
-    FilePickerAPI-Windows.zip
+    FilePickerAPI-<филиал>.zip для каждого филиала
 
 rules:
   proposal:
@@ -73,4 +82,4 @@ rules:
   tasks:
     - Включай задачи на тесты, сохраняющие 100% покрытие
     - Включай задачу на обновление README.md, если меняется API или конфигурация
-    - Последняя задача — прогон ruff check, ruff format --check и pytest
+    - Последняя задача — прогон ruff check, ruff format --check (app tests scripts) и pytest
