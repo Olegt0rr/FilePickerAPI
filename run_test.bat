@@ -2,6 +2,9 @@
 REM Batch file for testing FilePickerAPI in console/windowed mode
 REM This will display console output for debugging and testing
 
+REM Work from the folder of this batch file, not from the caller's CWD
+cd /d "%~dp0"
+
 REM Check if the executable exists
 if not exist "FilePickerAPI.exe" (
     echo Error: FilePickerAPI.exe not found!

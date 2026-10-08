@@ -72,7 +72,16 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -e .[build]
-    
+
+    # Кэш Nuitka (скомпилированные C-модули, скачанные утилиты): без него
+    # каждый push/PR заново компилирует всё дерево зависимостей.
+    - name: Cache Nuitka
+      uses: actions/cache@v4
+      with:
+        path: ~\AppData\Local\Nuitka\Nuitka\Cache
+        key: nuitka-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+        restore-keys: nuitka-${{ runner.os }}-
+
     - name: Build executable with Nuitka
       shell: pwsh
       run: |
@@ -134,9 +143,11 @@ jobs:
           $binaries = Get-ChildItem dist/FilePickerAPI -Recurse -File -Include *.exe, *.dll, *.pyd
           $unsigned = $binaries | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
 
-          & $signtool sign /sha1 $thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 `
-            /d FilePickerAPI $unsigned.FullName
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($unsigned) {
+            & $signtool sign /sha1 $thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 `
+              /d FilePickerAPI $unsigned.FullName
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
         } finally {
           $store.Remove($cert)
           $store.Close()

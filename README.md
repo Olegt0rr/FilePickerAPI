@@ -215,12 +215,12 @@ pytest
 
 Сборка выполняется [Nuitka](https://nuitka.net/): код компилируется в C, а затем в нативный бинарник. Нужен компилятор C (на Windows — MSVC из Visual Studio Build Tools).
 
-```bash
+```powershell
 pip install -e .[build]
-python -m nuitka --mode=standalone --assume-yes-for-downloads --remove-output \
-  --output-dir=build --output-folder-name=FilePickerAPI \
-  --output-filename=FilePickerAPI.exe \
-  --include-package=app --include-package=uvicorn \
+python -m nuitka --mode=standalone --assume-yes-for-downloads --remove-output `
+  --output-dir=build --output-folder-name=FilePickerAPI `
+  --output-filename=FilePickerAPI.exe `
+  --include-package=app --include-package=uvicorn `
   app/__main__.py
 ```
 

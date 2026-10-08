@@ -641,10 +641,10 @@ class TestFilesDirectoryIsFixed:
     def test_env_variable_does_not_override(self, settings_module, monkeypatch):
         """Проверить, что переменная окружения игнорируется."""
         expected = settings_module.Settings.files_directory
+        assert expected != self.ATTACKER_DIR
         monkeypatch.setenv("FILES_DIRECTORY", self.ATTACKER_DIR)
 
         assert settings_module.get_settings().files_directory == expected
-        assert expected != self.ATTACKER_DIR
 
     def test_dotenv_does_not_override(self, settings_module, tmp_path):
         """Проверить, что .env не подменяет путь.

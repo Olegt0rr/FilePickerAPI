@@ -2,6 +2,9 @@
 REM Batch file for running FilePickerAPI in production (daemon) mode
 REM This will run the application without a console window
 
+REM Work from the folder of this batch file, not from the caller's CWD
+cd /d "%~dp0"
+
 REM Check if the executable exists
 if not exist "FilePickerAPI.exe" (
     echo Error: FilePickerAPI.exe not found!
@@ -13,11 +16,14 @@ if not exist "FilePickerAPI.exe" (
 REM Start the application minimized in background
 start "" /MIN FilePickerAPI.exe
 
-REM Append to log file to track startup history
-echo FilePickerAPI started in daemon mode at %date% %time% >> startup.log
+REM Append to log file to track startup history. The install folder is
+REM not writable for users, so the log goes to the per-user profile.
+set "LOG_DIR=%LOCALAPPDATA%\FilePickerAPI"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+echo FilePickerAPI started in daemon mode at %date% %time% >> "%LOG_DIR%\startup.log"
 
 echo FilePickerAPI has been started in daemon mode (minimized window).
-echo Check startup.log for confirmation.
+echo Check %LOG_DIR%\startup.log for confirmation.
 echo To stop the application, use Task Manager to end FilePickerAPI.exe process.
 
 timeout /t 3 /nobreak >nul

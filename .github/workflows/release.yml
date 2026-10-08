@@ -13,7 +13,9 @@ jobs:
     uses: ./.github/workflows/build-exe.yml
     with:
       require-signing: true
-    secrets: inherit
+    secrets:
+      WINDOWS_SIGNING_CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+      WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
   
   release:
     runs-on: ubuntu-latest
