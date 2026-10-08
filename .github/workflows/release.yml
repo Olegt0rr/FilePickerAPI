@@ -25,12 +25,12 @@ jobs:
       contents: read
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         sparse-checkout: .github/scripts
 
     - name: Download build
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: FilePickerAPI-Windows
         path: dist/
@@ -48,7 +48,7 @@ jobs:
       run: ./.github/scripts/sign.ps1
 
     - name: Upload signed build
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: FilePickerAPI-Windows-signed
         path: dist/
@@ -62,7 +62,7 @@ jobs:
 
     steps:
     - name: Download artifact
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: FilePickerAPI-Windows-signed
         path: ./dist/
@@ -71,7 +71,7 @@ jobs:
       run: cd dist && zip -r FilePickerAPI-Windows.zip FilePickerAPI
     
     - name: Create Release and Upload Assets
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@v3
       with:
         files: |
           ./dist/FilePickerAPI-Windows.zip
