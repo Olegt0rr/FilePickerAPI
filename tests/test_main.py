@@ -6,7 +6,9 @@ import errno
 import importlib
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -46,6 +48,27 @@ def assert_sorted_by_created_at(files: list[dict]) -> None:
     if len(files) > 1:
         created_times = [item["createdAt"] for item in files]
         assert created_times == sorted(created_times, reverse=True)
+
+
+def fail_for(method, name, error):
+    """Вернуть патч метода Path, который падает только для файла name.
+
+    Падать на всех путях нельзя: ошибка случилась бы уже на базовой
+    директории (на Python 3.11 resolve() сам вызывает stat()).
+    """
+    original = getattr(Path, method)
+
+    def fake(self, *args, **kwargs):
+        if self.name == name:
+            raise error
+        return original(self, *args, **kwargs)
+
+    return mock.patch.object(Path, method, autospec=True, side_effect=fake)
+
+
+def fail_stat_for(name, error):
+    """Вернуть патч Path.stat, который падает только для файла name."""
+    return fail_for("stat", name, error)
 
 
 @pytest.fixture
@@ -596,11 +619,62 @@ class TestExceptionHandling:
         ],
     )
     def test_download_file_check_error(self, client, error, status_code, prefix):
-        """Проверить ошибку ОС при проверке скачиваемого файла."""
-        with mock.patch("pathlib.Path.stat", side_effect=error):
+        """Проверить ошибку ОС при проверке скачиваемого файла.
+
+        Текст исходной ошибки (с путём к сетевой папке) в ответ не
+        попадает.
+        """
+        with fail_stat_for("test1.txt", error):
             response = client.get("/files/test1.txt")
         assert response.status_code == status_code
-        assert response.json()["detail"] == f"{prefix} when reading file: {error}"
+        assert response.json()["detail"] == f"{prefix} when reading file"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError(errno.ENAMETOOLONG, "File name too long"),
+            OSError(errno.ELOOP, "Too many levels of symbolic links"),
+        ],
+    )
+    def test_download_invalid_name_error(self, client, error):
+        """Проверить, что ошибка «недопустимое имя» даёт 400."""
+        with fail_stat_for("test1.txt", error):
+            response = client.get("/files/test1.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    def test_download_invalid_name_on_windows(self, client):
+        """Проверить ERROR_INVALID_NAME на Windows (имя a*.txt)."""
+        error = OSError(errno.EINVAL, "The filename syntax is incorrect")
+        error.winerror = 123
+        with fail_stat_for("test1.txt", error):
+            response = client.get("/files/test1.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    def test_download_network_error_on_windows(self, client):
+        """Проверить, что сбой сети на Windows остаётся ошибкой 500."""
+        # ERROR_NETNAME_DELETED тоже приходит с errno EINVAL
+        error = OSError(errno.EINVAL, "The network name is no longer available")
+        error.winerror = 64
+        with fail_stat_for("test1.txt", error):
+            response = client.get("/files/test1.txt")
+        assert response.status_code == 500
+        assert response.json()["detail"] == "OS error when reading file"
+
+    def test_download_too_long_name(self, client):
+        """Проверить, что слишком длинное имя файла даёт 400."""
+        response = client.get("/files/" + "a" * 300 + ".txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    def test_download_symlink_loop_on_python_311(self, client):
+        """Проверить RuntimeError из resolve() при петле ссылок."""
+        error = RuntimeError("Symlink loop from 'loop.txt'")
+        with fail_for("resolve", "loop.txt", error):
+            response = client.get("/files/loop.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
 
     @pytest.mark.parametrize("file_id", ["..", ".", "../outside.txt"])
     def test_security_rejects_paths_outside_directory(self, test_files_dir, file_id):
@@ -626,16 +700,67 @@ class TestExceptionHandling:
         assert response.json()["detail"] == "Invalid filename"
 
     def test_list_files_directory_disappears_while_reading(self):
-        """Проверить ответ 500, если директория исчезла при чтении."""
+        """Проверить ответ 404, если директория исчезла при чтении."""
         with tempfile.TemporaryDirectory() as tmpdir:
             client = TestClient(reload_app(files_directory=tmpdir))
             error = FileNotFoundError("Directory was removed")
             with mock.patch("pathlib.Path.iterdir", side_effect=error):
                 response = client.get("/files")
-            assert response.status_code == 500
-            assert response.json()["detail"] == (
-                f"OS error when reading directory: {error}"
-            )
+            assert response.status_code == 404
+            assert response.json()["detail"] == "Files directory not found"
+
+    def test_list_files_skips_broken_and_vanished_files(self, test_files_dir):
+        """Проверить пропуск битых ссылок и исчезнувших файлов."""
+        try:
+            (Path(test_files_dir) / "broken.txt").symlink_to("missing.txt")
+        except OSError:
+            pytest.skip("Символические ссылки недоступны")
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        with fail_stat_for("test2.txt", FileNotFoundError("Removed")):
+            response = client.get("/files")
+        assert response.status_code == 200
+        names = [f["name"] for f in response.json()["availableFiles"]]
+        assert names == ["test1.txt"]
+
+    def test_list_files_ignores_directory_named_txt(self, test_files_dir):
+        """Проверить, что директория *.txt не попадает в список."""
+        (Path(test_files_dir) / "folder.txt").mkdir()
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        response = client.get("/files")
+        names = [f["name"] for f in response.json()["availableFiles"]]
+        assert "folder.txt" not in names
+
+    def test_list_files_file_permission_error(self, client):
+        """Проверить, что отказ в доступе к файлу списка даёт 403."""
+        error = PermissionError("Access is denied")
+        with fail_stat_for("test2.txt", error):
+            response = client.get("/files")
+        assert response.status_code == 403
+        assert response.json()["detail"] == (
+            f"Permission denied when reading directory: {error}"
+        )
+
+
+class TestCreatedAt:
+    """Тесты выбора времени для createdAt."""
+
+    @pytest.mark.parametrize(
+        ("platform", "fields", "expected"),
+        [
+            ("linux", {"st_birthtime": 1.0}, 1.0),
+            ("win32", {}, 2.0),
+            ("linux", {}, 3.0),
+        ],
+    )
+    def test_created_at_source(self, platform, fields, expected):
+        """Проверить: birthtime, на Windows ctime, иначе mtime."""
+        from app.handlers import files
+
+        file_stat = SimpleNamespace(st_ctime=2.0, st_mtime=3.0, **fields)
+        with mock.patch.object(files.sys, "platform", platform):
+            created_at = files.file_created_at(file_stat)
+        assert created_at == datetime.fromtimestamp(expected, tz=UTC)
 
 
 class TestMainExecution:
