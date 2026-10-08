@@ -6,7 +6,7 @@
 ## Requirements
 
 ### Requirement: OpenAPI-схема
-Сервис SHALL отдавать OpenAPI-схему по адресу `GET /openapi.json`. Схема SHALL содержать заголовок `File Picker API`, версию API и описание всех эндпоинтов `/files` с моделями ответов.
+Сервис SHALL отдавать OpenAPI-схему по адресу `GET /openapi.json`. Схема SHALL содержать заголовок `File Picker API`, версию из git-тега (см. `distribution`) и описание всех эндпоинтов `/files` с моделями ответов.
 
 #### Scenario: Получение схемы
 - **WHEN** клиент выполняет `GET /openapi.json`

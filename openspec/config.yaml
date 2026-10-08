@@ -25,9 +25,12 @@ context: |
   - FastAPI + Uvicorn, Pydantic v2, pydantic-settings
   - Зависимости закреплены точными версиями в pyproject.toml (кроме ruff,
     указанного как >=) — единственном источнике конфигурации (зависимости,
-    pytest, ruff)
-  - Поставка: Windows .exe через PyInstaller (основной сценарий),
-    Docker-образ, запуск из исходников
+    pytest, ruff, setuptools-scm)
+  - Версия — только из git-тега через setuptools-scm (app/_version.py
+    генерируется при pip install и не хранится в git)
+  - Поставка: Windows-сборка Nuitka в режиме standalone (папка с exe,
+    не onefile), подписанная Authenticode в релизе; запуск из исходников
+    для разработки. Docker не поддерживается
 
   ## Структура
   - app/__init__.py — создание FastAPI-приложения, CORS, подключение роутеров
@@ -54,9 +57,11 @@ context: |
 
   ## CI/CD
   - .github/workflows/build-exe.yml: ruff + pytest на Ubuntu, затем сборка
-    FilePickerAPI.exe на Windows
-  - .github/workflows/release.yml: по тегу v*.*.* создаёт GitHub Release
-    с FilePickerAPI.exe, run_test.bat и run_production.bat
+    Nuitka на Windows и пробная подпись одноразовым сертификатом
+    (sign-smoke, .github/scripts/sign.ps1)
+  - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
+    подписывает в окружении code-signing и публикует
+    FilePickerAPI-Windows.zip
 
 rules:
   proposal:
@@ -64,7 +69,7 @@ rules:
     - Перечисляй, что остаётся вне рамок изменения
     - Не предлагай способов задать директорию с файлами при запуске (см. «Неизменяемые требования»)
   design:
-    - Учитывай работу на Windows с сетевыми (UNC) путями и в Docker на Linux
+    - Учитывай работу на Windows с сетевыми (UNC) путями и разницу Python 3.11 (сборка, CI) и новее
   tasks:
     - Включай задачи на тесты, сохраняющие 100% покрытие
     - Включай задачу на обновление README.md, если меняется API или конфигурация
