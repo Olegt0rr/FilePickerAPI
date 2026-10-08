@@ -7,16 +7,6 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
   workflow_call:
-    inputs:
-      require-signing:
-        description: Fail the build if the code signing certificate is missing
-        type: boolean
-        default: false
-    secrets:
-      WINDOWS_SIGNING_CERT_PFX_BASE64:
-        required: false
-      WINDOWS_SIGNING_CERT_PASSWORD:
-        required: false
 
 jobs:
   test:
@@ -105,66 +95,6 @@ jobs:
         New-Item -ItemType Directory -Force dist | Out-Null
         Move-Item build/FilePickerAPI.dist dist/FilePickerAPI
         Copy-Item run_test.bat, run_production.bat dist/FilePickerAPI/
-    
-    # Подписываем каждый PE-файл сборки (exe, dll, pyd), у которого ещё нет
-    # действительной подписи: при включённых WDAC/AppLocker любой изменённый
-    # файл перестанет запускаться. Уже подписанные файлы (python311.dll,
-    # vcruntime и т.п.) не трогаем.
-    - name: Sign binaries
-      shell: pwsh
-      env:
-        CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
-        CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
-        REQUIRE_SIGNING: ${{ inputs.require-signing || false }}
-        TIMESTAMP_URL: http://timestamp.digicert.com
-      run: |
-        if (-not $env:CERT_PFX_BASE64) {
-          if ($env:REQUIRE_SIGNING -eq 'true') {
-            Write-Output "::error::Secret WINDOWS_SIGNING_CERT_PFX_BASE64 is not set, signing is required"
-            exit 1
-          }
-          Write-Output "::warning::Secret WINDOWS_SIGNING_CERT_PFX_BASE64 is not set, binaries are NOT signed"
-          exit 0
-        }
-
-        $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
-          [Convert]::FromBase64String($env:CERT_PFX_BASE64),
-          $env:CERT_PASSWORD,
-          [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]'UserKeySet,PersistKeySet')
-        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('My', 'CurrentUser')
-        $store.Open('ReadWrite')
-        $store.Add($cert)
-        $thumbprint = $cert.Thumbprint
-
-        try {
-          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-
-          $binaries = Get-ChildItem dist/FilePickerAPI -Recurse -File -Include *.exe, *.dll, *.pyd
-          $unsigned = $binaries | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
-
-          if ($unsigned) {
-            & $signtool sign /sha1 $thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 `
-              /d FilePickerAPI $unsigned.FullName
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          }
-        } finally {
-          $store.Remove($cert)
-          $store.Close()
-        }
-
-        # Проверяем, что каждый PE-файл подписан нами или уже имел
-        # действительную подпись. Цепочку до корня не требуем: сертификат
-        # может быть выпущен внутренним CA, которому раннер не доверяет.
-        $bad = $binaries | Where-Object {
-          $sig = Get-AuthenticodeSignature $_.FullName
-          $sig.Status -ne 'Valid' -and $sig.SignerCertificate.Thumbprint -ne $thumbprint
-        }
-        if ($bad) {
-          $bad | ForEach-Object { Write-Output "::error::Not signed: $($_.FullName)" }
-          exit 1
-        }
-        Write-Output "Signed $($unsigned.Count) of $($binaries.Count) binaries with $thumbprint"
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4

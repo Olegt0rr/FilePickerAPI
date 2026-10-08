@@ -6,21 +6,99 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     uses: ./.github/workflows/build-exe.yml
-    with:
-      require-signing: true
-    secrets:
-      WINDOWS_SIGNING_CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
-      WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
-  
+
+  # Подпись вынесена в отдельный джоб с окружением code-signing: секреты
+  # сертификата лежат только в этом окружении, а его правила развёртывания
+  # пускают лишь теги v*. Сборки из PR и веток (даже с изменённым
+  # воркфлоу) до сертификата не дотягиваются.
+  sign:
+    runs-on: windows-latest
+    needs: build
+    environment: code-signing
+    permissions:
+      contents: read
+
+    steps:
+    - name: Download build
+      uses: actions/download-artifact@v4
+      with:
+        name: FilePickerAPI-Windows
+        path: dist/
+
+    # Подписываем каждый PE-файл сборки (exe, dll, pyd), у которого ещё нет
+    # действительной подписи: при включённых WDAC/AppLocker любой изменённый
+    # файл перестанет запускаться. Уже подписанные файлы (python311.dll,
+    # vcruntime и т.п.) не трогаем.
+    - name: Sign binaries
+      shell: pwsh
+      env:
+        CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+        CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        TIMESTAMP_URL: http://timestamp.digicert.com
+      run: |
+        if (-not $env:CERT_PFX_BASE64 -or -not $env:CERT_PASSWORD) {
+          Write-Output "::error::Signing secrets are not set in the code-signing environment"
+          exit 1
+        }
+
+        # Ключ не импортируем в хранилище сертификатов, чтобы он не остался
+        # в профиле раннера: signtool читает временный PFX, который сразу
+        # удаляется.
+        $pfxBytes = [Convert]::FromBase64String($env:CERT_PFX_BASE64)
+        $thumbprint = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+          $pfxBytes,
+          $env:CERT_PASSWORD,
+          [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet).Thumbprint
+
+        $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+          Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+
+        $binaries = Get-ChildItem dist/FilePickerAPI -Recurse -File -Include *.exe, *.dll, *.pyd
+        $unsigned = $binaries | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
+
+        if ($unsigned) {
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, $pfxBytes)
+          try {
+            & $signtool sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 `
+              /d FilePickerAPI $unsigned.FullName
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item $pfx -Force
+          }
+        }
+
+        # Проверяем, что каждый PE-файл подписан нами или уже имел
+        # действительную подпись. Цепочку до корня не требуем: сертификат
+        # может быть выпущен внутренним CA, которому раннер не доверяет.
+        $bad = $binaries | Where-Object {
+          $sig = Get-AuthenticodeSignature $_.FullName
+          $sig.Status -ne 'Valid' -and $sig.SignerCertificate.Thumbprint -ne $thumbprint
+        }
+        if ($bad) {
+          $bad | ForEach-Object { Write-Output "::error::Not signed: $($_.FullName)" }
+          exit 1
+        }
+        Write-Output "Signed $(@($unsigned).Count) of $($binaries.Count) binaries with $thumbprint"
+
+    - name: Upload signed build
+      uses: actions/upload-artifact@v4
+      with:
+        name: FilePickerAPI-Windows-signed
+        path: dist/
+        retention-days: 30
+
   release:
     runs-on: ubuntu-latest
-    needs: build
-    
+    needs: sign
+    permissions:
+      contents: write
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -28,7 +106,7 @@ jobs:
     - name: Download artifact
       uses: actions/download-artifact@v4
       with:
-        name: FilePickerAPI-Windows
+        name: FilePickerAPI-Windows-signed
         path: ./dist/
     
     - name: Pack distribution
