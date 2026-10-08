@@ -336,7 +336,12 @@ class TestSecurityDirectoryTraversal:
         """
         inner = Path(test_files_dir) / "subdir" / "inner.txt"
         inner.write_text("inner")
-        (Path(test_files_dir) / "link.txt").symlink_to(inner)
+        try:
+            (Path(test_files_dir) / "link.txt").symlink_to(inner)
+        except OSError:
+            # На Windows без прав администратора или режима
+            # разработчика символические ссылки создать нельзя
+            pytest.skip("Символические ссылки недоступны")
         client = TestClient(reload_app(files_directory=test_files_dir))
 
         response = client.get("/files/link.txt")
@@ -576,7 +581,7 @@ class TestExceptionHandling:
         """Проверить ошибку ОС при проверке самой директории."""
         with tempfile.TemporaryDirectory() as tmpdir:
             client = TestClient(reload_app(files_directory=tmpdir))
-            with mock.patch("pathlib.Path.exists", side_effect=error):
+            with mock.patch("pathlib.Path.stat", side_effect=error):
                 response = client.get("/files")
             assert response.status_code == status_code
             assert response.json()["detail"] == (
@@ -592,50 +597,45 @@ class TestExceptionHandling:
     )
     def test_download_file_check_error(self, client, error, status_code, prefix):
         """Проверить ошибку ОС при проверке скачиваемого файла."""
-        with mock.patch("pathlib.Path.exists", side_effect=error):
+        with mock.patch("pathlib.Path.stat", side_effect=error):
             response = client.get("/files/test1.txt")
         assert response.status_code == status_code
         assert response.json()["detail"] == f"{prefix} when reading file: {error}"
 
-    def test_security_value_error_with_mock(self):
-        """Проверить, что ValueError в commonpath перехватывается."""
+    @pytest.mark.parametrize("file_id", ["..", ".", "../outside.txt"])
+    def test_security_rejects_paths_outside_directory(self, test_files_dir, file_id):
+        """Проверить отказ для путей, не указывающих на файл директории.
+
+        Вызываем обработчик напрямую: HTTP-клиент нормализует ".."
+        в URL до того, как запрос дойдёт до маршрута.
+        """
+        from fastapi import HTTPException
+
+        reload_app(files_directory=test_files_dir)
+        from app.handlers.files import get_file
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_file(file_id)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "Invalid filename"
+
+    def test_security_null_byte_in_file_id(self, client):
+        """Проверить, что NUL-байт в fileId даёт 400, а не 500."""
+        response = client.get("/files/a%00.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    def test_list_files_directory_disappears_while_reading(self):
+        """Проверить ответ 500, если директория исчезла при чтении."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            test_file = Path(tmpdir) / "test.txt"
-            test_file.write_text("content")
-
-            test_app = reload_app(files_directory=tmpdir)
-            client = TestClient(test_app)
-
-            # Мокируем os.path.commonpath для возбуждения ValueError
-            with mock.patch(
-                "app.handlers.files.os.path.commonpath",
-                side_effect=ValueError("Different drives"),
-            ):
-                response = client.get("/files/test.txt")
-                # Должны получить ошибку 400 из-за ValueError
-                assert response.status_code == 400
-                assert "Invalid filename" in response.json()["detail"]
-
-    def test_security_common_path_not_equal_base_dir(self):
-        """Проверить отклонение файлов вне базовой директории."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Создаем базовую директорию и файл
-            test_file = Path(tmpdir) / "test.txt"
-            test_file.write_text("content")
-
-            test_app = reload_app(files_directory=tmpdir)
-            client = TestClient(test_app)
-
-            # Мокируем os.path.commonpath для возврата
-            # родительской директории
-            parent_dir = str(Path(tmpdir).parent)
-            with mock.patch(
-                "app.handlers.files.os.path.commonpath", return_value=parent_dir
-            ):
-                response = client.get("/files/test.txt")
-                # Должны получить ошибку 400
-                assert response.status_code == 400
-                assert "Invalid filename" in response.json()["detail"]
+            client = TestClient(reload_app(files_directory=tmpdir))
+            error = FileNotFoundError("Directory was removed")
+            with mock.patch("pathlib.Path.iterdir", side_effect=error):
+                response = client.get("/files")
+            assert response.status_code == 500
+            assert response.json()["detail"] == (
+                f"OS error when reading directory: {error}"
+            )
 
 
 class TestMainExecution:

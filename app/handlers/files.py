@@ -1,8 +1,10 @@
 """Обработчики для работы с файлами."""
 
-import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from stat import S_ISDIR, S_ISREG
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
@@ -67,6 +69,36 @@ class FileListResponse(CamelCaseModel):
     unavailable_files: list[FileInfo]
 
 
+@contextmanager
+def _map_os_errors(target: str, not_found: str | None = None) -> Iterator[None]:
+    """Превратить ошибки ОС в HTTP-ошибки с понятным detail.
+
+    Args:
+        target: Что читалось: "directory" или "file"
+        not_found: detail для 404, если путь не найден; без него
+            отсутствие пути считается ошибкой ввода-вывода
+
+    Raises:
+        HTTPException: 404 если путь не найден (при заданном
+            not_found), 403 при отказе в доступе, 500 при прочих
+            ошибках ввода-вывода
+
+    """
+    try:
+        yield
+    except (FileNotFoundError, NotADirectoryError) as e:
+        if not_found is None:
+            msg = f"OS error when reading {target}: {e!s}"
+            raise HTTPException(status_code=500, detail=msg) from e
+        raise HTTPException(status_code=404, detail=not_found) from e
+    except PermissionError as e:
+        msg = f"Permission denied when reading {target}: {e!s}"
+        raise HTTPException(status_code=403, detail=msg) from e
+    except OSError as e:
+        msg = f"OS error when reading {target}: {e!s}"
+        raise HTTPException(status_code=500, detail=msg) from e
+
+
 def _collect_file_info(files_path: Path) -> list[FileInfo]:
     """Собрать информацию о всех .txt файлах в директории.
 
@@ -82,30 +114,27 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
     """
     file_list = []
     try:
-        for item in files_path.iterdir():
-            # Игнорируем директории, обрабатываем только файлы
-            if not item.is_file():
-                continue
-            # Игнорируем файлы, которые не являются .txt
-            if item.suffix.lower() != ".txt":
-                continue
-            stat = item.stat()
-            file_list.append(
-                FileInfo(
-                    id=item.name,
-                    name=item.name,
-                    size=stat.st_size,
-                    created_at=datetime.fromtimestamp(
-                        getattr(stat, "st_birthtime", stat.st_mtime), tz=UTC
-                    ),
+        with _map_os_errors("directory"):
+            for item in files_path.iterdir():
+                # Игнорируем директории, обрабатываем только файлы
+                if not item.is_file():
+                    continue
+                # Игнорируем файлы, которые не являются .txt
+                if item.suffix.lower() != ".txt":
+                    continue
+                stat = item.stat()
+                file_list.append(
+                    FileInfo(
+                        id=item.name,
+                        name=item.name,
+                        size=stat.st_size,
+                        created_at=datetime.fromtimestamp(
+                            getattr(stat, "st_birthtime", stat.st_mtime), tz=UTC
+                        ),
+                    )
                 )
-            )
-    except PermissionError as e:
-        msg = f"Permission denied when reading directory: {e!s}"
-        raise HTTPException(status_code=403, detail=msg) from e
-    except OSError as e:
-        msg = f"OS error when reading directory: {e!s}"
-        raise HTTPException(status_code=500, detail=msg) from e
+    except HTTPException:
+        raise
     except Exception as e:
         msg = f"Unexpected error when reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
@@ -149,28 +178,17 @@ def list_files() -> FileListResponse:
 
     Returns:
         Объект с двумя списками файлов, отсортированными по createdAt
-        создания (новые первыми)
+        (новые первыми)
 
     """
     files_path = Path(get_settings().files_directory)
 
-    # На Python 3.11 exists() и is_dir() пробрасывают PermissionError
-    # и другие ошибки ОС, а не возвращают False
-    try:
-        exists = files_path.exists()
-        is_dir = exists and files_path.is_dir()
-    except PermissionError as e:
-        msg = f"Permission denied when reading directory: {e!s}"
-        raise HTTPException(status_code=403, detail=msg) from e
-    except OSError as e:
-        msg = f"OS error when reading directory: {e!s}"
-        raise HTTPException(status_code=500, detail=msg) from e
+    # Один stat() вместо exists() + is_dir(): меньше обращений к
+    # сетевой папке и одинаковое поведение на всех версиях Python
+    with _map_os_errors("directory", not_found="Files directory not found"):
+        dir_stat = files_path.stat()
 
-    if not exists:
-        msg = "Files directory not found"
-        raise HTTPException(status_code=404, detail=msg)
-
-    if not is_dir:
+    if not S_ISDIR(dir_stat.st_mode):
         msg = "Files path is not a directory"
         raise HTTPException(status_code=400, detail=msg)
 
@@ -206,53 +224,32 @@ def get_file(
             (не соответствует критериям availableFiles)
 
     """
-    # Безопасность: предотвращение обхода директорий
-    # Получаем абсолютные пути и проверяем, что файл находится
-    # в разрешенной директории
-    base_dir = Path(get_settings().files_directory).resolve()
-    requested_path = (Path(get_settings().files_directory) / file_id).resolve()
-
-    # Проверяем, что разрешенный путь находится внутри
-    # базовой директории
+    files_directory = Path(get_settings().files_directory)
     try:
-        common_path = os.path.commonpath([base_dir, requested_path])
-        if common_path != str(base_dir):
-            msg = "Invalid filename"
-            raise HTTPException(status_code=400, detail=msg)
+        with _map_os_errors("file"):
+            base_dir = files_directory.resolve()
+            file_path = (files_directory / file_id).resolve()
     except ValueError as e:
+        # Например, NUL-байт в fileId
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg) from e
 
-    # Отдаём только файлы непосредственно из директории, как и в
-    # списке. На Windows fileId с обратным слэшем (%5C) проходит
-    # маршрут и указывает в поддиректорию
-    if requested_path.parent != base_dir:
+    # Безопасность: отдаём только файлы непосредственно из директории,
+    # как и в списке. Это отсекает и выход наружу через "..", и
+    # поддиректории (на Windows fileId с %5C указывает в поддиректорию)
+    if file_path.parent != base_dir:
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg)
 
-    file_path = Path(requested_path)
+    with _map_os_errors("file", not_found="File not found"):
+        file_stat = file_path.stat()
 
-    try:
-        exists = file_path.exists()
-        is_file = exists and file_path.is_file()
-        file_size = file_path.stat().st_size if is_file else 0
-    except PermissionError as e:
-        msg = f"Permission denied when reading file: {e!s}"
-        raise HTTPException(status_code=403, detail=msg) from e
-    except OSError as e:
-        msg = f"OS error when reading file: {e!s}"
-        raise HTTPException(status_code=500, detail=msg) from e
-
-    if not exists:
-        msg = "File not found"
-        raise HTTPException(status_code=404, detail=msg)
-
-    if not is_file:
+    if not S_ISREG(file_stat.st_mode):
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
 
     # Проверяем, что файл доступен для загрузки
-    if not check_file_availability(file_path, file_size):
+    if not check_file_availability(file_path, file_stat.st_size):
         msg = "File is not available for download"
         raise HTTPException(status_code=403, detail=msg)
 
@@ -260,4 +257,5 @@ def get_file(
         path=file_path,
         filename=file_path.name,
         media_type="application/octet-stream",
+        stat_result=file_stat,
     )

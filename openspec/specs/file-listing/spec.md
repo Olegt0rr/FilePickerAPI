@@ -75,7 +75,7 @@
 Если настроенная директория не существует, сервис SHALL отвечать на `GET /files` статусом 404 и `detail` = `Files directory not found`. Если настроенный путь указывает не на директорию, сервис SHALL отвечать статусом 400 и `detail` = `Files path is not a directory`.
 
 #### Scenario: Директория не существует
-- **WHEN** настроенная директория отсутствует или сетевая папка недоступна
+- **WHEN** настроенная директория отсутствует или ОС сообщает, что сетевой путь не найден
 - **THEN** `GET /files` отвечает статусом 404 и `detail` = `Files directory not found`
 
 #### Scenario: Путь указывает на файл
@@ -83,7 +83,7 @@
 - **THEN** `GET /files` отвечает статусом 400 и `detail` = `Files path is not a directory`
 
 ### Requirement: Ошибки чтения директории
-При ошибке чтения содержимого директории сервис SHALL отвечать HTTP-ошибкой, `detail` которой содержит текст исходной ошибки: 403 с префиксом `Permission denied when reading directory:` при отказе в доступе, 500 с префиксом `OS error when reading directory:` при прочих ошибках ввода-вывода и 500 с префиксом `Unexpected error when reading directory:` при любой другой ошибке.
+При ошибке ОС во время проверки директории или чтения её содержимого (кроме «путь не найден») сервис SHALL отвечать HTTP-ошибкой, `detail` которой содержит текст исходной ошибки: 403 с префиксом `Permission denied when reading directory:` при отказе в доступе, 500 с префиксом `OS error when reading directory:` при прочих ошибках ввода-вывода и 500 с префиксом `Unexpected error when reading directory:` при любой другой ошибке.
 
 #### Scenario: Нет прав на чтение
 - **WHEN** у процесса нет прав на чтение содержимого директории

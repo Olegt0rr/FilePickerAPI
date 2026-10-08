@@ -27,5 +27,10 @@ def ensure_files_directory() -> None:
 
 
 if __name__ == "__main__":
+    # До запуска uvicorn логирование не настроено: без basicConfig
+    # предупреждение ушло бы в stderr без времени и уровня
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     ensure_files_directory()
     uvicorn.run(app, host="0.0.0.0", port=8000)
