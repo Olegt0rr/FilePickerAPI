@@ -83,6 +83,10 @@ jobs:
       uses: softprops/action-gh-release@v3
       with:
         files: ./release/*.zip
+        # Под body — список изменений GitHub с предыдущего релиза. Если
+        # релиз уже создан через интерфейс (там нельзя создать только тег),
+        # экшен обновляет его, и описание получается таким же
+        generate_release_notes: true
         body: |
           ## FilePickerAPI ${{ github.ref_name }}
           
