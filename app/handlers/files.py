@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from stat import S_ISDIR, S_ISLNK, S_ISREG
+from stat import S_ISDIR, S_ISREG
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
@@ -184,12 +184,12 @@ def file_created_at(file_stat: os.stat_result) -> datetime:
 
 
 def _stat_listed_item(
-    item: Path, base_dir: Callable[[], Path]
+    entry: os.DirEntry[str], base_dir: Callable[[], Path]
 ) -> tuple[os.stat_result | None, bool]:
     """Вернуть stat файла для списка или None, если его не показывать.
 
     Args:
-        item: Элемент директории с расширением .txt
+        entry: Элемент директории с расширением .txt
         base_dir: Функция, возвращающая разрешённый путь директории
 
     Returns:
@@ -200,14 +200,16 @@ def _stat_listed_item(
 
     """
     try:
-        file_stat = item.lstat()
-        if S_ISLNK(file_stat.st_mode):
+        # На Windows признак ссылки, размер и время обычного файла уже
+        # получены при перечислении, и запроса к сетевой папке нет
+        if entry.is_symlink():
             # Ссылку показываем, только если её можно скачать: цель —
             # .txt прямо в директории (см. get_file)
-            target = item.resolve()
+            target = Path(entry.path).resolve()
             if target.parent != base_dir() or target.suffix.lower() != ".txt":
                 return None, False
-            file_stat = item.stat()
+        # Для ссылки stat() идёт к цели
+        file_stat = entry.stat()
     except RuntimeError:
         # Петля ссылок в resolve() на Python 3.11
         return None, False
@@ -244,21 +246,22 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
     skipped_missing = False
     try:
         # Директория могла исчезнуть после проверки в list_files
-        with _directory_errors(not_found=True):
-            items = list(files_path.iterdir())
+        # Отбор по расширению сразу при перечислении: он не требует
+        # обращения к ФС, и прочие элементы не держатся в памяти
+        with _directory_errors(not_found=True), os.scandir(files_path) as it:
+            entries = [
+                entry for entry in it if Path(entry.name).suffix.lower() == ".txt"
+            ]
         with _directory_errors():
-            for item in items:
-                # Сначала расширение: оно не требует обращения к ФС
-                if item.suffix.lower() != ".txt":
-                    continue
-                file_stat, missing = _stat_listed_item(item, base_dir)
+            for entry in entries:
+                file_stat, missing = _stat_listed_item(entry, base_dir)
                 skipped_missing |= missing
                 if file_stat is None:
                     continue
                 file_list.append(
                     FileInfo(
-                        id=item.name,
-                        name=item.name,
+                        id=entry.name,
+                        name=entry.name,
                         size=file_stat.st_size,
                         created_at=file_created_at(file_stat),
                     )
@@ -343,6 +346,50 @@ def list_files() -> FileListResponse:
     )
 
 
+# Разрешённый путь к директории с файлами. Ключ — только путь из
+# настроек, зашитый в сборку, поэтому кэш не даёт способа подменить
+# директорию. Сюда попадает только результат строгого resolve()
+_real_path_cache: dict[Path, Path] = {}
+
+
+def _files_directory_real_path(files_directory: Path, *, refresh: bool = False) -> Path:
+    """Вернуть разрешённый путь к директории с файлами.
+
+    Директория не меняется, поэтому путь разрешается один раз: это
+    экономит запросы к сетевой папке на каждом скачивании. Строгий
+    resolve() либо разрешает путь целиком, либо падает, и тогда кэш
+    не заполняется, а прежний путь из него убирается.
+
+    Args:
+        files_directory: Директория из настроек
+        refresh: Разрешить путь заново, не глядя в кэш. Кэш заранее
+            не очищается, и параллельные скачивания им пользуются
+
+    Raises:
+        HTTPException: 500 при сбое самой директории, без пути в
+            detail: это ошибка сервера, а не клиента
+
+    """
+    cached = _real_path_cache.get(files_directory)
+    if cached is not None and not refresh:
+        return cached
+    try:
+        try:
+            real_path = files_directory.resolve(strict=True)
+        except OSError:
+            # Папка недоступна: нестрогий resolve(), как и раньше, но
+            # без кэша — он может вернуть неразрешённый путь
+            _real_path_cache.pop(files_directory, None)
+            return files_directory.resolve()
+    except (OSError, RuntimeError, ValueError) as e:
+        _real_path_cache.pop(files_directory, None)
+        logger.warning("Не удалось разрешить путь к директории с файлами: %s", e)
+        msg = "OS error when reading file"
+        raise HTTPException(status_code=500, detail=msg) from e
+    _real_path_cache[files_directory] = real_path
+    return real_path
+
+
 @router.get("/{fileId}")
 def get_file(
     file_id: Annotated[str, PathParam(alias="fileId")],
@@ -381,22 +428,19 @@ def get_file(
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg)
 
-    # Сбой самой директории — ошибка сервера, а не клиента: 500, и без
-    # пути в detail
-    try:
-        base_dir = files_directory.resolve()
-    except (OSError, RuntimeError, ValueError) as e:
-        logger.warning("Не удалось разрешить путь к директории с файлами: %s", e)
-        msg = "OS error when reading file"
-        raise HTTPException(status_code=500, detail=msg) from e
+    base_dir = _files_directory_real_path(files_directory)
 
     with _file_errors(file_id):
         file_path = candidate.resolve()
 
     # Отдаём только файлы непосредственно из директории, как и в
     # списке: символическая ссылка не должна уводить в поддиректорию
-    # или за пределы директории
-    if file_path.parent != base_dir:
+    # или за пределы директории. Перед отказом сверяемся с заново
+    # разрешённым путём: закэшированный мог устареть (например, DFS
+    # переключил сетевую папку на другой сервер)
+    if file_path.parent != base_dir and file_path.parent != (
+        _files_directory_real_path(files_directory, refresh=True)
+    ):
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg)
 

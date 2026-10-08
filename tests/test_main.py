@@ -4,8 +4,10 @@
 
 import errno
 import importlib
+import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,6 +73,46 @@ def fail_stat_for(name, error):
     return fail_for("stat", name, error)
 
 
+class FailingEntry:
+    """Обёртка DirEntry, у которой stat() падает с заданной ошибкой."""
+
+    def __init__(self, entry, error):
+        self._entry = entry
+        self._error = error
+
+    def __getattr__(self, name):
+        return getattr(self._entry, name)
+
+    def stat(self, **_kwargs):
+        raise self._error
+
+
+def fail_entry_stat_for(name, error):
+    """Вернуть патч os.scandir: DirEntry.stat() падает для файла name.
+
+    Методы DirEntry нельзя подменить напрямую, поэтому подменяем сами
+    элементы перечисления.
+    """
+    original = os.scandir
+
+    @contextmanager
+    def fake(path):
+        with original(path) as it:
+            yield [FailingEntry(e, error) if e.name == name else e for e in it]
+
+    return mock.patch("os.scandir", side_effect=fake)
+
+
+def symlink_or_skip(link, target):
+    """Создать символическую ссылку или пропустить тест."""
+    try:
+        Path(link).symlink_to(target)
+    except OSError:
+        # На Windows без прав администратора или режима
+        # разработчика символические ссылки создать нельзя
+        pytest.skip("Символические ссылки недоступны")
+
+
 @pytest.fixture
 def test_files_dir():
     """Создать временную директорию с тестовыми файлами."""
@@ -90,6 +132,15 @@ def test_files_dir():
         subdir.mkdir()
 
         yield tmpdir
+
+
+@pytest.fixture
+def subdir_link(test_files_dir):
+    """Создать link.txt — ссылку на файл в поддиректории."""
+    inner = Path(test_files_dir) / "subdir" / "inner.txt"
+    inner.write_text("inner")
+    symlink_or_skip(Path(test_files_dir) / "link.txt", inner)
+    return test_files_dir
 
 
 @pytest.fixture
@@ -350,6 +401,7 @@ class TestDownloadFileEndpoint:
 class TestSecurityDirectoryTraversal:
     """Тесты для безопасности обхода директорий."""
 
+    @pytest.mark.usefixtures("subdir_link")
     def test_symlink_into_subdirectory(self, test_files_dir):
         """Проверить: файл из поддиректории не виден и не скачивается.
 
@@ -357,14 +409,6 @@ class TestSecurityDirectoryTraversal:
         (``subdir%5Cinner.txt``): путь остаётся внутри директории,
         но указывает не на её непосредственный файл.
         """
-        inner = Path(test_files_dir) / "subdir" / "inner.txt"
-        inner.write_text("inner")
-        try:
-            (Path(test_files_dir) / "link.txt").symlink_to(inner)
-        except OSError:
-            # На Windows без прав администратора или режима
-            # разработчика символические ссылки создать нельзя
-            pytest.skip("Символические ссылки недоступны")
         client = TestClient(reload_app(files_directory=test_files_dir))
 
         response = client.get("/files/link.txt")
@@ -575,10 +619,10 @@ class TestExceptionHandling:
             test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
-            # Эмулируем отказ в доступе через iterdir, а не через chmod:
+            # Эмулируем отказ в доступе через scandir, а не через chmod:
             # под root права на директорию не проверяются
             error = PermissionError(errno.EACCES, "Permission denied", tmpdir)
-            with mock.patch("pathlib.Path.iterdir", side_effect=error):
+            with mock.patch("os.scandir", side_effect=error):
                 response = client.get("/files")
             # Должны получить ошибку 403 из-за отказа в доступе,
             # а текст исходного исключения должен попасть в detail.
@@ -598,9 +642,9 @@ class TestExceptionHandling:
             test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
-            # Мокируем iterdir для возбуждения OSError
+            # Мокируем scandir для возбуждения OSError
             with mock.patch(
-                "pathlib.Path.iterdir",
+                "os.scandir",
                 side_effect=OSError("Disk error"),
             ):
                 response = client.get("/files")
@@ -617,9 +661,9 @@ class TestExceptionHandling:
             test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
-            # Мокируем iterdir для возбуждения произвольного Exception
+            # Мокируем scandir для возбуждения произвольного Exception
             with mock.patch(
-                "pathlib.Path.iterdir",
+                "os.scandir",
                 side_effect=RuntimeError("Unexpected error"),
             ):
                 response = client.get("/files")
@@ -813,20 +857,18 @@ class TestExceptionHandling:
         with tempfile.TemporaryDirectory() as tmpdir:
             client = TestClient(reload_app(files_directory=tmpdir))
             error = FileNotFoundError("Directory was removed")
-            with mock.patch("pathlib.Path.iterdir", side_effect=error):
+            with mock.patch("os.scandir", side_effect=error):
                 response = client.get("/files")
             assert response.status_code == 404
             assert response.json()["detail"] == "Files directory not found"
 
     def test_list_files_skips_broken_and_vanished_files(self, test_files_dir):
         """Проверить пропуск битых ссылок и исчезнувших файлов."""
-        try:
-            (Path(test_files_dir) / "broken.txt").symlink_to("missing.txt")
-        except OSError:
-            pytest.skip("Символические ссылки недоступны")
+        symlink_or_skip(Path(test_files_dir) / "broken.txt", "missing.txt")
         client = TestClient(reload_app(files_directory=test_files_dir))
 
-        with fail_stat_for("test2.txt", FileNotFoundError("Removed")):
+        error = FileNotFoundError("Removed")
+        with fail_entry_stat_for("test2.txt", error):
             response = client.get("/files")
         assert response.status_code == 200
         names = [f["name"] for f in response.json()["availableFiles"]]
@@ -843,7 +885,7 @@ class TestExceptionHandling:
     def test_list_files_skips_invalid_name(self, client):
         """Проверить пропуск файла с ошибкой «недопустимое имя»."""
         error = OSError(errno.ELOOP, "Too many levels of symbolic links")
-        with fail_for("lstat", "test2.txt", error):
+        with fail_entry_stat_for("test2.txt", error):
             response = client.get("/files")
         assert response.status_code == 200
         names = [f["name"] for f in response.json()["availableFiles"]]
@@ -858,16 +900,19 @@ class TestExceptionHandling:
 
         def fake_stat(self, *args, **kwargs):
             # Первый stat директории (проверка в list_files) проходит,
-            # дальше пропали и файлы, и сама директория
+            # дальше пропала и сама директория
             if self == base:
                 base_stat_calls.append(self)
                 if len(base_stat_calls) > 1:
                     raise FileNotFoundError(self)
-            elif self.parent == base:
-                raise FileNotFoundError(self)
             return original_stat(self, *args, **kwargs)
 
-        with mock.patch.object(Path, "stat", autospec=True, side_effect=fake_stat):
+        # Файлы из перечисления уже не находятся
+        error = FileNotFoundError("Removed")
+        with (
+            fail_entry_stat_for("test1.txt", error),
+            mock.patch.object(Path, "stat", autospec=True, side_effect=fake_stat),
+        ):
             response = client.get("/files")
         assert response.status_code == 404
         assert response.json()["detail"] == "Files directory not found"
@@ -875,7 +920,7 @@ class TestExceptionHandling:
     def test_list_files_file_permission_error(self, client):
         """Проверить, что отказ в доступе к файлу списка даёт 403."""
         error = PermissionError("Access is denied")
-        with fail_stat_for("test2.txt", error):
+        with fail_entry_stat_for("test2.txt", error):
             response = client.get("/files")
         assert response.status_code == 403
         assert response.json()["detail"] == (
@@ -920,6 +965,244 @@ class TestCreatedAt:
         file_stat = SimpleNamespace(st_ctime=timestamp, st_mtime=timestamp)
         with mock.patch.object(files.sys, "platform", "linux"):
             assert files.file_created_at(file_stat) == expected
+
+
+class TestListingScandir:
+    """Тесты чтения списка через os.scandir."""
+
+    def test_list_files_stats_only_directory(self, client):
+        """Проверить: Path.stat() вызывается только для директории.
+
+        Атрибуты файлов берутся из DirEntry.stat(): на Windows для
+        обычных файлов он не делает отдельного запроса к ФС.
+        """
+        with mock.patch.object(
+            Path, "stat", autospec=True, side_effect=Path.stat
+        ) as stat:
+            response = client.get("/files")
+        assert response.status_code == 200
+        assert len(response.json()["availableFiles"]) == 2
+        assert stat.call_count == 1
+
+    def test_list_files_reads_directory_once(self, client):
+        """Проверить, что директория перечисляется один раз."""
+        with mock.patch("os.scandir", side_effect=os.scandir) as scandir:
+            response = client.get("/files")
+        assert response.status_code == 200
+        assert scandir.call_count == 1
+
+    def test_list_files_follows_symlink_to_file(self, test_files_dir):
+        """Проверить: ссылка на файл в списке с атрибутами цели."""
+        target = Path(test_files_dir) / "target.txt"
+        target.write_bytes(b"x" * 123)
+        symlink_or_skip(Path(test_files_dir) / "link.txt", target)
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files")
+        files = {f["name"]: f for f in response.json()["availableFiles"]}
+        assert files["link.txt"]["size"] == 123
+
+    def test_list_files_skips_symlink_loop(self, test_files_dir):
+        """Проверить пропуск петли символических ссылок."""
+        loop = Path(test_files_dir) / "loop.txt"
+        symlink_or_skip(loop, loop)
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files")
+        assert response.status_code == 200
+        names = [f["name"] for f in response.json()["availableFiles"]]
+        assert sorted(names) == ["test1.txt", "test2.txt"]
+
+    def test_list_files_created_at_matches_stat(self, test_files_dir):
+        """Проверить: createdAt тот же, что из os.stat() файла."""
+        from app.handlers import files
+
+        file_path = Path(test_files_dir) / "test1.txt"
+        os.utime(file_path, (1_600_000_000, 1_600_000_000))
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files")
+        items = {f["name"]: f for f in response.json()["availableFiles"]}
+        expected = files.file_created_at(file_path.stat())
+        created_at = datetime.fromisoformat(items["test1.txt"]["createdAt"])
+        assert created_at == expected
+
+
+def count_resolve(directory):
+    """Вернуть патч Path.resolve, считающий вызовы для directory."""
+    original = Path.resolve
+    calls = []
+
+    def fake(self, *args, **kwargs):
+        if self == Path(directory):
+            calls.append(kwargs.get("strict", args[0] if args else False))
+        return original(self, *args, **kwargs)
+
+    patch = mock.patch.object(Path, "resolve", autospec=True, side_effect=fake)
+    return patch, calls
+
+
+def fail_strict_resolve(directory):
+    """Вернуть патч Path.resolve: строгий resolve() directory падает.
+
+    Так ведёт себя недоступная сетевая папка: нестрогий resolve()
+    отрабатывает, строгий — нет.
+    """
+    original = Path.resolve
+
+    def fake(self, *, strict=False):
+        if self == Path(directory) and strict:
+            raise FileNotFoundError(errno.ENOENT, "Network path not found")
+        return original(self, strict=strict)
+
+    return mock.patch.object(Path, "resolve", autospec=True, side_effect=fake)
+
+
+class TestFilesDirectoryCache:
+    """Тесты кэша разрешённого пути к директории с файлами."""
+
+    def test_directory_resolved_once(self, client, test_files_dir):
+        """Проверить, что путь к директории разрешается один раз."""
+        patch, calls = count_resolve(test_files_dir)
+        with patch:
+            for _ in range(3):
+                assert client.get("/files/test1.txt").status_code == 200
+        assert calls == [True]
+
+    def test_error_does_not_fill_cache(self, client, test_files_dir):
+        """Проверить, что при сбое директории кэш не заполняется."""
+        error = OSError(errno.EIO, "Network error")
+        with fail_for("resolve", Path(test_files_dir).name, error):
+            response = client.get("/files/test1.txt")
+        assert response.status_code == 500
+
+        patch, calls = count_resolve(test_files_dir)
+        with patch:
+            for _ in range(2):
+                assert client.get("/files/test1.txt").status_code == 200
+        assert calls == [True]
+
+    def test_unavailable_directory_is_not_cached(self, client, test_files_dir):
+        """Проверить: нестрогий resolve() не попадает в кэш.
+
+        Пока сетевая папка недоступна, строгий resolve() падает, и
+        скачивание идёт по нестрогому, как раньше.
+        """
+        with fail_strict_resolve(test_files_dir):
+            assert client.get("/files/test1.txt").status_code == 200
+
+        patch, calls = count_resolve(test_files_dir)
+        with patch:
+            for _ in range(2):
+                assert client.get("/files/test1.txt").status_code == 200
+        assert calls == [True]
+
+    def test_directory_appears_later(self, tmp_path):
+        """Проверить: папка, недоступная при первом запросе, потом
+        работает без перезапуска.
+
+        Путь к директории идёт через ещё не созданную ссылку: пока её
+        нет, нестрогий resolve() возвращает неразрешённый путь.
+        """
+        real = tmp_path / "real"
+        link = tmp_path / "link"
+        files_dir = link / "share"
+        client = TestClient(reload_app(files_directory=str(files_dir)))
+
+        response = client.get("/files/test1.txt")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "File not found"
+
+        (real / "share").mkdir(parents=True)
+        (real / "share" / "test1.txt").write_text("content")
+        symlink_or_skip(link, real)
+        response = client.get("/files/test1.txt")
+        assert response.status_code == 200
+        assert response.content == b"content"
+
+    def test_stale_cache_is_refreshed(self, tmp_path):
+        """Проверить: устаревший путь в кэше разрешается заново.
+
+        Например, DFS переключил сетевую папку на другой сервер.
+        """
+        for name in ("a", "b"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "test1.txt").write_text(name)
+        link = tmp_path / "link"
+        symlink_or_skip(link, tmp_path / "a")
+        client = TestClient(reload_app(files_directory=str(link)))
+        assert client.get("/files/test1.txt").content == b"a"
+
+        link.unlink()
+        link.symlink_to(tmp_path / "b")
+        response = client.get("/files/test1.txt")
+        assert response.status_code == 200
+        assert response.content == b"b"
+
+    @pytest.mark.usefixtures("subdir_link")
+    def test_cache_is_refreshed_before_rejecting(self, test_files_dir):
+        """Проверить: перед отказом 400 путь разрешается заново.
+
+        Кэш при этом не очищается: следующее скачивание берёт путь
+        из него.
+        """
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        assert client.get("/files/test1.txt").status_code == 200
+
+        patch, calls = count_resolve(test_files_dir)
+        with patch:
+            response = client.get("/files/link.txt")
+            assert client.get("/files/test1.txt").status_code == 200
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+        assert calls == [True]
+
+    @pytest.mark.usefixtures("subdir_link")
+    def test_refresh_unavailable_directory_drops_cache(self, test_files_dir):
+        """Проверить: недоступная при повторной проверке папка — 400.
+
+        Строгий resolve() упал, нестрогий отработал: путь убирается из
+        кэша, и следующее скачивание разрешает его заново.
+        """
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        assert client.get("/files/test1.txt").status_code == 200
+
+        with fail_strict_resolve(test_files_dir):
+            response = client.get("/files/link.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+        patch, calls = count_resolve(test_files_dir)
+        with patch:
+            assert client.get("/files/test1.txt").status_code == 200
+        assert calls == [True]
+
+    @pytest.mark.usefixtures("subdir_link")
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError(errno.EIO, "Network error", "/secret/share"),
+            RuntimeError("Symlink loop from '/secret/share'"),
+        ],
+    )
+    def test_refresh_error_is_server_error(self, test_files_dir, error):
+        """Проверить: сбой при повторном разрешении — 500 и сброс кэша.
+
+        Сбой директории — ошибка сервера, как и раньше; путь в detail
+        не попадает.
+        """
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        assert client.get("/files/test1.txt").status_code == 200
+
+        with fail_for("resolve", Path(test_files_dir).name, error):
+            response = client.get("/files/link.txt")
+        assert response.status_code == 500
+        assert response.json()["detail"] == "OS error when reading file"
+
+        patch, calls = count_resolve(test_files_dir)
+        with patch:
+            assert client.get("/files/test1.txt").status_code == 200
+        assert calls == [True]
 
 
 class TestMainExecution:
