@@ -77,6 +77,26 @@ class TestBranchesFile:
         with pytest.raises(ValueError, match="недопустимое имя"):
             branches.load_branches(path)
 
+    def test_name_with_trailing_newline_rejected(self, branches, write_toml):
+        path = write_toml('[[branch]]\nname = "5000\\n"\nfiles_directory = "x"\n')
+        with pytest.raises(ValueError, match="недопустимое имя"):
+            branches.load_branches(path)
+
+    def test_non_string_name_rejected(self, branches, write_toml):
+        path = write_toml('[[branch]]\nname = 5000\nfiles_directory = "x"\n')
+        with pytest.raises(ValueError, match="недопустимое имя"):
+            branches.load_branches(path)
+
+    def test_non_string_directory_rejected(self, branches, write_toml):
+        path = write_toml('[[branch]]\nname = "5000"\nfiles_directory = 1\n')
+        with pytest.raises(ValueError, match="не задан files_directory"):
+            branches.load_branches(path)
+
+    def test_single_table_rejected(self, branches, write_toml):
+        path = write_toml('[branch]\nname = "5000"\nfiles_directory = "x"\n')
+        with pytest.raises(ValueError, match=r"\[\[branch\]\]"):
+            branches.load_branches(path)
+
     def test_missing_directory_rejected(self, branches, write_toml):
         path = write_toml('[[branch]]\nname = "5000"\nfiles_directory = " "\n')
         with pytest.raises(ValueError, match="не задан files_directory"):
@@ -125,6 +145,15 @@ class TestSettingsFilesDirectory:
         settings_module = importlib.reload(importlib.import_module("app.settings"))
 
         assert settings_module.Settings.files_directory == "./files"
+
+    def test_broken_build_config_not_silenced(self, monkeypatch):
+        # Модуль есть, но без FILES_DIRECTORY - ошибка, а не ./files
+
+        build_config = types.ModuleType("app._build_config")
+        monkeypatch.setitem(sys.modules, "app._build_config", build_config)
+
+        with pytest.raises(ImportError):
+            importlib.reload(importlib.import_module("app.settings"))
 
     def test_uses_build_config(self, monkeypatch):
         build_config = types.ModuleType("app._build_config")

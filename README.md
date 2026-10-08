@@ -222,7 +222,7 @@ pytest
 pip install pyinstaller
 # Зашить путь нужного филиала из branches.toml (создаёт app/_build_config.py)
 python scripts/branches.py configure 5400
-pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
+pyinstaller --onefile --name FilePickerAPI --hidden-import app._build_config --add-data "app;app" app/__main__.py
 ```
 
 Исполняемый файл будет создан в директории `dist/`. Без шага `configure` exe будет обслуживать `./files`.

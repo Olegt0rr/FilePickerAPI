@@ -16,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BRANCHES_FILE = ROOT / "branches.toml"
 BUILD_CONFIG_FILE = ROOT / "app" / "_build_config.py"
-NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def load_branches(path: Path = BRANCHES_FILE) -> list[dict[str, str]]:
@@ -24,21 +24,24 @@ def load_branches(path: Path = BRANCHES_FILE) -> list[dict[str, str]]:
     with path.open("rb") as f:
         branches = tomllib.load(f).get("branch", [])
 
+    if not isinstance(branches, list) or not all(isinstance(b, dict) for b in branches):
+        msg = f"{path.name}: филиалы задаются блоками [[branch]]"
+        raise ValueError(msg)
     if not branches:
         msg = f"{path.name}: список филиалов пуст"
         raise ValueError(msg)
 
     names = set()
     for branch in branches:
-        name = branch.get("name", "")
-        directory = branch.get("files_directory", "")
-        if not NAME_PATTERN.match(name):
+        name = branch.get("name")
+        directory = branch.get("files_directory")
+        if not isinstance(name, str) or not NAME_PATTERN.fullmatch(name):
             msg = f"{path.name}: недопустимое имя филиала {name!r}"
             raise ValueError(msg)
         if name in names:
             msg = f"{path.name}: филиал {name!r} указан дважды"
             raise ValueError(msg)
-        if not directory.strip():
+        if not isinstance(directory, str) or not directory.strip():
             msg = f"{path.name}: у филиала {name!r} не задан files_directory"
             raise ValueError(msg)
         names.add(name)

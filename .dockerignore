@@ -39,3 +39,6 @@ test_*.py
 
 # Files directory (user data should be mounted as volume)
 files/
+
+# Generated per-branch build config (CI only)
+app/_build_config.py

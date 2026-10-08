@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     
     steps:
     - uses: actions/checkout@v4
@@ -32,6 +34,12 @@ jobs:
         ruff check app tests scripts
         ruff format --check app tests scripts
     
+    - name: Read branch list from branches.toml
+      id: matrix
+      run: |
+        matrix="$(python scripts/branches.py matrix)"
+        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+    
     - name: Run tests with coverage
       run: |
         pytest
@@ -44,36 +52,16 @@ jobs:
         path: htmlcov/
         retention-days: 7
 
-  branches:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-
-    - name: Read branch list from branches.toml
-      id: matrix
-      run: |
-        echo "matrix=$(python scripts/branches.py matrix)" >> "$GITHUB_OUTPUT"
-
   build:
     name: build (${{ matrix.name }})
     runs-on: windows-latest
-    needs: [test, branches]
+    needs: test
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.branches.outputs.matrix) }}
+        include: ${{ fromJSON(needs.test.outputs.matrix) }}
     
     steps:
     - uses: actions/checkout@v4
@@ -110,7 +98,7 @@ jobs:
     
     - name: Build executable with PyInstaller
       run: |
-        pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
+        pyinstaller --onefile --name FilePickerAPI --hidden-import app._build_config --add-data "app;app" app/__main__.py
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4

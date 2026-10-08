@@ -8,7 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 try:
     # Файл генерируется в CI под конкретный филиал (см. branches.toml)
     from app._build_config import FILES_DIRECTORY
-except ImportError:
+except ModuleNotFoundError as e:
+    if e.name != "app._build_config":
+        raise
     # Локальный запуск и Docker: файлы из ./files
     FILES_DIRECTORY = "./files"
 
