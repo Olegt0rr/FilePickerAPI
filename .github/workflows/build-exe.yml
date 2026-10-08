@@ -82,10 +82,11 @@ jobs:
       shell: pwsh
       run: |
         # Версию вычисляет setuptools-scm из git-тега при pip install.
-        # Для свойств exe нужны только цифры: 2.3.1.dev4+g1a2b3c4 -> 2.3.1.
-        $fullVersion = python -c "from app._version import version; print(version)"
-        $version = python -c "from app._version import version_tuple as v; print('.'.join(str(p) for p in v[:3]))"
-        if ($LASTEXITCODE -or -not $version) { exit 1 }
+        # Для свойств exe нужны только ведущие числа (не больше трёх):
+        # 2.3.1.dev4+g1a2b3c4 -> 2.3.1, 0.1.dev4+g1a2b3c4 (нет тегов) -> 0.1.
+        $out = python -c "from itertools import takewhile; from app._version import version, version_tuple as v; print(version); print('.'.join(str(p) for p in takewhile(lambda p: isinstance(p, int), v[:3])))"
+        if ($LASTEXITCODE -or @($out).Count -ne 2 -or -not $out[1]) { exit 1 }
+        $fullVersion, $version = $out
         if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$fullVersion") {
           Write-Output "::error::Tag $env:GITHUB_REF_NAME resolved to version $fullVersion"
           exit 1

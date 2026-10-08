@@ -11,6 +11,7 @@ if not exist "FilePickerAPI.exe" (
     echo Error: FilePickerAPI.exe not found!
     echo Please make sure FilePickerAPI.exe is in the same directory as this batch file.
     pause
+    popd
     exit /b 1
 )
 
@@ -23,3 +24,4 @@ REM Run the executable in the current console window
 FilePickerAPI.exe
 
 pause
+popd

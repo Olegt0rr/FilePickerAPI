@@ -632,7 +632,11 @@ class TestFilesDirectoryIsFixed:
         module = importlib.reload(importlib.import_module("app.settings"))
         module.get_settings.cache_clear()
         yield module
-        module.get_settings.cache_clear()
+        # Перезагружаем и обработчики с приложением: иначе они остаются
+        # привязаны к get_settings из модуля до перезагрузки. Сначала
+        # возвращаем рабочую папку и окружение (не читать .env теста)
+        monkeypatch.undo()
+        reload_app()
 
     def test_files_directory_is_not_a_settings_field(self, settings_module):
         """Проверить, что путь не является полем настроек."""

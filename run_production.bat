@@ -11,6 +11,7 @@ if not exist "FilePickerAPI.exe" (
     echo Error: FilePickerAPI.exe not found!
     echo Please make sure FilePickerAPI.exe is in the same directory as this batch file.
     pause
+    popd
     exit /b 1
 )
 
@@ -24,7 +25,7 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
 echo FilePickerAPI started in daemon mode at %date% %time% >> "%LOG_DIR%\startup.log"
 
 echo FilePickerAPI has been started in daemon mode (minimized window).
-echo Check %LOG_DIR%\startup.log for confirmation.
+echo Check "%LOG_DIR%\startup.log" for confirmation.
 echo To stop the application, use Task Manager to end FilePickerAPI.exe process.
 
 timeout /t 3 /nobreak >nul
