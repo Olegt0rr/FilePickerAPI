@@ -1,14 +1,15 @@
 """Обработчики для работы с файлами."""
 
 import errno
+import functools
 import logging
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from stat import S_ISDIR, S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
@@ -182,6 +183,48 @@ def file_created_at(file_stat: os.stat_result) -> datetime:
         return datetime.max.replace(tzinfo=UTC) if timestamp > 0 else _DATETIME_MIN
 
 
+def _stat_listed_item(
+    item: Path, base_dir: Callable[[], Path]
+) -> tuple[os.stat_result | None, bool]:
+    """Вернуть stat файла для списка или None, если его не показывать.
+
+    Args:
+        item: Элемент директории с расширением .txt
+        base_dir: Функция, возвращающая разрешённый путь директории
+
+    Returns:
+        Кортеж (stat или None, файл не найден)
+
+    Raises:
+        OSError: При прочих ошибках файловой системы
+
+    """
+    try:
+        file_stat = item.lstat()
+        if S_ISLNK(file_stat.st_mode):
+            # Ссылку показываем, только если её можно скачать: цель —
+            # .txt прямо в директории (см. get_file)
+            target = item.resolve()
+            if target.parent != base_dir() or target.suffix.lower() != ".txt":
+                return None, False
+            file_stat = item.stat()
+    except RuntimeError:
+        # Петля ссылок в resolve() на Python 3.11
+        return None, False
+    except OSError as e:
+        # Как и прежний is_file(), пропускаем битые ссылки, петли
+        # ссылок и файлы, удалённые после чтения списка
+        if isinstance(e, (FileNotFoundError, NotADirectoryError)):
+            return None, True
+        if _is_invalid_name_error(e):
+            return None, False
+        raise
+    # Директории не показываем
+    if not S_ISREG(file_stat.st_mode):
+        return None, False
+    return file_stat, False
+
+
 def _collect_file_info(files_path: Path) -> list[FileInfo]:
     """Собрать информацию о всех .txt файлах в директории.
 
@@ -196,6 +239,9 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
 
     """
     file_list = []
+    # Разрешаем путь директории, только если встретилась ссылка
+    base_dir = functools.cache(files_path.resolve)
+    skipped_missing = False
     try:
         # Директория могла исчезнуть после проверки в list_files
         with _directory_errors(not_found=True):
@@ -205,19 +251,9 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
                 # Сначала расширение: оно не требует обращения к ФС
                 if item.suffix.lower() != ".txt":
                     continue
-                try:
-                    file_stat = item.stat()
-                except OSError as e:
-                    # Как и прежний is_file(), пропускаем битые ссылки,
-                    # петли ссылок и файлы, удалённые после чтения
-                    # списка
-                    if isinstance(
-                        e, (FileNotFoundError, NotADirectoryError)
-                    ) or _is_invalid_name_error(e):
-                        continue
-                    raise
-                # Игнорируем директории, обрабатываем только файлы
-                if not S_ISREG(file_stat.st_mode):
+                file_stat, missing = _stat_listed_item(item, base_dir)
+                skipped_missing |= missing
+                if file_stat is None:
                     continue
                 file_list.append(
                     FileInfo(
@@ -227,6 +263,12 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
                         created_at=file_created_at(file_stat),
                     )
                 )
+        if skipped_missing:
+            # Пропавшие файлы могут означать, что пропала вся директория
+            # (например, отвалилась сетевая папка): тогда это 404, а не
+            # пустой список
+            with _directory_errors(not_found=True):
+                files_path.stat()
     except HTTPException:
         raise
     except Exception as e:
@@ -329,7 +371,10 @@ def get_file(
     # конце: Win32 их отбрасывает, и ".. " превращается в ".."
     candidate = files_directory / file_id
     if (
-        candidate.parent != files_directory
+        # Склейка нормализует путь: на Windows ".\\x.txt", "x.txt\\" и
+        # полный путь к файлу в директории — тот же файл, но не имя
+        candidate.name != file_id
+        or "\x00" in file_id
         or file_id in {".", ".."}
         or (sys.platform == "win32" and (":" in file_id or file_id[-1] in ". "))
     ):

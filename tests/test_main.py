@@ -351,7 +351,7 @@ class TestSecurityDirectoryTraversal:
     """Тесты для безопасности обхода директорий."""
 
     def test_symlink_into_subdirectory(self, test_files_dir):
-        """Проверить, что файл из поддиректории нельзя скачать.
+        """Проверить: файл из поддиректории не виден и не скачивается.
 
         На Windows так же разрешается fileId с обратным слэшем
         (``subdir%5Cinner.txt``): путь остаётся внутри директории,
@@ -370,6 +370,41 @@ class TestSecurityDirectoryTraversal:
         response = client.get("/files/link.txt")
         assert response.status_code == 400
         assert response.json()["detail"] == "Invalid filename"
+
+        names = [f["name"] for f in client.get("/files").json()["availableFiles"]]
+        assert "link.txt" not in names
+
+    @pytest.mark.parametrize(
+        ("target", "listed"),
+        [("test1.txt", True), ("document.pdf", False)],
+    )
+    def test_symlink_listed_only_if_downloadable(self, test_files_dir, target, listed):
+        """Проверить: ссылка в списке, только если её можно скачать."""
+        try:
+            (Path(test_files_dir) / "link.txt").symlink_to(target)
+        except OSError:
+            pytest.skip("Символические ссылки недоступны")
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        names = [f["name"] for f in client.get("/files").json()["availableFiles"]]
+        assert ("link.txt" in names) is listed
+        download = client.get("/files/link.txt")
+        assert (download.status_code == 200) is listed
+
+    def test_symlink_loop_skipped_in_listing(self, test_files_dir):
+        """Проверить: петля ссылок на Python 3.11 не роняет список."""
+        try:
+            (Path(test_files_dir) / "loop.txt").symlink_to("test1.txt")
+        except OSError:
+            pytest.skip("Символические ссылки недоступны")
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        error = RuntimeError("Symlink loop from 'loop.txt'")
+        with fail_for("resolve", "loop.txt", error):
+            response = client.get("/files")
+        assert response.status_code == 200
+        names = [f["name"] for f in response.json()["availableFiles"]]
+        assert "loop.txt" not in names
 
     def test_directory_traversal_with_dotdot(self, client):
         """Проверить, что обход директорий с .. предотвращен."""
@@ -693,7 +728,10 @@ class TestExceptionHandling:
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid filename"
 
-    @pytest.mark.parametrize("file_id", ["/etc/passwd", "sub/x.txt"])
+    @pytest.mark.parametrize(
+        "file_id",
+        ["/etc/passwd", "sub/x.txt", "./test1.txt", "test1.txt/", "a\x00.txt"],
+    )
     def test_security_rejects_non_name_before_fs_access(self, test_files_dir, file_id):
         """Проверить отказ для пути вместо имени до обращения к ФС.
 
@@ -713,6 +751,21 @@ class TestExceptionHandling:
             get_file(file_id)
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid filename"
+
+    def test_security_rejects_full_path_inside_directory(self, test_files_dir):
+        """Проверить отказ для полного пути даже к своему файлу."""
+        from fastapi import HTTPException
+
+        reload_app(files_directory=test_files_dir)
+        from app.handlers.files import get_file
+
+        error = AssertionError("resolve() must not be called")
+        with (
+            mock.patch("pathlib.Path.resolve", side_effect=error),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            get_file(str(Path(test_files_dir) / "test1.txt"))
+        assert exc_info.value.status_code == 400
 
     @pytest.mark.parametrize(
         "file_id", ["test1.txt:stream", "C:x.txt", ".. ", "...", "test1.txt."]
@@ -786,6 +839,38 @@ class TestExceptionHandling:
         response = client.get("/files")
         names = [f["name"] for f in response.json()["availableFiles"]]
         assert "folder.txt" not in names
+
+    def test_list_files_skips_invalid_name(self, client):
+        """Проверить пропуск файла с ошибкой «недопустимое имя»."""
+        error = OSError(errno.ELOOP, "Too many levels of symbolic links")
+        with fail_for("lstat", "test2.txt", error):
+            response = client.get("/files")
+        assert response.status_code == 200
+        names = [f["name"] for f in response.json()["availableFiles"]]
+        assert names == ["test1.txt"]
+
+    def test_list_files_directory_disappears_after_listing(self, test_files_dir):
+        """Проверить 404, если директория пропала после перечисления."""
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        base = Path(test_files_dir)
+        original_stat = Path.stat
+        base_stat_calls = []
+
+        def fake_stat(self, *args, **kwargs):
+            # Первый stat директории (проверка в list_files) проходит,
+            # дальше пропали и файлы, и сама директория
+            if self == base:
+                base_stat_calls.append(self)
+                if len(base_stat_calls) > 1:
+                    raise FileNotFoundError(self)
+            elif self.parent == base:
+                raise FileNotFoundError(self)
+            return original_stat(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", autospec=True, side_effect=fake_stat):
+            response = client.get("/files")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Files directory not found"
 
     def test_list_files_file_permission_error(self, client):
         """Проверить, что отказ в доступе к файлу списка даёт 403."""
