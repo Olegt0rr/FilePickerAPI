@@ -1,0 +1,46 @@
+# distribution Specification
+
+## Purpose
+Способы поставки и запуска сервиса: готовый Windows-исполняемый файл с bat-скриптами, Docker-образ и автоматические релизы на GitHub.
+
+## Requirements
+
+### Requirement: Windows-исполняемый файл
+Проект SHALL собираться в один самодостаточный файл `FilePickerAPI.exe`, который запускает сервис без установленного Python. Сборка SHALL выполняться в CI только после успешного прохождения линтера и тестов.
+
+#### Scenario: Сборка в CI
+- **WHEN** в ветку `main`/`master` отправлен коммит или открыт pull request
+- **THEN** CI запускает ruff и pytest на Linux и, если они прошли, собирает `FilePickerAPI.exe` на Windows и публикует его как артефакт сборки
+
+#### Scenario: Тесты упали
+- **WHEN** линтер или тесты завершились с ошибкой
+- **THEN** исполняемый файл не собирается
+
+### Requirement: Скрипты запуска для Windows
+Вместе с исполняемым файлом SHALL поставляться два скрипта:
+- `run_test.bat` — запускает `FilePickerAPI.exe` в текущем окне консоли с видимым выводом для отладки;
+- `run_production.bat` — запускает `FilePickerAPI.exe` в свёрнутом окне в фоне и дописывает время запуска в `startup.log`.
+
+Оба скрипта MUST завершаться с сообщением об ошибке, если рядом с ними нет `FilePickerAPI.exe`.
+
+#### Scenario: Запуск в фоновом режиме
+- **WHEN** пользователь запускает `run_production.bat` в директории с `FilePickerAPI.exe`
+- **THEN** сервис стартует в свёрнутом окне, а в `startup.log` добавляется строка с датой и временем запуска
+
+#### Scenario: Исполняемый файл отсутствует
+- **WHEN** пользователь запускает любой из bat-скриптов в директории без `FilePickerAPI.exe`
+- **THEN** скрипт выводит `Error: FilePickerAPI.exe not found!` и не запускает сервис
+
+### Requirement: Автоматический релиз
+При публикации тега вида `v*.*.*` SHALL создаваться GitHub Release, к которому прикреплены `FilePickerAPI.exe`, `run_test.bat` и `run_production.bat`, собранные из этого тега после успешного прохождения тестов.
+
+#### Scenario: Публикация тега
+- **WHEN** в репозиторий отправлен тег `v1.2.3`
+- **THEN** создаётся релиз `v1.2.3` с тремя файлами: `FilePickerAPI.exe`, `run_test.bat`, `run_production.bat`
+
+### Requirement: Docker-образ
+Проект SHALL содержать Dockerfile и docker-compose.yml, позволяющие запустить сервис в контейнере на Python 3.11 с пробросом порта 8000 на хост.
+
+#### Scenario: Запуск через docker-compose
+- **WHEN** пользователь выполняет `docker-compose up -d` в корне репозитория
+- **THEN** образ собирается, контейнер запускается и API доступен на порту 8000 хоста

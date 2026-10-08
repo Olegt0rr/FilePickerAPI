@@ -174,6 +174,21 @@ pytest
 - Блок выполнения main
 - Метаданные файлов, сортировку и специальные символы
 
+### Спецификации (OpenSpec)
+
+Поведение сервиса описано в формате [OpenSpec](https://github.com/Fission-AI/OpenSpec) в директории `openspec/`:
+- `openspec/config.yaml` — контекст проекта (стек, соглашения, проверки) для AI-ассистентов
+- `openspec/specs/` — текущие требования по возможностям: `file-listing`, `file-download`, `service-configuration`, `api-documentation`, `distribution`
+- `openspec/changes/` — предложения изменений, которые ещё не внесены в спецификации
+
+Изменения поведения начинаются с предложения (`/opsx:propose` в Claude Code или `openspec new change`), а после реализации архивируются (`openspec archive`), обновляя `openspec/specs/`.
+
+```bash
+npm install -g @fission-ai/openspec
+openspec list --specs
+openspec validate --specs --strict
+```
+
 ### Локальная сборка исполняемого файла
 
 Сборка выполняется [Nuitka](https://nuitka.net/): код компилируется в C, а затем в нативный бинарник. Нужен компилятор C (на Windows — MSVC из Visual Studio Build Tools).
