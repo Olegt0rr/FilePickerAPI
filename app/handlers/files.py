@@ -352,34 +352,32 @@ def list_files() -> FileListResponse:
 _real_path_cache: dict[Path, Path] = {}
 
 
-def _files_directory_real_path(files_directory: Path, *, refresh: bool = False) -> Path:
-    """Вернуть разрешённый путь к директории с файлами.
+def _resolve_files_directory(files_directory: Path, *, refresh: bool = False) -> Path:
+    """Разрешить путь к директории с файлами и обновить кэш.
 
-    Директория не меняется, поэтому путь разрешается один раз: это
-    экономит запросы к сетевой папке на каждом скачивании. Строгий
-    resolve() либо разрешает путь целиком, либо падает, и тогда кэш
-    не заполняется, а прежний путь из него убирается.
+    Строгий resolve() либо разрешает путь целиком, либо падает, и
+    тогда кэш не заполняется, а прежний путь из него убирается.
 
     Args:
         files_directory: Директория из настроек
-        refresh: Разрешить путь заново, не глядя в кэш. Кэш заранее
-            не очищается, и параллельные скачивания им пользуются
+        refresh: Повторная проверка закэшированного пути. Недоступная
+            директория тогда — сбой, а не повод сверяться с
+            неразрешённым путём
 
     Raises:
         HTTPException: 500 при сбое самой директории, без пути в
             detail: это ошибка сервера, а не клиента
 
     """
-    cached = _real_path_cache.get(files_directory)
-    if cached is not None and not refresh:
-        return cached
     try:
         try:
             real_path = files_directory.resolve(strict=True)
         except OSError:
+            _real_path_cache.pop(files_directory, None)
+            if refresh:
+                raise
             # Папка недоступна: нестрогий resolve(), как и раньше, но
             # без кэша — он может вернуть неразрешённый путь
-            _real_path_cache.pop(files_directory, None)
             return files_directory.resolve()
     except (OSError, RuntimeError, ValueError) as e:
         _real_path_cache.pop(files_directory, None)
@@ -428,18 +426,27 @@ def get_file(
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg)
 
-    base_dir = _files_directory_real_path(files_directory)
+    # Директория не меняется, поэтому её путь разрешается один раз:
+    # это экономит запросы к сетевой папке на каждом скачивании
+    cached_dir = _real_path_cache.get(files_directory)
+    base_dir = (
+        cached_dir
+        if cached_dir is not None
+        else _resolve_files_directory(files_directory)
+    )
 
     with _file_errors(file_id):
         file_path = candidate.resolve()
 
     # Отдаём только файлы непосредственно из директории, как и в
     # списке: символическая ссылка не должна уводить в поддиректорию
-    # или за пределы директории. Перед отказом сверяемся с заново
-    # разрешённым путём: закэшированный мог устареть (например, DFS
-    # переключил сетевую папку на другой сервер)
-    if file_path.parent != base_dir and file_path.parent != (
-        _files_directory_real_path(files_directory, refresh=True)
+    # или за пределы директории. Если путь директории взят из кэша,
+    # перед отказом сверяемся с заново разрешённым: закэшированный
+    # мог устареть (например, DFS переключил сетевую папку на другой
+    # сервер)
+    if file_path.parent != base_dir and (
+        cached_dir is None
+        or file_path.parent != _resolve_files_directory(files_directory, refresh=True)
     ):
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg)

@@ -1158,24 +1158,50 @@ class TestFilesDirectoryCache:
         assert calls == [True]
 
     @pytest.mark.usefixtures("subdir_link")
-    def test_refresh_unavailable_directory_drops_cache(self, test_files_dir):
-        """Проверить: недоступная при повторной проверке папка — 400.
+    def test_refresh_unavailable_directory_is_server_error(self, test_files_dir):
+        """Проверить: папка, недоступная при повторной проверке, — 500.
 
-        Строгий resolve() упал, нестрогий отработал: путь убирается из
-        кэша, и следующее скачивание разрешает его заново.
+        Нестрогий resolve() тут не используется: сравнение с
+        неразрешённым путём дало бы клиенту 400 за сбой сервера. Путь
+        убирается из кэша, и следующее скачивание разрешает его заново.
         """
         client = TestClient(reload_app(files_directory=test_files_dir))
         assert client.get("/files/test1.txt").status_code == 200
 
         with fail_strict_resolve(test_files_dir):
             response = client.get("/files/link.txt")
-        assert response.status_code == 400
-        assert response.json()["detail"] == "Invalid filename"
+        assert response.status_code == 500
+        assert response.json()["detail"] == "OS error when reading file"
 
         patch, calls = count_resolve(test_files_dir)
         with patch:
             assert client.get("/files/test1.txt").status_code == 200
         assert calls == [True]
+
+    @pytest.mark.usefixtures("subdir_link")
+    def test_fresh_directory_is_not_resolved_twice(self, test_files_dir):
+        """Проверить: свежий путь директории не перепроверяется."""
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        patch, calls = count_resolve(test_files_dir)
+        with patch:
+            response = client.get("/files/link.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+        assert calls == [True]
+
+    @pytest.mark.usefixtures("subdir_link")
+    def test_unavailable_directory_rejects_as_before(self, test_files_dir):
+        """Проверить: без кэша несовпадение даёт 400, как и раньше.
+
+        Например, на сетевой папке, где строгий resolve() не работает.
+        """
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        with fail_strict_resolve(test_files_dir):
+            response = client.get("/files/link.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
 
     @pytest.mark.usefixtures("subdir_link")
     @pytest.mark.parametrize(
