@@ -11,7 +11,7 @@ try:
 except ModuleNotFoundError as e:
     if e.name != "app._build_config":
         raise
-    # Локальный запуск и Docker: файлы из ./files
+    # Запуск из исходного кода без configure: файлы из ./files
     FILES_DIRECTORY = "./files"
 
 

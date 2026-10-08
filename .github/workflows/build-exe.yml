@@ -117,7 +117,10 @@ jobs:
         path: ~\AppData\Local\Nuitka\Nuitka\Cache
         # Ключ уникален для коммита: actions/cache не перезаписывает
         # существующий ключ, а restore-keys подхватит предыдущий кэш.
-        key: nuitka-${{ runner.os }}-${{ github.sha }}-${{ matrix.name }}
+        # Один ключ на все филиалы: сборки отличаются только
+        # app._build_config, поэтому сохраняет кэш первый завершившийся
+        # джоб, а не каждый филиал свою почти одинаковую копию.
+        key: nuitka-${{ runner.os }}-${{ github.sha }}
         restore-keys: nuitka-${{ runner.os }}-
 
     - name: Build executable with Nuitka
@@ -189,7 +192,6 @@ jobs:
       shell: pwsh
       env:
         TIMESTAMP_URL: http://timestamp.digicert.com
-        SIGN_PATH: dist
       run: |
         $rsa = [System.Security.Cryptography.RSA]::Create(3072)
         $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(

@@ -46,7 +46,6 @@ jobs:
         CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
         CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
         TIMESTAMP_URL: http://timestamp.digicert.com
-        SIGN_PATH: dist
       run: ./.github/scripts/sign.ps1
 
     - name: Upload signed builds

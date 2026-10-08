@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_main import reload_app
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -67,10 +69,39 @@ class TestBranchesFile:
         with pytest.raises(ValueError, match="пуст"):
             branches.load_branches(write_toml(""))
 
-    def test_duplicate_name_rejected(self, branches, write_toml):
-        entry = '[[branch]]\nname = "5000"\nfiles_directory = "x"\n'
+    @pytest.mark.parametrize(
+        ("first", "second"), [("5000", "5000"), ("kazan", "KAZAN")]
+    )
+    def test_duplicate_name_rejected(self, branches, write_toml, first, second):
+        entry = "[[branch]]\nname = \"{}\"\nfiles_directory = 'C:\\files'\n"
+        path = write_toml(entry.format(first) + entry.format(second))
         with pytest.raises(ValueError, match="дважды"):
-            branches.load_branches(write_toml(entry + entry))
+            branches.load_branches(path)
+
+    @pytest.mark.parametrize(
+        "directory",
+        [
+            "x",
+            "./files",
+            "localmq\\Payments\\5000",
+            "\\files",
+            "C:files",
+            "C:\\files\n",
+        ],
+    )
+    def test_relative_or_padded_directory_rejected(
+        self, branches, write_toml, directory
+    ):
+        path = write_toml(
+            f'[[branch]]\nname = "5000"\nfiles_directory = {json.dumps(directory)}\n'
+        )
+        with pytest.raises(ValueError, match="абсолютным путём"):
+            branches.load_branches(path)
+
+    def test_drive_letter_directory_accepted(self, branches, write_toml):
+        path = write_toml("[[branch]]\nname = \"5000\"\nfiles_directory = 'D:\\RSB'\n")
+
+        assert branches.load_branches(path)[0]["files_directory"] == "D:\\RSB"
 
     @pytest.mark.parametrize("name", ["", "50 00", "../x", "5000/1"])
     def test_invalid_name_rejected(self, branches, write_toml, name):
@@ -138,13 +169,10 @@ class TestSettingsFilesDirectory:
     def restore_settings(self, monkeypatch):
         yield
         # Убираем подменённый app._build_config и перезагружаем
-        # настройки, обработчики и приложение (как reload_app в
-        # test_main): иначе они останутся привязаны к get_settings
-        # из перезагруженного здесь модуля
+        # настройки, обработчики и приложение: иначе они останутся
+        # привязаны к get_settings из перезагруженного здесь модуля
         monkeypatch.undo()
-        importlib.reload(sys.modules["app.settings"])
-        importlib.reload(sys.modules["app.handlers.files"])
-        importlib.reload(sys.modules["app"])
+        reload_app()
 
     def test_default_without_build_config(self, monkeypatch):
         # None в sys.modules заставляет импорт упасть с ImportError

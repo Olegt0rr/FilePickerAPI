@@ -5,13 +5,14 @@
 #   CERT_PFX_BASE64 — PFX сертификата подписи кода в base64
 #   CERT_PASSWORD   — пароль от PFX
 #   TIMESTAMP_URL   — RFC 3161 сервер меток времени
-#   SIGN_PATH       — папка сборки (по умолчанию dist/FilePickerAPI)
+#   SIGN_PATH       — папка со сборками (по умолчанию dist: сборки всех
+#                     филиалов, dist/FilePickerAPI-<филиал>/FilePickerAPI)
 #
 # Используется в release.yml (боевой сертификат) и в build-exe.yml
 # (одноразовый сертификат, чтобы проверять логику подписи в каждом PR).
 
 $ErrorActionPreference = 'Stop'
-$signPath = if ($env:SIGN_PATH) { $env:SIGN_PATH } else { 'dist/FilePickerAPI' }
+$signPath = if ($env:SIGN_PATH) { $env:SIGN_PATH } else { 'dist' }
 
 if (-not $env:CERT_PFX_BASE64 -or -not $env:CERT_PASSWORD) {
   Write-Output "::error::Signing secrets are not set in the code-signing environment"
@@ -57,9 +58,16 @@ if ($unsigned) {
   $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
   [IO.File]::WriteAllBytes($pfx, $pfxBytes)
   try {
-    & $signtool sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 `
-      /d FilePickerAPI $unsigned.FullName
-    if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    # Пачками: файлы сборок всех филиалов в одной команде упёрлись бы
+    # в лимит длины командной строки Windows (32767 символов).
+    $paths = @($unsigned.FullName)
+    $batchSize = 50
+    for ($i = 0; $i -lt $paths.Count; $i += $batchSize) {
+      $batch = $paths[$i..([Math]::Min($i + $batchSize, $paths.Count) - 1)]
+      & $signtool sign /f $pfx /p $env:CERT_PASSWORD /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 `
+        /d FilePickerAPI $batch
+      if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    }
   } finally {
     Remove-Item $pfx -Force
   }

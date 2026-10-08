@@ -11,7 +11,7 @@ import json
 import re
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parent.parent
 BRANCHES_FILE = ROOT / "branches.toml"
@@ -38,13 +38,26 @@ def load_branches(path: Path = BRANCHES_FILE) -> list[dict[str, str]]:
         if not isinstance(name, str) or not NAME_PATTERN.fullmatch(name):
             msg = f"{path.name}: недопустимое имя филиала {name!r}"
             raise ValueError(msg)
-        if name in names:
+        # Без учёта регистра: артефакты FilePickerAPI-<филиал>
+        # скачиваются на Windows, где Kazan и kazan - одна папка
+        if name.lower() in names:
             msg = f"{path.name}: филиал {name!r} указан дважды"
             raise ValueError(msg)
         if not isinstance(directory, str) or not directory.strip():
             msg = f"{path.name}: у филиала {name!r} не задан files_directory"
             raise ValueError(msg)
-        names.add(name)
+        # Относительный путь считался бы от рабочей папки при запуске,
+        # и пользователь подменил бы директорию, запустив exe из своей
+        if (
+            directory != directory.strip()
+            or not PureWindowsPath(directory).is_absolute()
+        ):
+            msg = (
+                f"{path.name}: у филиала {name!r} files_directory должен быть "
+                f"абсолютным путём Windows без пробелов по краям: {directory!r}"
+            )
+            raise ValueError(msg)
+        names.add(name.lower())
 
     return [
         {"name": b["name"], "files_directory": b["files_directory"]} for b in branches
