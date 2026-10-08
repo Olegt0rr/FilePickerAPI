@@ -31,10 +31,10 @@ jobs:
         name: FilePickerAPI-Windows
         path: dist/
 
-    # Подписываем каждый PE-файл сборки (exe, dll, pyd), у которого ещё нет
-    # действительной подписи: при включённых WDAC/AppLocker любой изменённый
-    # файл перестанет запускаться. Уже подписанные файлы (python311.dll,
-    # vcruntime и т.п.) не трогаем.
+    # Подписываем каждый неподписанный PE-файл сборки (exe, dll, pyd): при
+    # включённых WDAC/AppLocker любой изменённый файл перестанет запускаться.
+    # Файлы с действительной чужой подписью (python311.dll, vcruntime и т.п.)
+    # не трогаем, а с недействительной — останавливаем релиз.
     - name: Sign binaries
       shell: pwsh
       env:
@@ -63,15 +63,17 @@ jobs:
         $status = @{}
         $binaries | ForEach-Object { $status[$_.FullName] = (Get-AuthenticodeSignature $_.FullName).Status }
 
-        # Файл с чужой подписью и HashMismatch изменён после подписи: свою
-        # подпись поверх не ставим, иначе подмена станет незаметной.
-        $tampered = $binaries | Where-Object { $status[$_.FullName] -eq 'HashMismatch' }
-        if ($tampered) {
-          $tampered | ForEach-Object { Write-Output "::error::Signature hash mismatch: $($_.FullName)" }
+        # Подписываем только файлы без подписи. Чужая подпись в любом другом
+        # состоянии, кроме Valid (HashMismatch, NotTrusted, UnknownError...),
+        # означает изменённый или подозрительный файл: свою подпись поверх
+        # не ставим, иначе проблема станет незаметной, и останавливаем релиз.
+        $suspicious = $binaries | Where-Object { $status[$_.FullName] -notin 'Valid', 'NotSigned' }
+        if ($suspicious) {
+          $suspicious | ForEach-Object { Write-Output "::error::Signature status $($status[$_.FullName]): $($_.FullName)" }
           exit 1
         }
 
-        $unsigned = $binaries | Where-Object { $status[$_.FullName] -ne 'Valid' }
+        $unsigned = $binaries | Where-Object { $status[$_.FullName] -eq 'NotSigned' }
 
         if ($unsigned) {
           $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
@@ -100,6 +102,12 @@ jobs:
           exit 1
         }
         Write-Output "Signed $(@($unsigned).Count) of $($binaries.Count) binaries with $thumbprint"
+
+        # Файлы с чужой действительной подписью оставлены как есть: их
+        # издателей нужно разрешить в политике WDAC/AppLocker.
+        $binaries | Where-Object { $status[$_.FullName] -eq 'Valid' } |
+          Group-Object { (Get-AuthenticodeSignature $_.FullName).SignerCertificate.Subject } |
+          ForEach-Object { Write-Output "Kept third-party signature on $($_.Count) file(s): $($_.Name)" }
 
     - name: Upload signed build
       uses: actions/upload-artifact@v4

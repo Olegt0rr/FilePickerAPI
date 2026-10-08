@@ -15,8 +15,10 @@ if not exist "FilePickerAPI.exe" (
     exit /b 1
 )
 
-REM Start the application minimized in background
-start "" /MIN FilePickerAPI.exe
+REM Start the application minimized in background. Use the original path
+REM of this folder (not the drive letter pushd may have mapped for a UNC
+REM path), so the popd at the end cannot pull the drive from under the app.
+start "" /D "%~dp0." /MIN "%~dp0FilePickerAPI.exe"
 
 REM Append to log file to track startup history. The install folder is
 REM not writable for users, so the log goes to the per-user profile.
@@ -29,3 +31,4 @@ echo Check "%LOG_DIR%\startup.log" for confirmation.
 echo To stop the application, use Task Manager to end FilePickerAPI.exe process.
 
 timeout /t 3 /nobreak >nul
+popd

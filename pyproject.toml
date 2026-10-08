@@ -49,6 +49,10 @@ addopts = [
     "--cov-report=xml",
 ]
 
+[tool.coverage.run]
+# Генерируется setuptools-scm при установке, тестировать в нём нечего
+omit = ["app/_version.py"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 88

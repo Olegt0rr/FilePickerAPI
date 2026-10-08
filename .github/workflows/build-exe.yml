@@ -88,7 +88,9 @@ jobs:
         # Версию вычисляет setuptools-scm из git-тега при pip install.
         # Для свойств exe нужны только ведущие числа (не больше трёх):
         # 2.3.1.dev4+g1a2b3c4 -> 2.3.1, 0.1.dev4+g1a2b3c4 (нет тегов) -> 0.1.
-        $out = python -c "from itertools import takewhile; from app._version import version, version_tuple as v; print(version); print('.'.join(str(p) for p in takewhile(lambda p: isinstance(p, int), v[:3])))"
+        # Файл читаем через runpy, а не импортом: импорт app._version
+        # выполнил бы app/__init__.py (FastAPI, настройки, чтение .env).
+        $out = python -c "import runpy; from itertools import takewhile; ns = runpy.run_path('app/_version.py'); v = ns['version_tuple']; print(ns['version']); print('.'.join(str(p) for p in takewhile(lambda p: isinstance(p, int), v[:3])))"
         if ($LASTEXITCODE -or @($out).Count -ne 2 -or -not $out[1]) { exit 1 }
         $fullVersion, $version = $out
         if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$fullVersion") {
