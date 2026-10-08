@@ -488,7 +488,7 @@ class TestAPIDocumentation:
 class TestExceptionHandling:
     """Тесты для обработки исключений и ошибочных случаев."""
 
-    def test_list_files_permission_error(self):
+    def test_list_files_permission_error(self, monkeypatch):
         """Проверить вывод списка файлов, когда в доступе отказано."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_dir = Path(tmpdir) / "restricted"
@@ -501,17 +501,22 @@ class TestExceptionHandling:
             test_app = reload_app(files_directory=str(test_dir))
             client = TestClient(test_app)
 
-            # Убираем права на чтение
-            test_dir.chmod(0o000)
+            # Эмулируем отказ в доступе через iterdir, а не через chmod:
+            # под root права на директорию не проверяются
+            original_iterdir = Path.iterdir
 
-            try:
-                response = client.get("/files")
-                # Должны получить ошибку 403 из-за отказа в доступе
-                assert response.status_code == 403
-                assert "Permission denied" in response.json()["detail"]
-            finally:
-                # Восстанавливаем права для очистки
-                test_dir.chmod(0o755)
+            def iterdir_denied(self):
+                if self == test_dir:
+                    msg = f"[Errno 13] Permission denied: '{self}'"
+                    raise PermissionError(msg)
+                return original_iterdir(self)
+
+            monkeypatch.setattr(Path, "iterdir", iterdir_denied)
+
+            response = client.get("/files")
+            # Должны получить ошибку 403 из-за отказа в доступе
+            assert response.status_code == 403
+            assert "Permission denied" in response.json()["detail"]
 
     def test_list_files_oserror(self):
         """Проверить обработку OSError при чтении директории."""
