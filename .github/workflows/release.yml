@@ -3,36 +3,80 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      # Только финальные версии: v2.3.0, но не v2.3.0-rc1
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     uses: ./.github/workflows/build-exe.yml
-  
-  release:
-    runs-on: ubuntu-latest
+
+  # Подпись вынесена в отдельный джоб с окружением code-signing: секреты
+  # сертификата лежат только в этом окружении, а его правила развёртывания
+  # пускают лишь теги v*. Сборки из PR и веток (даже с изменённым
+  # воркфлоу) до сертификата не дотягиваются.
+  sign:
+    runs-on: windows-latest
     needs: build
-    
+    environment: code-signing
+    permissions:
+      contents: read
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Download artifacts
+    - uses: actions/checkout@v4
+      with:
+        sparse-checkout: .github/scripts
+
+    # Сборки всех филиалов: dist/FilePickerAPI-<филиал>/FilePickerAPI
+    - name: Download builds
       uses: actions/download-artifact@v4
       with:
         pattern: FilePickerAPI-*
-        path: ./artifacts/
+        path: dist/
+
+    # Подписываем каждый неподписанный PE-файл сборки (exe, dll, pyd): при
+    # включённых WDAC/AppLocker любой изменённый файл перестанет запускаться.
+    # Файлы с действительной чужой подписью (python311.dll, vcruntime и т.п.)
+    # не трогаем, а с недействительной — останавливаем релиз.
+    - name: Sign binaries
+      shell: pwsh
+      env:
+        CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+        CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        TIMESTAMP_URL: http://timestamp.digicert.com
+        SIGN_PATH: dist
+      run: ./.github/scripts/sign.ps1
+
+    - name: Upload signed builds
+      uses: actions/upload-artifact@v4
+      with:
+        name: signed-builds
+        path: dist/
+        retention-days: 30
+
+  release:
+    runs-on: ubuntu-latest
+    needs: sign
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download signed builds
+      uses: actions/download-artifact@v4
+      with:
+        name: signed-builds
+        path: ./dist/
     
-    - name: Package one archive per branch
+    # Архив на каждый филиал: FilePickerAPI-<филиал>.zip с папкой
+    # FilePickerAPI внутри, как и раньше
+    - name: Pack distributions
       run: |
-        mkdir -p release
-        for dir in artifacts/FilePickerAPI-*/; do
+        mkdir release
+        for dir in dist/FilePickerAPI-*/; do
           name="$(basename "$dir")"
-          cp run_test.bat run_production.bat "$dir"
-          (cd "$dir" && zip -q "../../release/${name}.zip" FilePickerAPI.exe run_test.bat run_production.bat)
+          (cd "$dir" && zip -r "../../release/${name}.zip" FilePickerAPI)
         done
         ls -l release
     
@@ -46,23 +90,22 @@ jobs:
           ### Установка
           
           #### Windows
-          Для каждого филиала собран отдельный архив `FilePickerAPI-<код филиала>.zip`
-          (список филиалов и их пути — в `branches.toml`). Скачайте архив своего филиала
-          и распакуйте его в одну директорию. В архиве:
-          - **`FilePickerAPI.exe`** - приложение с зашитым путём к файлам филиала
+          Для каждого филиала собран свой архив `FilePickerAPI-<код филиала>.zip`: директория с файлами зашита в сборку. Скачайте архив своего филиала и распакуйте его в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`). Все `exe`/`dll`/`pyd` в архиве подписаны.
+
+          Для запуска используйте один из bat-файлов из архива:
           - **`run_test.bat`** - для тестирования (с консольным окном и выводом отладочной информации)
-          - **`run_production.bat`** - для продакшн работы (без консольного окна, в фоновом режиме)
-          
+          - **`run_production.bat`** - для продакшн работы (сервис в свёрнутом окне в фоне; скрипт проверяет, что сервис ответил, и пишет итог в `%LOCALAPPDATA%\FilePickerAPI\startup.log`, код выхода 0 — запущен, 1 — ошибка; нужен системный `curl.exe`, Windows 10 1803+)
+
           #### Из исходного кода
           ```bash
           pip install -e .
           python -m app
           ```
-          
+
           ### Конфигурация
-          - Директория с файлами зашита в exe при сборке (см. `branches.toml`), при запуске из исходников - `./files`
+          - Директория с файлами зашита в сборку филиала (см. `branches.toml`) и не настраивается
           - `CORS_ORIGINS` - разрешенные CORS origins (по умолчанию: `*`)
-          
+
           Полная документация: https://github.com/Olegt0rr/FilePickerAPI#readme
         draft: false
         prerelease: false

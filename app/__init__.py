@@ -6,10 +6,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.handlers import files
 from app.settings import get_settings
 
+try:
+    # Файл генерирует setuptools-scm при pip install (в git его нет)
+    from app._version import __version__
+except ImportError:  # pragma: no cover - запуск без установки пакета
+    __version__ = "0.0.0"
+
 app = FastAPI(
     title="File Picker API",
     description="API for listing and downloading files from a configured directory",
-    version="1.0.0",
+    version=__version__,
 )
 
 # Включение CORS для фронтенд-приложений

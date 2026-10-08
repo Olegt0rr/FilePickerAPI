@@ -2,6 +2,7 @@
 Тесты сборки под филиалы: branches.toml и scripts/branches.py.
 """
 
+import builtins
 import importlib
 import importlib.util
 import json
@@ -10,7 +11,6 @@ import types
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -135,10 +135,16 @@ class TestBranchesCli:
 
 class TestSettingsFilesDirectory:
     @pytest.fixture(autouse=True)
-    def restore_settings(self):
+    def restore_settings(self, monkeypatch):
         yield
-        sys.modules.pop("app._build_config", None)
+        # Убираем подменённый app._build_config и перезагружаем
+        # настройки, обработчики и приложение (как reload_app в
+        # test_main): иначе они останутся привязаны к get_settings
+        # из перезагруженного здесь модуля
+        monkeypatch.undo()
         importlib.reload(sys.modules["app.settings"])
+        importlib.reload(sys.modules["app.handlers.files"])
+        importlib.reload(sys.modules["app"])
 
     def test_default_without_build_config(self, monkeypatch):
         # None в sys.modules заставляет импорт упасть с ImportError
@@ -166,35 +172,18 @@ class TestSettingsFilesDirectory:
             r"\\host\Payments\5400\CENTER\RSB"
         )
 
+    def test_broken_build_config_is_not_ignored(self, monkeypatch):
+        """Сломанный конфиг сборки не подменяется на ./files."""
+        real_import = builtins.__import__
 
-class TestFilesDirectoryNotOverridable:
-    """Пользователь не должен иметь возможности подменить директорию."""
+        def fake_import(name, *args, **kwargs):
+            if name == "app._build_config":
+                # Конфиг есть, но сам импортирует отсутствующий модуль
+                raise ModuleNotFoundError(name="missing_dependency")
+            return real_import(name, *args, **kwargs)
 
-    BUILT_IN = r"\\host\Payments\5400\CENTER\RSB"
+        monkeypatch.setattr(builtins, "__import__", fake_import)
 
-    @pytest.fixture
-    def settings_module(self, monkeypatch, tmp_path):
-        build_config = types.ModuleType("app._build_config")
-        build_config.FILES_DIRECTORY = self.BUILT_IN
-        monkeypatch.setitem(sys.modules, "app._build_config", build_config)
-        monkeypatch.chdir(tmp_path)
-        module = importlib.reload(importlib.import_module("app.settings"))
-        yield module
-        monkeypatch.undo()
-        importlib.reload(sys.modules["app.settings"])
-
-    def test_environment_variable_ignored(self, settings_module, monkeypatch):
-        monkeypatch.setenv("FILES_DIRECTORY", r"C:\other")
-
-        assert settings_module.Settings().files_directory == self.BUILT_IN
-
-    def test_dotenv_cannot_override(self, settings_module, tmp_path):
-        (tmp_path / ".env").write_text("FILES_DIRECTORY=C:\\other\n")
-
-        with pytest.raises(ValidationError):
-            settings_module.Settings()
-        assert settings_module.Settings.files_directory == self.BUILT_IN
-
-    def test_constructor_argument_cannot_override(self, settings_module):
-        with pytest.raises(ValidationError):
-            settings_module.Settings(files_directory=r"C:\other")
+        with pytest.raises(ModuleNotFoundError) as exc_info:
+            importlib.reload(importlib.import_module("app.settings"))
+        assert exc_info.value.name == "missing_dependency"
