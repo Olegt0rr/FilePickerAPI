@@ -10,6 +10,7 @@ import types
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -164,3 +165,36 @@ class TestSettingsFilesDirectory:
         assert settings_module.Settings.files_directory == (
             r"\\host\Payments\5400\CENTER\RSB"
         )
+
+
+class TestFilesDirectoryNotOverridable:
+    """Пользователь не должен иметь возможности подменить директорию."""
+
+    BUILT_IN = r"\\host\Payments\5400\CENTER\RSB"
+
+    @pytest.fixture
+    def settings_module(self, monkeypatch, tmp_path):
+        build_config = types.ModuleType("app._build_config")
+        build_config.FILES_DIRECTORY = self.BUILT_IN
+        monkeypatch.setitem(sys.modules, "app._build_config", build_config)
+        monkeypatch.chdir(tmp_path)
+        module = importlib.reload(importlib.import_module("app.settings"))
+        yield module
+        monkeypatch.undo()
+        importlib.reload(sys.modules["app.settings"])
+
+    def test_environment_variable_ignored(self, settings_module, monkeypatch):
+        monkeypatch.setenv("FILES_DIRECTORY", r"C:\other")
+
+        assert settings_module.Settings().files_directory == self.BUILT_IN
+
+    def test_dotenv_cannot_override(self, settings_module, tmp_path):
+        (tmp_path / ".env").write_text("FILES_DIRECTORY=C:\\other\n")
+
+        with pytest.raises(ValidationError):
+            settings_module.Settings()
+        assert settings_module.Settings.files_directory == self.BUILT_IN
+
+    def test_constructor_argument_cannot_override(self, settings_module):
+        with pytest.raises(ValidationError):
+            settings_module.Settings(files_directory=r"C:\other")
