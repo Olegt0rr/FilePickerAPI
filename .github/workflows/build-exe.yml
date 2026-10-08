@@ -29,8 +29,8 @@ jobs:
     
     - name: Run ruff checks
       run: |
-        ruff check app tests
-        ruff format --check app tests
+        ruff check app tests scripts
+        ruff format --check app tests scripts
     
     - name: Run tests with coverage
       run: |
@@ -44,11 +44,36 @@ jobs:
         path: htmlcov/
         retention-days: 7
 
-  build:
-    runs-on: windows-latest
-    needs: test
+  branches:
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Read branch list from branches.toml
+      id: matrix
+      run: |
+        echo "matrix=$(python scripts/branches.py matrix)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: windows-latest
+    needs: [test, branches]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.branches.outputs.matrix) }}
     
     steps:
     - uses: actions/checkout@v4
@@ -64,6 +89,25 @@ jobs:
         pip install -e .
         pip install pyinstaller
     
+    - name: Configure files directory for branch ${{ matrix.name }}
+      env:
+        BRANCH_NAME: ${{ matrix.name }}
+      run: |
+        python scripts/branches.py configure "$env:BRANCH_NAME"
+    
+    - name: Verify files directory for branch ${{ matrix.name }}
+      shell: python
+      env:
+        EXPECTED_DIRECTORY: ${{ matrix.files_directory }}
+      run: |
+        import os
+        from app.settings import get_settings
+
+        actual = get_settings().files_directory
+        expected = os.environ["EXPECTED_DIRECTORY"]
+        print("files_directory =", actual)
+        assert actual == expected, f"expected {expected!r}, got {actual!r}"
+    
     - name: Build executable with PyInstaller
       run: |
         pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
@@ -71,6 +115,6 @@ jobs:
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: FilePickerAPI-Windows
+        name: FilePickerAPI-${{ matrix.name }}
         path: dist/FilePickerAPI.exe
         retention-days: 30

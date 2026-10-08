@@ -20,30 +20,38 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Download artifact
+    - name: Download artifacts
       uses: actions/download-artifact@v4
       with:
-        name: FilePickerAPI-Windows
-        path: ./dist/
+        pattern: FilePickerAPI-*
+        path: ./artifacts/
+    
+    - name: Package one archive per branch
+      run: |
+        mkdir -p release
+        for dir in artifacts/FilePickerAPI-*/; do
+          name="$(basename "$dir")"
+          cp run_test.bat run_production.bat "$dir"
+          (cd "$dir" && zip -q "../../release/${name}.zip" FilePickerAPI.exe run_test.bat run_production.bat)
+        done
+        ls -l release
     
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v2
       with:
-        files: |
-          ./dist/FilePickerAPI.exe
-          ./run_test.bat
-          ./run_production.bat
+        files: ./release/*.zip
         body: |
           ## FilePickerAPI ${{ github.ref_name }}
           
           ### Установка
           
           #### Windows
-          Скачайте `FilePickerAPI.exe` и один из bat-файлов для запуска:
+          Для каждого филиала собран отдельный архив `FilePickerAPI-<код филиала>.zip`
+          (список филиалов и их пути — в `branches.toml`). Скачайте архив своего филиала
+          и распакуйте его в одну директорию. В архиве:
+          - **`FilePickerAPI.exe`** - приложение с зашитым путём к файлам филиала
           - **`run_test.bat`** - для тестирования (с консольным окном и выводом отладочной информации)
           - **`run_production.bat`** - для продакшн работы (без консольного окна, в фоновом режиме)
-          
-          Поместите все файлы в одну директорию и запустите нужный bat-файл.
           
           #### Из исходного кода
           ```bash
@@ -52,7 +60,7 @@ jobs:
           ```
           
           ### Конфигурация
-          - `FILES_DIRECTORY` - директория с файлами (по умолчанию: `./files`)
+          - Директория с файлами зашита в exe при сборке (см. `branches.toml`), при запуске из исходников - `./files`
           - `CORS_ORIGINS` - разрешенные CORS origins (по умолчанию: `*`)
           
           Полная документация: https://github.com/Olegt0rr/FilePickerAPI#readme

@@ -47,3 +47,6 @@ files/
 .coverage
 htmlcov/
 coverage.xml
+
+# Сгенерированный при сборке путь филиала
+app/_build_config.py

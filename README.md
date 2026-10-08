@@ -122,11 +122,10 @@ API будет доступен по адресу `http://localhost:8000`
 
 ### Использование Windows исполняемого файла
 
-1. Скачайте последний `FilePickerAPI.exe` из [Releases](../../releases/latest)
-2. Запустите исполняемый файл:
-```bash
-FilePickerAPI.exe
-```
+1. Скачайте из [Releases](../../releases/latest) архив своего филиала `FilePickerAPI-<код филиала>.zip`
+2. Распакуйте архив и запустите `run_test.bat` или `run_production.bat`
+
+Путь к директории с файлами зашит в исполняемый файл при сборке (см. [Сборка под филиалы](#сборка-под-филиалы)).
 
 Также можно скачать артефакты из последних [GitHub Actions workflow runs](../../actions)
 
@@ -134,19 +133,19 @@ FilePickerAPI.exe
 
 ### Директория с файлами
 
-По умолчанию приложение обслуживает файлы из директории `./files`. Вы можете изменить это, установив переменную окружения `FILES_DIRECTORY`:
+Директория с файлами не настраивается через переменные окружения: для каждого филиала она зашивается в исполняемый файл при сборке. При запуске из исходного кода и в Docker приложение обслуживает файлы из директории `./files`.
 
-**Linux/Mac:**
-```bash
-export FILES_DIRECTORY="/path/to/your/files"
-python -m app
+### Сборка под филиалы
+
+Список филиалов и их путей хранится в [`branches.toml`](branches.toml):
+
+```toml
+[[branch]]
+name = "5400"
+files_directory = '\\localmq.neadru.local\Payments\5400\CENTER\RSB'
 ```
 
-**Windows:**
-```cmd
-set FILES_DIRECTORY=C:\path\to\your\files
-FilePickerAPI.exe
-```
+CI собирает отдельный `FilePickerAPI.exe` под каждый филиал из этого файла из одной и той же кодовой базы. Чтобы добавить филиал, допишите новый блок `[[branch]]` и сделайте коммит. Строку пути пишите в одинарных кавычках: тогда обратные слэши указываются как есть, без экранирования.
 
 ### CORS Origins
 
@@ -221,10 +220,12 @@ pytest
 
 ```bash
 pip install pyinstaller
+# Зашить путь нужного филиала из branches.toml (создаёт app/_build_config.py)
+python scripts/branches.py configure 5400
 pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
 ```
 
-Исполняемый файл будет создан в директории `dist/`.
+Исполняемый файл будет создан в директории `dist/`. Без шага `configure` exe будет обслуживать `./files`.
 
 **Примечание**: На Windows используйте точку с запятой (`;`) в параметре `--add-data`, на Linux/Mac используйте двоеточие (`:`):
 - Windows: `--add-data "app;app"`
@@ -238,9 +239,9 @@ pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
 
 Автоматически:
 - Запускает набор тестов на Ubuntu
-- Собирает Windows исполняемый файл (только если тесты прошли)
+- Собирает Windows исполняемый файл под каждый филиал из `branches.toml` (только если тесты прошли)
 - Загружает отчеты о покрытии тестами
-- Загружает Windows исполняемый файл как артефакт
+- Загружает исполняемые файлы как артефакты `FilePickerAPI-<код филиала>`
 
 Триггеры workflow:
 - Push в ветку main/master
@@ -256,8 +257,8 @@ pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
 Автоматически создаёт релизы с собранными артефактами:
 - Срабатывает при создании тега версии (формат: `v*.*.*`)
 - Создаёт GitHub Release с описанием
-- Собирает Windows исполняемый файл
-- Прикрепляет исполняемый файл к релизу
+- Собирает Windows исполняемые файлы под все филиалы
+- Прикрепляет к релизу архив `FilePickerAPI-<код филиала>.zip` для каждого филиала
 
 **Создание нового релиза:**
 
@@ -270,10 +271,10 @@ git push origin v1.0.0
 
 После отправки тега workflow автоматически:
 1. Создаст GitHub Release с именем "Release v1.0.0"
-2. Соберёт Windows исполняемый файл
-3. Прикрепит `FilePickerAPI.exe` к релизу
+2. Соберёт Windows исполняемые файлы под все филиалы из `branches.toml`
+3. Прикрепит к релизу архивы `FilePickerAPI-<код филиала>.zip` (exe + bat-файлы)
 
-Пользователи смогут скачать релиз с готовым исполняемым файлом со страницы [Releases](../../releases)
+Пользователи смогут скачать архив своего филиала со страницы [Releases](../../releases)
 
 ## Безопасность
 

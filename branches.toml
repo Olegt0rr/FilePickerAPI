@@ -1,0 +1,22 @@
+# Список филиалов, под которые CI собирает отдельный FilePickerAPI.exe.
+#
+# Чтобы добавить филиал, допишите новый блок [[branch]] и сделайте
+# коммит: CI соберёт exe для каждого филиала из этого списка.
+#
+# name            - короткий код филиала (буквы, цифры, "-" и "_"),
+#                   попадает в имя артефакта и архива релиза
+# files_directory - путь к директории с файлами платёжных поручений.
+#                   Строка в одинарных кавычках: обратные слэши
+#                   пишутся как есть, без экранирования.
+
+[[branch]]
+name = "5000"
+files_directory = '\\localmq.neadru.local\Payments\5000\CENTER\RSB'
+
+[[branch]]
+name = "5100"
+files_directory = '\\localmq.neadru.local\Payments\5100\CENTER\RSB'
+
+[[branch]]
+name = "5400"
+files_directory = '\\localmq.neadru.local\Payments\5400\CENTER\RSB'
