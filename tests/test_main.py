@@ -498,17 +498,17 @@ class TestExceptionHandling:
 
             # Эмулируем отказ в доступе через iterdir, а не через chmod:
             # под root права на директорию не проверяются
-            with mock.patch(
-                "pathlib.Path.iterdir",
-                side_effect=PermissionError(errno.EACCES, "Permission denied", tmpdir),
-            ):
+            error = PermissionError(errno.EACCES, "Permission denied", tmpdir)
+            with mock.patch("pathlib.Path.iterdir", side_effect=error):
                 response = client.get("/files")
-                # Должны получить ошибку 403 из-за отказа в доступе,
-                # а текст исходного исключения должен попасть в detail
-                assert response.status_code == 403
-                detail = response.json()["detail"]
-                assert detail.startswith("Permission denied when reading")
-                assert tmpdir in detail
+            # Должны получить ошибку 403 из-за отказа в доступе,
+            # а текст исходного исключения должен попасть в detail.
+            # Сравниваем с str(error), а не с tmpdir: путь в сообщении
+            # выводится через repr, и на Windows слэши удваиваются
+            assert response.status_code == 403
+            assert response.json()["detail"] == (
+                f"Permission denied when reading directory: {error}"
+            )
 
     def test_list_files_oserror(self):
         """Проверить обработку OSError при чтении директории."""
