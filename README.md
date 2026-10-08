@@ -83,50 +83,11 @@ API будет доступен по адресу `http://localhost:8000`
 
 **💡 Совет:** Откройте `http://localhost:8000/docs` в браузере для доступа к интерактивной документации Swagger UI
 
-### Запуск с Docker
-
-1. Клонируйте репозиторий:
-```bash
-git clone https://github.com/Olegt0rr/FilePickerAPI.git
-cd FilePickerAPI
-```
-
-2. Запустите с помощью Docker Compose:
-```bash
-docker-compose up -d
-```
-
-Или соберите и запустите вручную:
-```bash
-# Собрать образ
-docker build -t filepicker-api .
-
-# Запустить контейнер (Linux/Mac)
-docker run -d -p 8000:8000 -v $(pwd)/files:/app/files filepicker-api
-
-# Запустить контейнер (Windows PowerShell)
-docker run -d -p 8000:8000 -v ${PWD}/files:/app/files filepicker-api
-
-# Запустить контейнер (Windows CMD)
-docker run -d -p 8000:8000 -v %cd%/files:/app/files filepicker-api
-```
-
-API будет доступен по адресу `http://localhost:8000`
-
-**💡 Совет:** Откройте `http://localhost:8000/docs` в браузере для доступа к интерактивной документации Swagger UI
-
-**Примечания по Docker:**
-- Директория `./files` монтируется как том для хранения файлов
-- Порт `8000` пробрасывается на хост
-- Переменные окружения можно настроить в `docker-compose.yml` или передать через `-e` в `docker run`
-
 ### Использование Windows исполняемого файла
 
-1. Скачайте последний `FilePickerAPI.exe` из [Releases](../../releases/latest)
-2. Запустите исполняемый файл:
-```bash
-FilePickerAPI.exe
-```
+1. Скачайте `FilePickerAPI-Windows.zip` из [Releases](../../releases/latest)
+2. Распакуйте архив в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`)
+3. Запустите `run_production.bat` или `run_test.bat` из этой папки
 
 Также можно скачать артефакты из последних [GitHub Actions workflow runs](../../actions)
 
@@ -134,19 +95,15 @@ FilePickerAPI.exe
 
 ### Директория с файлами
 
-По умолчанию приложение обслуживает файлы из директории `./files`. Вы можете изменить это, установив переменную окружения `FILES_DIRECTORY`:
+Директория с файлами **зашита в код** (`app/settings.py`, атрибут `Settings.files_directory`) и не настраивается пользователем.
 
-**Linux/Mac:**
-```bash
-export FILES_DIRECTORY="/path/to/your/files"
-python -m app
-```
+**Требование:** пользователь не должен иметь возможности подменить директорию, из которой API отдаёт файлы. Поэтому:
 
-**Windows:**
-```cmd
-set FILES_DIRECTORY=C:\path\to\your\files
-FilePickerAPI.exe
-```
+- путь объявлен как `ClassVar`, а не как поле настроек, и не читается из переменных окружения;
+- переменная окружения `FILES_DIRECTORY` игнорируется;
+- если в `.env` указан `FILES_DIRECTORY`, приложение не запускается (ошибка валидации), а не переключается на другую директорию.
+
+Это поведение закреплено тестами (`TestFilesDirectoryIsFixed`). Изменить директорию можно только правкой кода и пересборкой.
 
 ### CORS Origins
 
@@ -219,16 +176,37 @@ pytest
 
 ### Локальная сборка исполняемого файла
 
-```bash
-pip install pyinstaller
-pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
+Сборка выполняется [Nuitka](https://nuitka.net/): код компилируется в C, а затем в нативный бинарник. Нужен компилятор C (на Windows — MSVC из Visual Studio Build Tools).
+
+```powershell
+pip install -e .[build]
+python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --remove-output `
+  --output-dir=build --output-folder-name=FilePickerAPI `
+  --output-filename=FilePickerAPI.exe `
+  --include-package=app --include-package=uvicorn `
+  app/__main__.py
 ```
 
-Исполняемый файл будет создан в директории `dist/`.
+Результат — папка `build/FilePickerAPI.dist/` с `FilePickerAPI.exe` и его зависимостями. Используется режим standalone (папка), а не onefile: onefile при запуске распаковывает неподписанные файлы во временную папку пользователя, что несовместимо с подписью и WDAC/AppLocker.
 
-**Примечание**: На Windows используйте точку с запятой (`;`) в параметре `--add-data`, на Linux/Mac используйте двоеточие (`:`):
-- Windows: `--add-data "app;app"`
-- Linux/Mac: `--add-data "app:app"`
+### Подпись кода
+
+Бинарники подписываются только при релизе, в отдельном джобе `sign` воркфлоу `release.yml`. Подписываются все `exe`/`dll`/`pyd` сборки сертификатом Authenticode; уже подписанные сторонние файлы (например, `python311.dll`) не трогаются. Обычные сборки из push и PR остаются неподписанными.
+
+Сертификат хранится в секретах GitHub Environment `code-signing` (не в секретах репозитория):
+
+- `WINDOWS_SIGNING_CERT_PFX_BASE64` — PFX-файл сертификата подписи кода в base64 (`[Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.pfx"))`)
+- `WINDOWS_SIGNING_CERT_PASSWORD` — пароль от PFX
+
+Настройка окружения (Settings → Environments → `code-signing`):
+
+1. **Deployment branches and tags** → *Selected branches and tags* → добавить правило для тегов `v*`. Без этого любая ветка или PR с изменённым воркфлоу сможет получить сертификат и подписать произвольный код.
+2. Создавать теги `v*` должны только доверенные люди: Settings → Rules → Rulesets, правило для тегов `v*` с ограничением на создание.
+3. По желанию — *Required reviewers*: подпись релиза потребует ручного подтверждения.
+
+Без секретов в окружении релиз падает: неподписанный релиз не публикуется.
+
+Подпись сама по себе не мешает запустить изменённый файл: она только позволяет это обнаружить. Чтобы подменённый или пропатченный бинарник не запускался, на рабочих местах нужно включить WDAC или AppLocker с правилом «разрешить только файлы, подписанные нашим сертификатом» (через доменную GPO), а пользователи не должны быть локальными администраторами. В политике также нужно разрешить издателей Microsoft и Python Software Foundation: их подписи остаются на `vcruntime*.dll`, `python311.dll` и других сторонних файлах сборки. Bat-файлы подписать нельзя, поэтому если в AppLocker включены правила для скриптов, разрешите `run_*.bat` правилом по пути к папке установки.
 
 ## GitHub Actions
 
@@ -238,9 +216,10 @@ pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
 
 Автоматически:
 - Запускает набор тестов на Ubuntu
-- Собирает Windows исполняемый файл (только если тесты прошли)
+- Собирает Windows-версию через Nuitka (только если тесты прошли)
 - Загружает отчеты о покрытии тестами
-- Загружает Windows исполняемый файл как артефакт
+- Загружает папку сборки как артефакт
+- Проверяет скрипт подписи (`.github/scripts/sign.ps1`) на этой сборке с одноразовым самоподписанным сертификатом — боевой сертификат здесь не используется
 
 Триггеры workflow:
 - Push в ветку main/master
@@ -248,30 +227,36 @@ pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
 - Ручной запуск workflow
 
 Артефакты:
-- Windows исполняемый файл: хранится 30 дней
+- Сборка для Windows: хранится 30 дней
 - Отчет о покрытии: хранится 7 дней
 
 ### Release (`.github/workflows/release.yml`)
 
 Автоматически создаёт релизы с собранными артефактами:
-- Срабатывает при создании тега версии (формат: `v*.*.*`)
+- Срабатывает при создании тега версии (формат: `vX.Y.Z` из цифр, например `v2.3.0`)
 - Создаёт GitHub Release с описанием
-- Собирает Windows исполняемый файл
-- Прикрепляет исполняемый файл к релизу
+- Собирает Windows-версию и подписывает её в окружении `code-signing` (без сертификата релиз падает)
+- Прикрепляет `FilePickerAPI-Windows.zip` к релизу
 
 **Создание нового релиза:**
 
+Версия проекта хранится только в git-теге: `pyproject.toml`, `/docs` и свойства exe получают её автоматически через [setuptools-scm](https://setuptools-scm.readthedocs.io/). Поднимать версию в файлах не нужно — достаточно создать тег:
+
 ```bash
-# Обновите версию в pyproject.toml, если необходимо
-# Создайте и отправьте тег
-git tag v1.0.0
-git push origin v1.0.0
+git tag v2.3.0
+git push origin v2.3.0
 ```
 
+Сборки между релизами получают версию вида `2.3.1.dev4+g1a2b3c4` (следующий патч, число коммитов после тега и хэш коммита).
+
+Релиз запускают только теги вида `vX.Y.Z` из цифр; теги вроде `v2.3.0-rc1` релиз не создают.
+
+При локальной разработке версия фиксируется в момент `pip install -e .`; чтобы `/docs` показал новую версию после коммитов или тега, выполните установку повторно.
+
 После отправки тега workflow автоматически:
-1. Создаст GitHub Release с именем "Release v1.0.0"
-2. Соберёт Windows исполняемый файл
-3. Прикрепит `FilePickerAPI.exe` к релизу
+1. Создаст GitHub Release с именем тега (например, `v2.3.0`)
+2. Соберёт и подпишет Windows-версию
+3. Прикрепит `FilePickerAPI-Windows.zip` к релизу
 
 Пользователи смогут скачать релиз с готовым исполняемым файлом со страницы [Releases](../../releases)
 

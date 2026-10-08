@@ -3,58 +3,100 @@ name: Release
 on:
   push:
     tags:
-      - 'v*.*.*'
+      # Только финальные версии: v2.3.0, но не v2.3.0-rc1
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
     uses: ./.github/workflows/build-exe.yml
-  
-  release:
-    runs-on: ubuntu-latest
+
+  # Подпись вынесена в отдельный джоб с окружением code-signing: секреты
+  # сертификата лежат только в этом окружении, а его правила развёртывания
+  # пускают лишь теги v*. Сборки из PR и веток (даже с изменённым
+  # воркфлоу) до сертификата не дотягиваются.
+  sign:
+    runs-on: windows-latest
     needs: build
-    
+    environment: code-signing
+    permissions:
+      contents: read
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Download artifact
+    - uses: actions/checkout@v4
+      with:
+        sparse-checkout: .github/scripts
+
+    - name: Download build
       uses: actions/download-artifact@v4
       with:
         name: FilePickerAPI-Windows
+        path: dist/
+
+    # Подписываем каждый неподписанный PE-файл сборки (exe, dll, pyd): при
+    # включённых WDAC/AppLocker любой изменённый файл перестанет запускаться.
+    # Файлы с действительной чужой подписью (python311.dll, vcruntime и т.п.)
+    # не трогаем, а с недействительной — останавливаем релиз.
+    - name: Sign binaries
+      shell: pwsh
+      env:
+        CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+        CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        TIMESTAMP_URL: http://timestamp.digicert.com
+      run: ./.github/scripts/sign.ps1
+
+    - name: Upload signed build
+      uses: actions/upload-artifact@v4
+      with:
+        name: FilePickerAPI-Windows-signed
+        path: dist/
+        retention-days: 30
+
+  release:
+    runs-on: ubuntu-latest
+    needs: sign
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: FilePickerAPI-Windows-signed
         path: ./dist/
+    
+    - name: Pack distribution
+      run: cd dist && zip -r FilePickerAPI-Windows.zip FilePickerAPI
     
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          ./dist/FilePickerAPI.exe
-          ./run_test.bat
-          ./run_production.bat
+          ./dist/FilePickerAPI-Windows.zip
         body: |
           ## FilePickerAPI ${{ github.ref_name }}
           
           ### Установка
           
           #### Windows
-          Скачайте `FilePickerAPI.exe` и один из bat-файлов для запуска:
+          Скачайте `FilePickerAPI-Windows.zip` и распакуйте его в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`). Все `exe`/`dll`/`pyd` в архиве подписаны.
+
+          Для запуска используйте один из bat-файлов из архива:
           - **`run_test.bat`** - для тестирования (с консольным окном и выводом отладочной информации)
           - **`run_production.bat`** - для продакшн работы (без консольного окна, в фоновом режиме)
-          
-          Поместите все файлы в одну директорию и запустите нужный bat-файл.
-          
+
           #### Из исходного кода
           ```bash
           pip install -e .
           python -m app
           ```
-          
+
           ### Конфигурация
-          - `FILES_DIRECTORY` - директория с файлами (по умолчанию: `./files`)
+          - Директория с файлами зашита в сборку и не настраивается
           - `CORS_ORIGINS` - разрешенные CORS origins (по умолчанию: `*`)
-          
+
           Полная документация: https://github.com/Olegt0rr/FilePickerAPI#readme
         draft: false
         prerelease: false

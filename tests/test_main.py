@@ -618,3 +618,55 @@ class TestMainExecution:
                 assert mock_run.called
                 # Проверяем, что директория была создана
                 assert files_dir.exists()
+
+
+class TestFilesDirectoryIsFixed:
+    """Требование: пользователь не может подменить директорию."""
+
+    ATTACKER_DIR = "/attacker/controlled/dir"
+
+    @pytest.fixture
+    def settings_module(self, monkeypatch, tmp_path):
+        """Чистый модуль настроек, запущенный из временной папки."""
+        monkeypatch.chdir(tmp_path)
+        # reload создаёт новый get_settings с пустым lru_cache
+        module = importlib.reload(importlib.import_module("app.settings"))
+        yield module
+        # Перезагружаем и обработчики с приложением: иначе они остаются
+        # привязаны к get_settings из модуля до перезагрузки. Сначала
+        # возвращаем рабочую папку и окружение (не читать .env теста)
+        monkeypatch.undo()
+        reload_app()
+
+    def test_files_directory_is_not_a_settings_field(self, settings_module):
+        """Проверить, что путь не является полем настроек."""
+        assert "files_directory" not in settings_module.Settings.model_fields
+
+    def test_env_variable_does_not_override(self, settings_module, monkeypatch):
+        """Проверить, что переменная окружения игнорируется."""
+        expected = settings_module.Settings.files_directory
+        assert expected != self.ATTACKER_DIR
+        monkeypatch.setenv("FILES_DIRECTORY", self.ATTACKER_DIR)
+
+        assert settings_module.get_settings().files_directory == expected
+
+    def test_dotenv_does_not_override(self, settings_module, tmp_path):
+        """Проверить, что .env не подменяет путь.
+
+        Вместо подмены приложение отказывается запускаться.
+        """
+        from pydantic import ValidationError
+
+        (tmp_path / ".env").write_text(
+            f"FILES_DIRECTORY={self.ATTACKER_DIR}\n", encoding="utf-8"
+        )
+
+        with pytest.raises(ValidationError):
+            settings_module.Settings()
+
+    def test_constructor_argument_does_not_override(self, settings_module):
+        """Проверить, что путь нельзя передать при создании настроек."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            settings_module.Settings(files_directory=self.ATTACKER_DIR)

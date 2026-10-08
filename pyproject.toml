@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "filepicker-api"
-version = "1.0.0"
+dynamic = ["version"]
 description = "FastAPI приложение для просмотра списка файлов и их загрузки"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,12 +18,21 @@ dependencies = [
 [tool.setuptools]
 packages = ["app", "app.handlers"]
 
+# Версия берётся из git-тега (v2.3.0 -> 2.3.0), руками её не поднимаем.
+# Между релизами получается версия вида 2.3.1.dev4+g1a2b3c4.
+[tool.setuptools_scm]
+version_file = "app/_version.py"
+fallback_version = "0.0.0"
+
 [project.optional-dependencies]
 dev = [
     "pytest==9.0.2",
     "httpx==0.28.1",
     "pytest-cov==7.0.0",
     "ruff>=0.14.9",
+]
+build = [
+    "nuitka==4.2.2",
 ]
 
 [tool.pytest.ini_options]
@@ -39,6 +48,10 @@ addopts = [
     "--cov-report=html",
     "--cov-report=xml",
 ]
+
+[tool.coverage.run]
+# Генерируется setuptools-scm при установке, тестировать в нём нечего
+omit = ["app/_version.py"]
 
 [tool.ruff]
 target-version = "py311"

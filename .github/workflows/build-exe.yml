@@ -16,6 +16,8 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # теги нужны setuptools-scm для версии
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -52,6 +54,8 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # теги нужны setuptools-scm для версии
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -61,16 +65,103 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -e .
-        pip install pyinstaller
-    
-    - name: Build executable with PyInstaller
+        pip install -e .[build]
+
+    # Кэш Nuitka (скомпилированные C-модули, скачанные утилиты): без него
+    # каждый push/PR заново компилирует всё дерево зависимостей.
+    # Релизная сборка (по тегу) идёт на подпись, поэтому собирается с нуля,
+    # без объектов из кэша других запусков; кэш тега к тому же никто
+    # не переиспользует.
+    - name: Cache Nuitka
+      if: github.ref_type != 'tag'
+      uses: actions/cache@v4
+      with:
+        path: ~\AppData\Local\Nuitka\Nuitka\Cache
+        # Ключ уникален для коммита: actions/cache не перезаписывает
+        # существующий ключ, а restore-keys подхватит предыдущий кэш.
+        key: nuitka-${{ runner.os }}-${{ github.sha }}
+        restore-keys: nuitka-${{ runner.os }}-
+
+    - name: Build executable with Nuitka
+      shell: pwsh
       run: |
-        pyinstaller --onefile --name FilePickerAPI --add-data "app;app" app/__main__.py
+        # Версию вычисляет setuptools-scm из git-тега при pip install.
+        # Для свойств exe нужны только ведущие числа (не больше трёх):
+        # 2.3.1.dev4+g1a2b3c4 -> 2.3.1, 0.1.dev4+g1a2b3c4 (нет тегов) -> 0.1.
+        # Файл читаем через runpy, а не импортом: импорт app._version
+        # выполнил бы app/__init__.py (FastAPI, настройки, чтение .env).
+        $out = python -c "import runpy; from itertools import takewhile; ns = runpy.run_path('app/_version.py'); v = ns['version_tuple']; print(ns['version']); print('.'.join(str(p) for p in takewhile(lambda p: isinstance(p, int), v[:3])))"
+        if ($LASTEXITCODE -or @($out).Count -ne 2 -or -not $out[1]) { exit 1 }
+        $fullVersion, $version = $out
+        if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$fullVersion") {
+          Write-Output "::error::Tag $env:GITHUB_REF_NAME resolved to version $fullVersion"
+          exit 1
+        }
+        Write-Output "Building version $fullVersion (file version $version)"
+        python -m nuitka `
+          --mode=standalone `
+          --msvc=latest `
+          --assume-yes-for-downloads `
+          --remove-output `
+          --output-dir=build `
+          --output-folder-name=FilePickerAPI `
+          --output-filename=FilePickerAPI.exe `
+          --include-package=app `
+          --include-package=uvicorn `
+          --product-name=FilePickerAPI `
+          --file-description="File Picker API" `
+          --file-version=$version `
+          --product-version=$version `
+          app/__main__.py
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        New-Item -ItemType Directory -Force dist | Out-Null
+        Move-Item build/FilePickerAPI.dist dist/FilePickerAPI
+        Copy-Item run_test.bat, run_production.bat dist/FilePickerAPI/
     
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: FilePickerAPI-Windows
-        path: dist/FilePickerAPI.exe
+        path: dist/
         retention-days: 30
+
+  # Прогоняет скрипт подписи из release.yml на этой же сборке, но с
+  # одноразовым самоподписанным сертификатом: боевой сертификат доступен
+  # только релизным тегам, а логику подписи нужно проверять в каждом PR.
+  sign-smoke:
+    runs-on: windows-latest
+    needs: build
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        sparse-checkout: .github/scripts
+
+    - name: Download build
+      uses: actions/download-artifact@v4
+      with:
+        name: FilePickerAPI-Windows
+        path: dist/
+
+    - name: Sign with a throwaway certificate
+      shell: pwsh
+      env:
+        TIMESTAMP_URL: http://timestamp.digicert.com
+      run: |
+        $rsa = [System.Security.Cryptography.RSA]::Create(3072)
+        $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+          'CN=FilePickerAPI CI smoke test', $rsa, 'SHA256',
+          [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $eku = [System.Security.Cryptography.OidCollection]::new()
+        [void]$eku.Add([System.Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3'))
+        $request.CertificateExtensions.Add(
+          [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($eku, $false))
+        $request.CertificateExtensions.Add(
+          [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new('DigitalSignature', $true))
+        $cert = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddDays(1))
+
+        $env:CERT_PASSWORD = [guid]::NewGuid().ToString()
+        $env:CERT_PFX_BASE64 = [Convert]::ToBase64String($cert.Export('Pfx', $env:CERT_PASSWORD))
+        ./.github/scripts/sign.ps1

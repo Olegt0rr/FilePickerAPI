@@ -41,6 +41,7 @@ Thumbs.db
 files/
 *.exe
 *.spec
+app/_version.py
 
 # Testing
 .pytest_cache/
