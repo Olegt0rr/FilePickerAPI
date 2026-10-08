@@ -6,7 +6,7 @@ import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 from typing import Annotated
@@ -156,6 +156,9 @@ def _file_errors(file_id: str) -> Iterator[None]:
         raise HTTPException(status_code=500, detail=msg) from e
 
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
 def file_created_at(file_stat: os.stat_result) -> datetime:
     """Вернуть время создания файла, а без него — время изменения.
 
@@ -168,7 +171,9 @@ def file_created_at(file_stat: os.stat_result) -> datetime:
         timestamp = file_stat.st_ctime
     else:
         timestamp = file_stat.st_mtime
-    return datetime.fromtimestamp(timestamp, tz=UTC)
+    # Не datetime.fromtimestamp: на Windows она падает на времени до
+    # 1970 года, а архиваторы и robocopy оставляют и такое
+    return _EPOCH + timedelta(seconds=timestamp)
 
 
 def _collect_file_info(files_path: Path) -> list[FileInfo]:
@@ -308,14 +313,29 @@ def get_file(
 
     """
     files_directory = Path(get_settings().files_directory)
-    with _directory_errors():
-        base_dir = files_directory.resolve()
-    with _file_errors(file_id):
-        file_path = (files_directory / file_id).resolve()
 
-    # Безопасность: отдаём только файлы непосредственно из директории,
-    # как и в списке. Это отсекает и выход наружу через "..", и
-    # поддиректории (на Windows fileId с %5C указывает в поддиректорию)
+    # Безопасность: fileId должен быть просто именем, и проверяется это
+    # до любого обращения к ФС. Абсолютный путь (на Windows и
+    # UNC-путь \\host\share) заменил бы директорию при склейке, и
+    # resolve() пошёл бы на чужой хост, отдав ему NTLM-хеш учётной
+    # записи сервиса. Двоеточие на Windows — диск или альтернативный
+    # поток NTFS, в именах файлов его не бывает
+    candidate = files_directory / file_id
+    if (
+        candidate.parent != files_directory
+        or file_id in {".", ".."}
+        or (sys.platform == "win32" and ":" in file_id)
+    ):
+        msg = "Invalid filename"
+        raise HTTPException(status_code=400, detail=msg)
+
+    with _file_errors(file_id):
+        base_dir = files_directory.resolve()
+        file_path = candidate.resolve()
+
+    # Отдаём только файлы непосредственно из директории, как и в
+    # списке: символическая ссылка не должна уводить в поддиректорию
+    # или за пределы директории
     if file_path.parent != base_dir:
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg)

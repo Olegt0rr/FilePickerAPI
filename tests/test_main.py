@@ -6,7 +6,7 @@ import errno
 import importlib
 import sys
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -693,6 +693,50 @@ class TestExceptionHandling:
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid filename"
 
+    @pytest.mark.parametrize("file_id", ["/etc/passwd", "sub/x.txt"])
+    def test_security_rejects_non_name_before_fs_access(self, test_files_dir, file_id):
+        """Проверить отказ для пути вместо имени до обращения к ФС.
+
+        На Windows так же отсекается UNC-путь к чужому хосту: иначе
+        resolve() подключился бы к нему.
+        """
+        from fastapi import HTTPException
+
+        reload_app(files_directory=test_files_dir)
+        from app.handlers.files import get_file
+
+        error = AssertionError("resolve() must not be called")
+        with (
+            mock.patch("pathlib.Path.resolve", side_effect=error),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            get_file(file_id)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "Invalid filename"
+
+    def test_security_rejects_colon_on_windows(self, test_files_dir):
+        """Проверить, что на Windows имя с двоеточием отклоняется."""
+        from fastapi import HTTPException
+
+        reload_app(files_directory=test_files_dir)
+        from app.handlers import files
+
+        with (
+            mock.patch.object(files.sys, "platform", "win32"),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            files.get_file("test1.txt:stream")
+        assert exc_info.value.status_code == 400
+
+    def test_base_directory_error_does_not_leak_path(self, test_files_dir):
+        """Проверить, что ошибка resolve() базы не раскрывает путь."""
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        error = OSError(errno.EIO, "Network error", test_files_dir)
+        with fail_for("resolve", Path(test_files_dir).name, error):
+            response = client.get("/files/test1.txt")
+        assert response.status_code == 500
+        assert response.json()["detail"] == "OS error when reading file"
+
     def test_security_null_byte_in_file_id(self, client):
         """Проверить, что NUL-байт в fileId даёт 400, а не 500."""
         response = client.get("/files/a%00.txt")
@@ -751,16 +795,19 @@ class TestCreatedAt:
             ("linux", {"st_birthtime": 1.0}, 1.0),
             ("win32", {}, 2.0),
             ("linux", {}, 3.0),
+            # FILETIME 0 (1601 год): fromtimestamp на Windows тут падает
+            ("win32", {"st_ctime": -11644473600.0}, -11644473600.0),
         ],
     )
     def test_created_at_source(self, platform, fields, expected):
         """Проверить: birthtime, на Windows ctime, иначе mtime."""
         from app.handlers import files
 
-        file_stat = SimpleNamespace(st_ctime=2.0, st_mtime=3.0, **fields)
+        file_stat = SimpleNamespace(**{"st_ctime": 2.0, "st_mtime": 3.0, **fields})
         with mock.patch.object(files.sys, "platform", platform):
             created_at = files.file_created_at(file_stat)
-        assert created_at == datetime.fromtimestamp(expected, tz=UTC)
+        expected_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=expected)
+        assert created_at == expected_at
 
 
 class TestMainExecution:
