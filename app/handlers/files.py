@@ -1,8 +1,15 @@
 """Обработчики для работы с файлами."""
 
+import errno
+import functools
+import logging
 import os
-from datetime import UTC, datetime
+import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
@@ -12,6 +19,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from app.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -53,7 +62,10 @@ class FileInfo(CamelCaseModel):
     name: str = Field(description="Имя файла")
     size: int = Field(description="Размер файла в байтах")
     created_at: datetime = Field(
-        description="Дата и время создания файла в формате ISO 8601 (UTC)"
+        description=(
+            "Дата и время создания файла в формате ISO 8601 (UTC); там, где "
+            "ОС не отдаёт время создания (Linux), — время последнего изменения"
+        )
     )
 
 
@@ -62,6 +74,155 @@ class FileListResponse(CamelCaseModel):
 
     available_files: list[FileInfo]
     unavailable_files: list[FileInfo]
+
+
+# Ошибки, означающие недопустимое имя файла, а не сбой ФС: на Windows
+# ERROR_INVALID_NAME, ERROR_FILENAME_EXCED_RANGE и
+# ERROR_CANT_RESOLVE_FILENAME, на остальных ОС слишком длинное имя и
+# петля символических ссылок
+_INVALID_NAME_WINERRORS = frozenset({123, 206, 1921})
+_INVALID_NAME_ERRNOS = frozenset({errno.ENAMETOOLONG, errno.ELOOP})
+
+
+def _is_invalid_name_error(error: OSError) -> bool:
+    """Проверить, вызвана ли ошибка ОС недопустимым именем файла."""
+    winerror = getattr(error, "winerror", None)
+    if winerror is not None:
+        return winerror in _INVALID_NAME_WINERRORS
+    return error.errno in _INVALID_NAME_ERRNOS
+
+
+@contextmanager
+def _directory_errors(*, not_found: bool = False) -> Iterator[None]:
+    """Превратить ошибки ОС при работе с директорией в HTTP-ошибки.
+
+    Текст исходной ошибки попадает в detail.
+
+    Args:
+        not_found: Отвечать 404 «Files directory not found», если
+            директория не найдена; иначе это ошибка ввода-вывода
+
+    Raises:
+        HTTPException: 404, 403 при отказе в доступе или 500 при
+            прочих ошибках ввода-вывода
+
+    """
+    try:
+        yield
+    except OSError as e:
+        if not_found and isinstance(e, (FileNotFoundError, NotADirectoryError)):
+            msg = "Files directory not found"
+            raise HTTPException(status_code=404, detail=msg) from e
+        if isinstance(e, PermissionError):
+            msg = f"Permission denied when reading directory: {e!s}"
+            raise HTTPException(status_code=403, detail=msg) from e
+        msg = f"OS error when reading directory: {e!s}"
+        raise HTTPException(status_code=500, detail=msg) from e
+
+
+@contextmanager
+def _file_errors(file_id: str) -> Iterator[None]:
+    """Превратить ошибки при поиске запрошенного файла в HTTP-ошибки.
+
+    Текст исходной ошибки в detail не попадает: в нём полный путь к
+    сетевой папке. Он пишется в лог.
+
+    Args:
+        file_id: Запрошенный идентификатор файла
+
+    Raises:
+        HTTPException: 400 при недопустимом имени, 404 если файла нет,
+            403 при отказе в доступе, 500 при прочих ошибках
+
+    """
+    try:
+        yield
+    except (ValueError, RuntimeError) as e:
+        # ValueError — NUL-байт в имени, RuntimeError — петля
+        # символических ссылок в resolve() на Python 3.11
+        msg = "Invalid filename"
+        raise HTTPException(status_code=400, detail=msg) from e
+    except OSError as e:
+        if _is_invalid_name_error(e):
+            msg = "Invalid filename"
+            raise HTTPException(status_code=400, detail=msg) from e
+        if isinstance(e, (FileNotFoundError, NotADirectoryError)):
+            msg = "File not found"
+            raise HTTPException(status_code=404, detail=msg) from e
+        logger.warning("Ошибка при чтении файла %r: %s", file_id, e)
+        if isinstance(e, PermissionError):
+            msg = "Permission denied when reading file"
+            raise HTTPException(status_code=403, detail=msg) from e
+        msg = "OS error when reading file"
+        raise HTTPException(status_code=500, detail=msg) from e
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_DATETIME_MIN = datetime.min.replace(tzinfo=UTC)
+
+
+def file_created_at(file_stat: os.stat_result) -> datetime:
+    """Вернуть время создания файла, а без него — время изменения.
+
+    На Windows до Python 3.12 время создания лежит в st_ctime, с 3.12 —
+    в st_birthtime. На Linux время создания недоступно.
+    """
+    if hasattr(file_stat, "st_birthtime"):
+        timestamp = file_stat.st_birthtime
+    elif sys.platform == "win32":
+        timestamp = file_stat.st_ctime
+    else:
+        timestamp = file_stat.st_mtime
+    # Не datetime.fromtimestamp: на Windows она падает на времени до
+    # 1970 года, а архиваторы и robocopy оставляют и такое
+    try:
+        return _EPOCH + timedelta(seconds=timestamp)
+    except OverflowError:
+        # Метка вне 1–9999 годов: метаданные повреждены. Файл всё равно
+        # показываем, а не роняем из-за него весь список
+        return datetime.max.replace(tzinfo=UTC) if timestamp > 0 else _DATETIME_MIN
+
+
+def _stat_listed_item(
+    item: Path, base_dir: Callable[[], Path]
+) -> tuple[os.stat_result | None, bool]:
+    """Вернуть stat файла для списка или None, если его не показывать.
+
+    Args:
+        item: Элемент директории с расширением .txt
+        base_dir: Функция, возвращающая разрешённый путь директории
+
+    Returns:
+        Кортеж (stat или None, файл не найден)
+
+    Raises:
+        OSError: При прочих ошибках файловой системы
+
+    """
+    try:
+        file_stat = item.lstat()
+        if S_ISLNK(file_stat.st_mode):
+            # Ссылку показываем, только если её можно скачать: цель —
+            # .txt прямо в директории (см. get_file)
+            target = item.resolve()
+            if target.parent != base_dir() or target.suffix.lower() != ".txt":
+                return None, False
+            file_stat = item.stat()
+    except RuntimeError:
+        # Петля ссылок в resolve() на Python 3.11
+        return None, False
+    except OSError as e:
+        # Как и прежний is_file(), пропускаем битые ссылки, петли
+        # ссылок и файлы, удалённые после чтения списка
+        if isinstance(e, (FileNotFoundError, NotADirectoryError)):
+            return None, True
+        if _is_invalid_name_error(e):
+            return None, False
+        raise
+    # Директории не показываем
+    if not S_ISREG(file_stat.st_mode):
+        return None, False
+    return file_stat, False
 
 
 def _collect_file_info(files_path: Path) -> list[FileInfo]:
@@ -78,31 +239,38 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
 
     """
     file_list = []
+    # Разрешаем путь директории, только если встретилась ссылка
+    base_dir = functools.cache(files_path.resolve)
+    skipped_missing = False
     try:
-        for item in files_path.iterdir():
-            # Игнорируем директории, обрабатываем только файлы
-            if not item.is_file():
-                continue
-            # Игнорируем файлы, которые не являются .txt
-            if item.suffix.lower() != ".txt":
-                continue
-            stat = item.stat()
-            file_list.append(
-                FileInfo(
-                    id=item.name,
-                    name=item.name,
-                    size=stat.st_size,
-                    created_at=datetime.fromtimestamp(
-                        getattr(stat, "st_birthtime", stat.st_mtime), tz=UTC
-                    ),
+        # Директория могла исчезнуть после проверки в list_files
+        with _directory_errors(not_found=True):
+            items = list(files_path.iterdir())
+        with _directory_errors():
+            for item in items:
+                # Сначала расширение: оно не требует обращения к ФС
+                if item.suffix.lower() != ".txt":
+                    continue
+                file_stat, missing = _stat_listed_item(item, base_dir)
+                skipped_missing |= missing
+                if file_stat is None:
+                    continue
+                file_list.append(
+                    FileInfo(
+                        id=item.name,
+                        name=item.name,
+                        size=file_stat.st_size,
+                        created_at=file_created_at(file_stat),
+                    )
                 )
-            )
-    except PermissionError as e:
-        msg = f"Permission denied when reading directory: {e!s}"
-        raise HTTPException(status_code=403, detail=msg) from e
-    except OSError as e:
-        msg = f"OS error when reading directory: {e!s}"
-        raise HTTPException(status_code=500, detail=msg) from e
+        if skipped_missing:
+            # Пропавшие файлы могут означать, что пропала вся директория
+            # (например, отвалилась сетевая папка): тогда это 404, а не
+            # пустой список
+            with _directory_errors(not_found=True):
+                files_path.stat()
+    except HTTPException:
+        raise
     except Exception as e:
         msg = f"Unexpected error when reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
@@ -133,34 +301,37 @@ def _categorize_files(
     return available_files, unavailable_files
 
 
+# Обработчики синхронные: FastAPI выполняет их в пуле потоков, поэтому
+# медленный ответ сетевой папки не блокирует цикл событий
 @router.get("", response_model=FileListResponse)
-async def list_files() -> FileListResponse:
+def list_files() -> FileListResponse:
     """Получить список всех файлов в настроенной директории.
 
     Только файлы .txt возвращаются в ответе. Файлы
     разделяются на две категории:
     - availableFiles: файлы .txt размером меньше 10 МБ
-    - notAvailableFiles: файлы .txt размером 10 МБ и больше
+    - unavailableFiles: файлы .txt размером 10 МБ и больше
 
     Returns:
-        Объект с двумя списками файлов, отсортированными по дате
-        создания (новые первыми)
+        Объект с двумя списками файлов, отсортированными по createdAt
+        (новые первыми)
 
     """
     files_path = Path(get_settings().files_directory)
 
-    if not files_path.exists():
-        msg = "Files directory not found"
-        raise HTTPException(status_code=404, detail=msg)
+    # Один stat() вместо exists() + is_dir(): меньше обращений к
+    # сетевой папке и одинаковое поведение на всех версиях Python
+    with _directory_errors(not_found=True):
+        dir_stat = files_path.stat()
 
-    if not files_path.is_dir():
+    if not S_ISDIR(dir_stat.st_mode):
         msg = "Files path is not a directory"
         raise HTTPException(status_code=400, detail=msg)
 
     # Собрать информацию о всех .txt файлах
     file_list = _collect_file_info(files_path)
 
-    # Сортировка файлов по дате создания (новые первыми)
+    # Сортировка файлов по createdAt (новые первыми)
     file_list.sort(key=lambda x: x.created_at, reverse=True)
 
     # Разделение файлов на доступные и недоступные
@@ -173,7 +344,7 @@ async def list_files() -> FileListResponse:
 
 
 @router.get("/{fileId}")
-async def get_file(
+def get_file(
     file_id: Annotated[str, PathParam(alias="fileId")],
 ) -> FileResponse:
     """Скачать определенный файл из настроенной директории.
@@ -189,36 +360,55 @@ async def get_file(
             (не соответствует критериям availableFiles)
 
     """
-    # Безопасность: предотвращение обхода директорий
-    # Получаем абсолютные пути и проверяем, что файл находится
-    # в разрешенной директории
-    base_dir = Path(get_settings().files_directory).resolve()
-    requested_path = (Path(get_settings().files_directory) / file_id).resolve()
+    files_directory = Path(get_settings().files_directory)
 
-    # Проверяем, что разрешенный путь находится внутри
-    # базовой директории
-    try:
-        common_path = os.path.commonpath([base_dir, requested_path])
-        if common_path != str(base_dir):
-            msg = "Invalid filename"
-            raise HTTPException(status_code=400, detail=msg)
-    except ValueError as e:
+    # Безопасность: fileId должен быть просто именем, и проверяется это
+    # до любого обращения к ФС. Абсолютный путь (на Windows и
+    # UNC-путь \\host\share) заменил бы директорию при склейке, и
+    # resolve() пошёл бы на чужой хост, отдав ему NTLM-хеш учётной
+    # записи сервиса. На Windows в именах файлов не бывает двоеточия
+    # (диск или альтернативный поток NTFS) и точек или пробелов в
+    # конце: Win32 их отбрасывает, и ".. " превращается в ".."
+    candidate = files_directory / file_id
+    if (
+        # Склейка нормализует путь: на Windows ".\\x.txt", "x.txt\\" и
+        # полный путь к файлу в директории — тот же файл, но не имя
+        candidate.name != file_id
+        or "\x00" in file_id
+        or file_id in {".", ".."}
+        or (sys.platform == "win32" and (":" in file_id or file_id[-1] in ". "))
+    ):
         msg = "Invalid filename"
-        raise HTTPException(status_code=400, detail=msg) from e
+        raise HTTPException(status_code=400, detail=msg)
 
-    file_path = Path(requested_path)
+    # Сбой самой директории — ошибка сервера, а не клиента: 500, и без
+    # пути в detail
+    try:
+        base_dir = files_directory.resolve()
+    except (OSError, RuntimeError, ValueError) as e:
+        logger.warning("Не удалось разрешить путь к директории с файлами: %s", e)
+        msg = "OS error when reading file"
+        raise HTTPException(status_code=500, detail=msg) from e
 
-    if not file_path.exists():
-        msg = "File not found"
-        raise HTTPException(status_code=404, detail=msg)
+    with _file_errors(file_id):
+        file_path = candidate.resolve()
 
-    if not file_path.is_file():
+    # Отдаём только файлы непосредственно из директории, как и в
+    # списке: символическая ссылка не должна уводить в поддиректорию
+    # или за пределы директории
+    if file_path.parent != base_dir:
+        msg = "Invalid filename"
+        raise HTTPException(status_code=400, detail=msg)
+
+    with _file_errors(file_id):
+        file_stat = file_path.stat()
+
+    if not S_ISREG(file_stat.st_mode):
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
 
     # Проверяем, что файл доступен для загрузки
-    file_size = file_path.stat().st_size
-    if not check_file_availability(file_path, file_size):
+    if not check_file_availability(file_path, file_stat.st_size):
         msg = "File is not available for download"
         raise HTTPException(status_code=403, detail=msg)
 
@@ -226,4 +416,5 @@ async def get_file(
         path=file_path,
         filename=file_path.name,
         media_type="application/octet-stream",
+        stat_result=file_stat,
     )

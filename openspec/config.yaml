@@ -1,0 +1,76 @@
+schema: spec-driven
+
+context: |
+  Language: ru
+  All artifacts must be written in ru.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  ## Назначение
+  FilePickerAPI — HTTP-сервис, который отдаёт фронтенду список .txt-файлов
+  из одной заранее заданной директории (сетевой папки обмена платёжными
+  файлами) и позволяет скачать файл, пригодный для импорта (.txt меньше
+  10 МиБ). Запись, удаление и загрузка файлов на сервер не поддерживаются.
+
+  ## Неизменяемые требования
+  - Директория с файлами зашивается в исполняемый файл при сборке, и
+    пользователь на месте не может её подменить. Не предлагать и не
+    добавлять переопределение пути при запуске: переменные окружения,
+    .env, аргументы, конфиги рядом с exe, параметры bat-файлов. Поэтому
+    Settings.files_directory — ClassVar, а не поле настроек. Варианты
+    «один exe + путь в конфиге рядом» отклоняются, даже если ускоряют
+    сборку. Смена пути — только через исходники и новую сборку.
+
+  ## Технологический стек
+  - Python 3.11 (target-version py311), пакет `app` (`python -m app`)
+  - FastAPI + Uvicorn, Pydantic v2, pydantic-settings
+  - Зависимости закреплены точными версиями в pyproject.toml (кроме ruff,
+    указанного как >=) — единственном источнике конфигурации (зависимости,
+    pytest, ruff, setuptools-scm)
+  - Версия — только из git-тега через setuptools-scm (app/_version.py
+    генерируется при pip install и не хранится в git)
+  - Поставка: Windows-сборка Nuitka в режиме standalone (папка с exe,
+    не onefile), подписанная Authenticode в релизе; запуск из исходников
+    для разработки. Docker не поддерживается
+
+  ## Структура
+  - app/__init__.py — создание FastAPI-приложения, CORS, подключение роутеров
+  - app/__main__.py — точка входа: создаёт директорию файлов и запускает
+    Uvicorn на 0.0.0.0:8000
+  - app/settings.py — настройки (pydantic-settings, кэш через lru_cache)
+  - app/handlers/ — роутеры; бизнес-логика файлов в app/handlers/files.py
+  - tests/test_main.py — все тесты (pytest + fastapi.testclient)
+
+  ## Соглашения
+  - Комментарии, docstring-и, сообщения коммитов и документация — на русском;
+    тексты ошибок API (`detail`) — на английском
+  - JSON-ответы в camelCase (alias_generator=to_camel)
+  - ruff с select = ["ALL"]; длина строки 88, docstring/комментарии — 72;
+    исключения правил описываются в pyproject.toml с комментарием-причиной
+  - Покрытие тестами 100% — обязательное требование (pytest не проверяет
+    порог автоматически: сверяй TOTAL в отчёте --cov-report=term-missing)
+  - Ошибки возвращаются через HTTPException с осмысленным `detail`
+
+  ## Проверки перед коммитом
+  - ruff check app tests
+  - ruff format --check app tests
+  - pytest
+
+  ## CI/CD
+  - .github/workflows/build-exe.yml: ruff + pytest на Ubuntu, затем сборка
+    Nuitka на Windows и пробная подпись одноразовым сертификатом
+    (sign-smoke, .github/scripts/sign.ps1)
+  - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
+    подписывает в окружении code-signing и публикует
+    FilePickerAPI-Windows.zip
+
+rules:
+  proposal:
+    - Явно указывай, меняется ли контракт HTTP API (поля, коды ответов, тексты detail)
+    - Перечисляй, что остаётся вне рамок изменения
+    - Не предлагай способов задать директорию с файлами при запуске (см. «Неизменяемые требования»)
+  design:
+    - Учитывай работу на Windows с сетевыми (UNC) путями и разницу Python 3.11 (сборка, CI) и новее
+  tasks:
+    - Включай задачи на тесты, сохраняющие 100% покрытие
+    - Включай задачу на обновление README.md, если меняется API или конфигурация
+    - Последняя задача — прогон ruff check, ruff format --check и pytest
