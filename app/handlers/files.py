@@ -157,6 +157,7 @@ def _file_errors(file_id: str) -> Iterator[None]:
 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_DATETIME_MIN = datetime.min.replace(tzinfo=UTC)
 
 
 def file_created_at(file_stat: os.stat_result) -> datetime:
@@ -173,7 +174,12 @@ def file_created_at(file_stat: os.stat_result) -> datetime:
         timestamp = file_stat.st_mtime
     # Не datetime.fromtimestamp: на Windows она падает на времени до
     # 1970 года, а архиваторы и robocopy оставляют и такое
-    return _EPOCH + timedelta(seconds=timestamp)
+    try:
+        return _EPOCH + timedelta(seconds=timestamp)
+    except OverflowError:
+        # Метка вне 1–9999 годов: метаданные повреждены. Файл всё равно
+        # показываем, а не роняем из-за него весь список
+        return datetime.max.replace(tzinfo=UTC) if timestamp > 0 else _DATETIME_MIN
 
 
 def _collect_file_info(files_path: Path) -> list[FileInfo]:
@@ -318,19 +324,28 @@ def get_file(
     # до любого обращения к ФС. Абсолютный путь (на Windows и
     # UNC-путь \\host\share) заменил бы директорию при склейке, и
     # resolve() пошёл бы на чужой хост, отдав ему NTLM-хеш учётной
-    # записи сервиса. Двоеточие на Windows — диск или альтернативный
-    # поток NTFS, в именах файлов его не бывает
+    # записи сервиса. На Windows в именах файлов не бывает двоеточия
+    # (диск или альтернативный поток NTFS) и точек или пробелов в
+    # конце: Win32 их отбрасывает, и ".. " превращается в ".."
     candidate = files_directory / file_id
     if (
         candidate.parent != files_directory
         or file_id in {".", ".."}
-        or (sys.platform == "win32" and ":" in file_id)
+        or (sys.platform == "win32" and (":" in file_id or file_id[-1] in ". "))
     ):
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg)
 
-    with _file_errors(file_id):
+    # Сбой самой директории — ошибка сервера, а не клиента: 500, и без
+    # пути в detail
+    try:
         base_dir = files_directory.resolve()
+    except (OSError, RuntimeError, ValueError) as e:
+        logger.warning("Не удалось разрешить путь к директории с файлами: %s", e)
+        msg = "OS error when reading file"
+        raise HTTPException(status_code=500, detail=msg) from e
+
+    with _file_errors(file_id):
         file_path = candidate.resolve()
 
     # Отдаём только файлы непосредственно из директории, как и в

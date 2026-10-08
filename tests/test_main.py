@@ -714,24 +714,36 @@ class TestExceptionHandling:
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid filename"
 
-    def test_security_rejects_colon_on_windows(self, test_files_dir):
-        """Проверить, что на Windows имя с двоеточием отклоняется."""
+    @pytest.mark.parametrize(
+        "file_id", ["test1.txt:stream", "C:x.txt", ".. ", "...", "test1.txt."]
+    )
+    def test_security_rejects_windows_only_names(self, test_files_dir, file_id):
+        """Проверить отказ для имён, недопустимых на Windows."""
         from fastapi import HTTPException
 
         reload_app(files_directory=test_files_dir)
         from app.handlers import files
 
+        error = AssertionError("resolve() must not be called")
         with (
             mock.patch.object(files.sys, "platform", "win32"),
+            mock.patch("pathlib.Path.resolve", side_effect=error),
             pytest.raises(HTTPException) as exc_info,
         ):
-            files.get_file("test1.txt:stream")
+            files.get_file(file_id)
         assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "Invalid filename"
 
-    def test_base_directory_error_does_not_leak_path(self, test_files_dir):
-        """Проверить, что ошибка resolve() базы не раскрывает путь."""
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError(errno.EIO, "Network error", "/secret/share"),
+            RuntimeError("Symlink loop from '/secret/share'"),
+        ],
+    )
+    def test_base_directory_error_does_not_leak_path(self, test_files_dir, error):
+        """Проверить: сбой resolve() базы — 500 без пути в detail."""
         client = TestClient(reload_app(files_directory=test_files_dir))
-        error = OSError(errno.EIO, "Network error", test_files_dir)
         with fail_for("resolve", Path(test_files_dir).name, error):
             response = client.get("/files/test1.txt")
         assert response.status_code == 500
@@ -808,6 +820,21 @@ class TestCreatedAt:
             created_at = files.file_created_at(file_stat)
         expected_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=expected)
         assert created_at == expected_at
+
+    @pytest.mark.parametrize(
+        ("timestamp", "expected"),
+        [
+            (1e12, datetime.max.replace(tzinfo=UTC)),
+            (-1e12, datetime.min.replace(tzinfo=UTC)),
+        ],
+    )
+    def test_created_at_out_of_range(self, timestamp, expected):
+        """Проверить, что повреждённая метка не роняет список."""
+        from app.handlers import files
+
+        file_stat = SimpleNamespace(st_ctime=timestamp, st_mtime=timestamp)
+        with mock.patch.object(files.sys, "platform", "linux"):
+            assert files.file_created_at(file_stat) == expected
 
 
 class TestMainExecution:
