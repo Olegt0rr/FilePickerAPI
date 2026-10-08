@@ -217,7 +217,7 @@ pytest
 
 ```powershell
 pip install -e .[build]
-python -m nuitka --mode=standalone --assume-yes-for-downloads --remove-output `
+python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --remove-output `
   --output-dir=build --output-folder-name=FilePickerAPI `
   --output-filename=FilePickerAPI.exe `
   --include-package=app --include-package=uvicorn `
@@ -243,7 +243,7 @@ python -m nuitka --mode=standalone --assume-yes-for-downloads --remove-output `
 
 Без секретов в окружении релиз падает: неподписанный релиз не публикуется.
 
-Подпись сама по себе не мешает запустить изменённый файл: она только позволяет это обнаружить. Чтобы подменённый или пропатченный бинарник не запускался, на рабочих местах нужно включить WDAC или AppLocker с правилом «разрешить только файлы, подписанные нашим сертификатом» (через доменную GPO), а пользователи не должны быть локальными администраторами. В политике также нужно разрешить издателей Microsoft и Python Software Foundation: их подписи остаются на `vcruntime*.dll`, `python311.dll` и других сторонних файлах сборки.
+Подпись сама по себе не мешает запустить изменённый файл: она только позволяет это обнаружить. Чтобы подменённый или пропатченный бинарник не запускался, на рабочих местах нужно включить WDAC или AppLocker с правилом «разрешить только файлы, подписанные нашим сертификатом» (через доменную GPO), а пользователи не должны быть локальными администраторами. В политике также нужно разрешить издателей Microsoft и Python Software Foundation: их подписи остаются на `vcruntime*.dll`, `python311.dll` и других сторонних файлах сборки. Bat-файлы подписать нельзя, поэтому если в AppLocker включены правила для скриптов, разрешите `run_*.bat` правилом по пути к папке установки.
 
 ## GitHub Actions
 

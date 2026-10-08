@@ -76,9 +76,12 @@ jobs:
         # Проверяем, что каждый PE-файл подписан нами или уже имел
         # действительную подпись. Цепочку до корня не требуем: сертификат
         # может быть выпущен внутренним CA, которому раннер не доверяет.
+        # Но хэш обязан совпадать: HashMismatch означает изменённый файл.
         $bad = $binaries | Where-Object {
           $sig = Get-AuthenticodeSignature $_.FullName
-          $sig.Status -ne 'Valid' -and $sig.SignerCertificate.Thumbprint -ne $thumbprint
+          $sig.Status -ne 'Valid' -and (
+            $sig.SignerCertificate.Thumbprint -ne $thumbprint -or
+            $sig.Status -eq 'HashMismatch')
         }
         if ($bad) {
           $bad | ForEach-Object { Write-Output "::error::Not signed: $($_.FullName)" }
@@ -100,9 +103,6 @@ jobs:
       contents: write
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
     - name: Download artifact
       uses: actions/download-artifact@v4
       with:

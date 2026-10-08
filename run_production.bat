@@ -3,7 +3,8 @@ REM Batch file for running FilePickerAPI in production (daemon) mode
 REM This will run the application without a console window
 
 REM Work from the folder of this batch file, not from the caller's CWD
-cd /d "%~dp0"
+REM (pushd, unlike cd /d, also works when the folder is a UNC path)
+pushd "%~dp0"
 
 REM Check if the executable exists
 if not exist "FilePickerAPI.exe" (

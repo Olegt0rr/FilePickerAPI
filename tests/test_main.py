@@ -629,7 +629,7 @@ class TestFilesDirectoryIsFixed:
     def settings_module(self, monkeypatch, tmp_path):
         """Чистый модуль настроек, запущенный из временной папки."""
         monkeypatch.chdir(tmp_path)
-        module = importlib.reload(sys.modules["app.settings"])
+        module = importlib.reload(importlib.import_module("app.settings"))
         module.get_settings.cache_clear()
         yield module
         module.get_settings.cache_clear()

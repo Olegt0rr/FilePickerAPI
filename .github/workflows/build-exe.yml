@@ -69,13 +69,22 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~\AppData\Local\Nuitka\Nuitka\Cache
-        key: nuitka-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+        # Ключ уникален для коммита: actions/cache не перезаписывает
+        # существующий ключ, а restore-keys подхватит предыдущий кэш.
+        key: nuitka-${{ runner.os }}-${{ github.sha }}
         restore-keys: nuitka-${{ runner.os }}-
 
     - name: Build executable with Nuitka
       shell: pwsh
       run: |
         $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+        if ($LASTEXITCODE -or -not $version) { exit 1 }
+        # Релизная сборка должна нести версию из тега, иначе подписанный
+        # exe будет показывать устаревшую версию в свойствах файла.
+        if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+          Write-Output "::error::Tag $env:GITHUB_REF_NAME does not match pyproject version $version"
+          exit 1
+        }
         python -m nuitka `
           --mode=standalone `
           --msvc=latest `
