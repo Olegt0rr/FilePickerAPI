@@ -5,13 +5,24 @@ from typing import ClassVar
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+try:
+    # Файл генерируется в CI под конкретный филиал (см. branches.toml)
+    from app._build_config import FILES_DIRECTORY
+except ModuleNotFoundError as e:
+    if e.name != "app._build_config":
+        raise
+    # Запуск из исходного кода без configure: файлы из ./files
+    FILES_DIRECTORY = "./files"
+
 
 class Settings(BaseSettings):
     """Настройки приложения File Picker API."""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-    files_directory: ClassVar[str] = r"\\localmq.neadru.local\Payments\5100\CENTER\RSB"
+    # ClassVar, а не поле настроек: путь нельзя подменить через
+    # переменные окружения или .env (требование, см. CLAUDE.md)
+    files_directory: ClassVar[str] = FILES_DIRECTORY
     cors_origins: str = "*"
 
     @property
