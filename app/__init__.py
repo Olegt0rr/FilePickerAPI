@@ -3,13 +3,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app._version import __version__
 from app.handlers import files
 from app.settings import get_settings
 
 app = FastAPI(
     title="File Picker API",
     description="API for listing and downloading files from a configured directory",
-    version="1.0.0",
+    version=__version__,
 )
 
 # Включение CORS для фронтенд-приложений

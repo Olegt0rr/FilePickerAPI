@@ -276,12 +276,14 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 **Создание нового релиза:**
 
+Версия проекта хранится только в git-теге: `pyproject.toml`, `/docs` и свойства exe получают её автоматически через [setuptools-scm](https://setuptools-scm.readthedocs.io/). Поднимать версию в файлах не нужно — достаточно создать тег:
+
 ```bash
-# Обновите версию в pyproject.toml, если необходимо
-# Создайте и отправьте тег
-git tag v1.0.0
-git push origin v1.0.0
+git tag v2.3.0
+git push origin v2.3.0
 ```
+
+Сборки между релизами получают версию вида `2.3.1.dev4+g1a2b3c4` (следующий патч, число коммитов после тега и хэш коммита).
 
 После отправки тега workflow автоматически:
 1. Создаст GitHub Release с именем "Release v1.0.0"

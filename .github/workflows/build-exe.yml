@@ -16,6 +16,8 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # теги нужны setuptools-scm для версии
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -52,6 +54,8 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # теги нужны setuptools-scm для версии
     
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -77,14 +81,16 @@ jobs:
     - name: Build executable with Nuitka
       shell: pwsh
       run: |
-        $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+        # Версию вычисляет setuptools-scm из git-тега при pip install.
+        # Для свойств exe нужны только цифры: 2.3.1.dev4+g1a2b3c4 -> 2.3.1.
+        $fullVersion = python -c "from app._version import version; print(version)"
+        $version = python -c "from app._version import version_tuple as v; print('.'.join(str(p) for p in v[:3]))"
         if ($LASTEXITCODE -or -not $version) { exit 1 }
-        # Релизная сборка должна нести версию из тега, иначе подписанный
-        # exe будет показывать устаревшую версию в свойствах файла.
-        if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
-          Write-Output "::error::Tag $env:GITHUB_REF_NAME does not match pyproject version $version"
+        if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$fullVersion") {
+          Write-Output "::error::Tag $env:GITHUB_REF_NAME resolved to version $fullVersion"
           exit 1
         }
+        Write-Output "Building version $fullVersion (file version $version)"
         python -m nuitka `
           --mode=standalone `
           --msvc=latest `
