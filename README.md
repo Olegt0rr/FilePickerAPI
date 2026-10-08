@@ -150,6 +150,8 @@ set CORS_ORIGINS=http://localhost:3000,https://yourdomain.com
 FilePickerAPI.exe
 ```
 
+Передача учётных данных (куки, HTTP-аутентификация) разрешается только для явного списка источников. При `*` ответ содержит `Access-Control-Allow-Origin: *` без `Access-Control-Allow-Credentials`.
+
 ## Документация API (Swagger)
 
 После запуска сервера автоматически становится доступна интерактивная документация API:
