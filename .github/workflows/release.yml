@@ -33,7 +33,7 @@ jobs:
     - name: Download builds
       uses: actions/download-artifact@v8
       with:
-        pattern: FilePickerAPI-*
+        name: FilePickerAPI
         path: dist/
 
     # Подписываем каждый неподписанный PE-файл сборки (exe, dll, pyd): при

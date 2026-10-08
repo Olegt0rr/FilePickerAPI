@@ -14,7 +14,7 @@ jobs:
     permissions:
       contents: read
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
+      branches: ${{ steps.branches.outputs.branches }}
     
     steps:
     - uses: actions/checkout@v7
@@ -36,13 +36,13 @@ jobs:
         ruff check app tests scripts
         ruff format --check app tests scripts
     
-    # Список филиалов для матрицы сборки. Вывод сохраняем в переменную
-    # до echo: иначе ошибка в branches.toml потерялась бы в подстановке.
+    # Список филиалов для сборки. Вывод сохраняем в переменную до echo:
+    # иначе ошибка в branches.toml потерялась бы в подстановке.
     - name: Read branch list from branches.toml
-      id: matrix
+      id: branches
       run: |
-        matrix="$(python scripts/branches.py matrix)"
-        echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+        branches="$(python scripts/branches.py matrix)"
+        echo "branches=$branches" >> "$GITHUB_OUTPUT"
     
     - name: Run tests with coverage
       run: |
@@ -56,18 +56,16 @@ jobs:
         path: htmlcov/
         retention-days: 7
 
-  # Отдельная сборка под каждый филиал из branches.toml: код один и тот
-  # же, отличается только зашитая директория с файлами.
+  # Сборки всех филиалов из branches.toml в одном джобе: код один и
+  # тот же, отличается только зашитая директория с файлами. Python,
+  # зависимости и утилиты Nuitka ставятся один раз, а сборки после
+  # первой берут скомпилированные C-модули из кэша Nuitka и заново
+  # компилируют только app._build_config.
   build:
-    name: build (${{ matrix.name }})
     runs-on: windows-latest
     needs: test
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.test.outputs.matrix) }}
     
     steps:
     - uses: actions/checkout@v7
@@ -84,32 +82,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install -e .[build]
 
-    - name: Configure files directory for branch ${{ matrix.name }}
-      env:
-        BRANCH_NAME: ${{ matrix.name }}
-      run: |
-        python scripts/branches.py configure "$env:BRANCH_NAME"
-
-    - name: Verify files directory for branch ${{ matrix.name }}
-      shell: python
-      env:
-        EXPECTED_DIRECTORY: ${{ matrix.files_directory }}
-      run: |
-        import os
-        import runpy
-
-        # Читаем сгенерированный файл через runpy, а не импортом app:
-        # импорт выполнил бы app/__init__.py (FastAPI, настройки, .env).
-        actual = runpy.run_path("app/_build_config.py")["FILES_DIRECTORY"]
-        expected = os.environ["EXPECTED_DIRECTORY"]
-        print("files_directory =", actual)
-        assert actual == expected, f"expected {expected!r}, got {actual!r}"
-
     # Кэш Nuitka (скомпилированные C-модули, скачанные утилиты): без него
     # каждый push/PR заново компилирует всё дерево зависимостей.
     # Релизная сборка (по тегу) идёт на подпись, поэтому собирается с нуля,
     # без объектов из кэша других запусков; кэш тега к тому же никто
-    # не переиспользует.
+    # не переиспользует. Филиалы внутри одного запуска кэш делят и
+    # в релизе: его наполняет сборка первого филиала этого же джоба.
     - name: Cache Nuitka
       if: github.ref_type != 'tag'
       uses: actions/cache@v6
@@ -117,14 +95,13 @@ jobs:
         path: ~\AppData\Local\Nuitka\Nuitka\Cache
         # Ключ уникален для коммита: actions/cache не перезаписывает
         # существующий ключ, а restore-keys подхватит предыдущий кэш.
-        # Один ключ на все филиалы: сборки отличаются только
-        # app._build_config, поэтому сохраняет кэш первый завершившийся
-        # джоб, а не каждый филиал свою почти одинаковую копию.
         key: nuitka-${{ runner.os }}-${{ github.sha }}
         restore-keys: nuitka-${{ runner.os }}-
 
-    - name: Build executable with Nuitka
+    - name: Build executables for all branches
       shell: pwsh
+      env:
+        BRANCHES: ${{ needs.test.outputs.branches }}
       run: |
         # Версию вычисляет setuptools-scm из git-тега при pip install.
         # Для свойств exe нужны только ведущие числа (не больше трёх):
@@ -139,31 +116,54 @@ jobs:
           exit 1
         }
         Write-Output "Building version $fullVersion (file version $version)"
-        python -m nuitka `
-          --mode=standalone `
-          --msvc=latest `
-          --assume-yes-for-downloads `
-          --remove-output `
-          --output-dir=build `
-          --output-folder-name=FilePickerAPI `
-          --output-filename=FilePickerAPI.exe `
-          --include-package=app `
-          --include-module=app._build_config `
-          --include-package=uvicorn `
-          --product-name=FilePickerAPI `
-          --file-description="File Picker API" `
-          --file-version=$version `
-          --product-version=$version `
-          app/__main__.py
-        if ($LASTEXITCODE) { exit $LASTEXITCODE }
-        New-Item -ItemType Directory -Force dist | Out-Null
-        Move-Item build/FilePickerAPI.dist dist/FilePickerAPI
-        Copy-Item run_test.bat, run_production.bat dist/FilePickerAPI/
-    
+
+        # Список филиалов — из джоба test, где branches.toml прошёл проверку
+        foreach ($branch in ($env:BRANCHES | ConvertFrom-Json)) {
+          $name = $branch.name
+          Write-Output "::group::Branch $name"
+
+          python scripts/branches.py configure $name
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+          # Сверяем записанный путь с branches.toml. Файл читаем через
+          # runpy, а не импортом app: импорт выполнил бы app/__init__.py
+          # (FastAPI, настройки, .env).
+          $env:EXPECTED_DIRECTORY = $branch.files_directory
+          python -c "import os, runpy, sys; actual = runpy.run_path('app/_build_config.py')['FILES_DIRECTORY']; expected = os.environ['EXPECTED_DIRECTORY']; print('files_directory =', actual); sys.exit(0 if actual == expected else f'expected {expected!r}, got {actual!r}')"
+          if ($LASTEXITCODE) { exit 1 }
+
+          python -m nuitka `
+            --mode=standalone `
+            --msvc=latest `
+            --assume-yes-for-downloads `
+            --remove-output `
+            --output-dir=build `
+            --output-folder-name=FilePickerAPI `
+            --output-filename=FilePickerAPI.exe `
+            --include-package=app `
+            --include-module=app._build_config `
+            --include-package=uvicorn `
+            --product-name=FilePickerAPI `
+            --file-description="File Picker API" `
+            --file-version=$version `
+            --product-version=$version `
+            app/__main__.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+          $target = "dist/FilePickerAPI-$name"
+          New-Item -ItemType Directory -Force $target | Out-Null
+          Move-Item build/FilePickerAPI.dist "$target/FilePickerAPI"
+          Copy-Item run_test.bat, run_production.bat "$target/FilePickerAPI/"
+          Write-Output "::endgroup::"
+        }
+
+    # Один артефакт на все филиалы: загрузка артефакта — отдельный шаг,
+    # а шаги нельзя повторить по списку филиалов. Внутри по папке
+    # на филиал: FilePickerAPI-<филиал>/FilePickerAPI
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
-        name: FilePickerAPI-${{ matrix.name }}
+        name: FilePickerAPI
         path: dist/
         retention-days: 30
 
@@ -185,7 +185,7 @@ jobs:
     - name: Download builds
       uses: actions/download-artifact@v8
       with:
-        pattern: FilePickerAPI-*
+        name: FilePickerAPI
         path: dist/
 
     - name: Sign with a throwaway certificate

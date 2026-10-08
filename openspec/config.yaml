@@ -41,7 +41,7 @@ context: |
     не хранится в git), без него — ./files
   - branches.toml — филиалы и их директории; под каждый CI собирает
     отдельную сборку
-  - scripts/branches.py — проверка branches.toml, матрица для CI
+  - scripts/branches.py — проверка branches.toml, список филиалов для CI
     (matrix) и запись пути филиала перед сборкой (configure <филиал>)
   - app/handlers/ — роутеры; бизнес-логика файлов в app/handlers/files.py
   - tests/test_main.py — тесты API и настроек (pytest + fastapi.testclient)
@@ -65,9 +65,10 @@ context: |
 
   ## CI/CD
   - .github/workflows/build-exe.yml: ruff + pytest на Ubuntu, затем сборка
-    Nuitka на Windows под каждый филиал из branches.toml (артефакты
-    FilePickerAPI-<филиал>) и пробная подпись одноразовым сертификатом
-    (sign-smoke, .github/scripts/sign.ps1)
+    Nuitka на Windows под каждый филиал из branches.toml в одном джобе
+    (зависимости ставятся один раз; артефакт FilePickerAPI с папкой
+    FilePickerAPI-<филиал> на филиал) и пробная подпись одноразовым
+    сертификатом (sign-smoke, .github/scripts/sign.ps1)
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
     подписывает в окружении code-signing и публикует
     FilePickerAPI-<филиал>.zip для каждого филиала

@@ -10,7 +10,7 @@
 
 #### Scenario: Сборка в CI
 - **WHEN** в ветку `main`/`master` отправлен коммит или открыт pull request в одну из этих веток
-- **THEN** CI запускает ruff и pytest на Linux и, если они прошли, собирает папку `FilePickerAPI` на Windows для каждого филиала из `branches.toml` и публикует её как артефакт `FilePickerAPI-<филиал>` (например, `FilePickerAPI-5400`)
+- **THEN** CI запускает ruff и pytest на Linux и, если они прошли, в одном Windows-джобе собирает папку `FilePickerAPI` для каждого филиала из `branches.toml`, устанавливая Python и зависимости один раз, и публикует сборки одним артефактом `FilePickerAPI` с папкой `FilePickerAPI-<филиал>/FilePickerAPI` на каждый филиал (например, `FilePickerAPI-5400/FilePickerAPI`)
 
 #### Scenario: Тесты упали
 - **WHEN** линтер или тесты завершились с ошибкой
@@ -117,7 +117,7 @@
 
 #### Scenario: Добавление филиала
 - **WHEN** в `branches.toml` добавлен блок `[[branch]]` с `name = "5500"` и путём филиала, и коммит отправлен в `main`
-- **THEN** CI собирает дополнительный артефакт `FilePickerAPI-5500`, а следующий релиз содержит `FilePickerAPI-5500.zip`
+- **THEN** CI дополнительно собирает папку `FilePickerAPI-5500/FilePickerAPI` в артефакте `FilePickerAPI`, а следующий релиз содержит `FilePickerAPI-5500.zip`
 
 #### Scenario: Повтор кода филиала
 - **WHEN** в `branches.toml` два блока с одинаковым `name`
