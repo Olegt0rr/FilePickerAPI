@@ -488,8 +488,11 @@ class TestAPIDocumentation:
 class TestExceptionHandling:
     """Тесты для обработки исключений и ошибочных случаев."""
 
-    def test_list_files_permission_error(self, monkeypatch):
+    def test_list_files_permission_error(self):
         """Проверить вывод списка файлов, когда в доступе отказано."""
+        import errno
+        from unittest import mock
+
         with tempfile.TemporaryDirectory() as tmpdir:
             test_dir = Path(tmpdir) / "restricted"
             test_dir.mkdir()
@@ -503,20 +506,16 @@ class TestExceptionHandling:
 
             # Эмулируем отказ в доступе через iterdir, а не через chmod:
             # под root права на директорию не проверяются
-            original_iterdir = Path.iterdir
-
-            def iterdir_denied(self):
-                if self == test_dir:
-                    msg = f"[Errno 13] Permission denied: '{self}'"
-                    raise PermissionError(msg)
-                return original_iterdir(self)
-
-            monkeypatch.setattr(Path, "iterdir", iterdir_denied)
-
-            response = client.get("/files")
-            # Должны получить ошибку 403 из-за отказа в доступе
-            assert response.status_code == 403
-            assert "Permission denied" in response.json()["detail"]
+            with mock.patch(
+                "pathlib.Path.iterdir",
+                side_effect=PermissionError(
+                    errno.EACCES, "Permission denied", str(test_dir)
+                ),
+            ):
+                response = client.get("/files")
+                # Должны получить ошибку 403 из-за отказа в доступе
+                assert response.status_code == 403
+                assert "Permission denied" in response.json()["detail"]
 
     def test_list_files_oserror(self):
         """Проверить обработку OSError при чтении директории."""
