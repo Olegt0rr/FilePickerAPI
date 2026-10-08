@@ -327,6 +327,22 @@ class TestDownloadFileEndpoint:
 class TestSecurityDirectoryTraversal:
     """Тесты для безопасности обхода директорий."""
 
+    def test_symlink_into_subdirectory(self, test_files_dir):
+        """Проверить, что файл из поддиректории нельзя скачать.
+
+        На Windows так же разрешается fileId с обратным слэшем
+        (``subdir%5Cinner.txt``): путь остаётся внутри директории,
+        но указывает не на её непосредственный файл.
+        """
+        inner = Path(test_files_dir) / "subdir" / "inner.txt"
+        inner.write_text("inner")
+        (Path(test_files_dir) / "link.txt").symlink_to(inner)
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files/link.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
     def test_directory_traversal_with_dotdot(self, client):
         """Проверить, что обход директорий с .. предотвращен."""
         response = client.get("/files/../main.py")
@@ -549,6 +565,38 @@ class TestExceptionHandling:
                 assert response.status_code == 500
                 assert "Unexpected error" in response.json()["detail"]
 
+    @pytest.mark.parametrize(
+        ("error", "status_code", "prefix"),
+        [
+            (PermissionError("Access is denied"), 403, "Permission denied"),
+            (OSError("Network path not found"), 500, "OS error"),
+        ],
+    )
+    def test_list_files_directory_check_error(self, error, status_code, prefix):
+        """Проверить ошибку ОС при проверке самой директории."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = TestClient(reload_app(files_directory=tmpdir))
+            with mock.patch("pathlib.Path.exists", side_effect=error):
+                response = client.get("/files")
+            assert response.status_code == status_code
+            assert response.json()["detail"] == (
+                f"{prefix} when reading directory: {error}"
+            )
+
+    @pytest.mark.parametrize(
+        ("error", "status_code", "prefix"),
+        [
+            (PermissionError("Access is denied"), 403, "Permission denied"),
+            (OSError("Network path not found"), 500, "OS error"),
+        ],
+    )
+    def test_download_file_check_error(self, client, error, status_code, prefix):
+        """Проверить ошибку ОС при проверке скачиваемого файла."""
+        with mock.patch("pathlib.Path.exists", side_effect=error):
+            response = client.get("/files/test1.txt")
+        assert response.status_code == status_code
+        assert response.json()["detail"] == f"{prefix} when reading file: {error}"
+
     def test_security_value_error_with_mock(self):
         """Проверить, что ValueError в commonpath перехватывается."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -618,6 +666,16 @@ class TestMainExecution:
                 assert mock_run.called
                 # Проверяем, что директория была создана
                 assert files_dir.exists()
+
+    def test_unreachable_directory_does_not_stop_startup(self, caplog):
+        """Проверить, что недоступная директория не мешает запуску."""
+        reload_app(files_directory=r"\\unreachable\share")
+        from app.__main__ import ensure_files_directory
+
+        error = OSError("The network path was not found")
+        with mock.patch("pathlib.Path.mkdir", side_effect=error):
+            ensure_files_directory()
+        assert "The network path was not found" in caplog.text
 
 
 class TestFilesDirectoryIsFixed:

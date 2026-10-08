@@ -53,7 +53,10 @@ class FileInfo(CamelCaseModel):
     name: str = Field(description="Имя файла")
     size: int = Field(description="Размер файла в байтах")
     created_at: datetime = Field(
-        description="Дата и время создания файла в формате ISO 8601 (UTC)"
+        description=(
+            "Дата и время создания файла в формате ISO 8601 (UTC); если ОС "
+            "не отдаёт время создания, то время последнего изменения"
+        )
     )
 
 
@@ -133,8 +136,10 @@ def _categorize_files(
     return available_files, unavailable_files
 
 
+# Обработчики синхронные: FastAPI выполняет их в пуле потоков, поэтому
+# медленный ответ сетевой папки не блокирует цикл событий
 @router.get("", response_model=FileListResponse)
-async def list_files() -> FileListResponse:
+def list_files() -> FileListResponse:
     """Получить список всех файлов в настроенной директории.
 
     Только файлы .txt возвращаются в ответе. Файлы
@@ -143,24 +148,36 @@ async def list_files() -> FileListResponse:
     - unavailableFiles: файлы .txt размером 10 МБ и больше
 
     Returns:
-        Объект с двумя списками файлов, отсортированными по дате
+        Объект с двумя списками файлов, отсортированными по createdAt
         создания (новые первыми)
 
     """
     files_path = Path(get_settings().files_directory)
 
-    if not files_path.exists():
+    # На Python 3.11 exists() и is_dir() пробрасывают PermissionError
+    # и другие ошибки ОС, а не возвращают False
+    try:
+        exists = files_path.exists()
+        is_dir = exists and files_path.is_dir()
+    except PermissionError as e:
+        msg = f"Permission denied when reading directory: {e!s}"
+        raise HTTPException(status_code=403, detail=msg) from e
+    except OSError as e:
+        msg = f"OS error when reading directory: {e!s}"
+        raise HTTPException(status_code=500, detail=msg) from e
+
+    if not exists:
         msg = "Files directory not found"
         raise HTTPException(status_code=404, detail=msg)
 
-    if not files_path.is_dir():
+    if not is_dir:
         msg = "Files path is not a directory"
         raise HTTPException(status_code=400, detail=msg)
 
     # Собрать информацию о всех .txt файлах
     file_list = _collect_file_info(files_path)
 
-    # Сортировка файлов по дате создания (новые первыми)
+    # Сортировка файлов по createdAt (новые первыми)
     file_list.sort(key=lambda x: x.created_at, reverse=True)
 
     # Разделение файлов на доступные и недоступные
@@ -173,7 +190,7 @@ async def list_files() -> FileListResponse:
 
 
 @router.get("/{fileId}")
-async def get_file(
+def get_file(
     file_id: Annotated[str, PathParam(alias="fileId")],
 ) -> FileResponse:
     """Скачать определенный файл из настроенной директории.
@@ -206,18 +223,35 @@ async def get_file(
         msg = "Invalid filename"
         raise HTTPException(status_code=400, detail=msg) from e
 
+    # Отдаём только файлы непосредственно из директории, как и в
+    # списке. На Windows fileId с обратным слэшем (%5C) проходит
+    # маршрут и указывает в поддиректорию
+    if requested_path.parent != base_dir:
+        msg = "Invalid filename"
+        raise HTTPException(status_code=400, detail=msg)
+
     file_path = Path(requested_path)
 
-    if not file_path.exists():
+    try:
+        exists = file_path.exists()
+        is_file = exists and file_path.is_file()
+        file_size = file_path.stat().st_size if is_file else 0
+    except PermissionError as e:
+        msg = f"Permission denied when reading file: {e!s}"
+        raise HTTPException(status_code=403, detail=msg) from e
+    except OSError as e:
+        msg = f"OS error when reading file: {e!s}"
+        raise HTTPException(status_code=500, detail=msg) from e
+
+    if not exists:
         msg = "File not found"
         raise HTTPException(status_code=404, detail=msg)
 
-    if not file_path.is_file():
+    if not is_file:
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
 
     # Проверяем, что файл доступен для загрузки
-    file_size = file_path.stat().st_size
     if not check_file_availability(file_path, file_size):
         msg = "File is not available for download"
         raise HTTPException(status_code=403, detail=msg)
