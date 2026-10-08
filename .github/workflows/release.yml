@@ -11,6 +11,9 @@ permissions:
 jobs:
   build:
     uses: ./.github/workflows/build-exe.yml
+    with:
+      require-signing: true
+    secrets: inherit
   
   release:
     runs-on: ubuntu-latest
@@ -26,35 +29,36 @@ jobs:
         name: FilePickerAPI-Windows
         path: ./dist/
     
+    - name: Pack distribution
+      run: cd dist && zip -r FilePickerAPI-Windows.zip FilePickerAPI
+    
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          ./dist/FilePickerAPI.exe
-          ./run_test.bat
-          ./run_production.bat
+          ./dist/FilePickerAPI-Windows.zip
         body: |
           ## FilePickerAPI ${{ github.ref_name }}
           
           ### Установка
           
           #### Windows
-          Скачайте `FilePickerAPI.exe` и один из bat-файлов для запуска:
+          Скачайте `FilePickerAPI-Windows.zip` и распакуйте его в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`). Все `exe`/`dll`/`pyd` в архиве подписаны.
+
+          Для запуска используйте один из bat-файлов из архива:
           - **`run_test.bat`** - для тестирования (с консольным окном и выводом отладочной информации)
           - **`run_production.bat`** - для продакшн работы (без консольного окна, в фоновом режиме)
-          
-          Поместите все файлы в одну директорию и запустите нужный bat-файл.
-          
+
           #### Из исходного кода
           ```bash
           pip install -e .
           python -m app
           ```
-          
+
           ### Конфигурация
-          - `FILES_DIRECTORY` - директория с файлами (по умолчанию: `./files`)
+          - Директория с файлами зашита в сборку и не настраивается
           - `CORS_ORIGINS` - разрешенные CORS origins (по умолчанию: `*`)
-          
+
           Полная документация: https://github.com/Olegt0rr/FilePickerAPI#readme
         draft: false
         prerelease: false

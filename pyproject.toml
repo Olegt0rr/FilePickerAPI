@@ -25,6 +25,9 @@ dev = [
     "pytest-cov==7.0.0",
     "ruff>=0.14.9",
 ]
+build = [
+    "nuitka==4.2.2",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
