@@ -2,10 +2,12 @@
 Комплексные тесты для File Picker API.
 """
 
+import errno
 import importlib
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -490,37 +492,26 @@ class TestExceptionHandling:
 
     def test_list_files_permission_error(self):
         """Проверить вывод списка файлов, когда в доступе отказано."""
-        import errno
-        from unittest import mock
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            test_dir = Path(tmpdir) / "restricted"
-            test_dir.mkdir()
-
-            # Создаем файл в директории
-            test_file = test_dir / "test.txt"
-            test_file.write_text("content")
-
-            test_app = reload_app(files_directory=str(test_dir))
+            test_app = reload_app(files_directory=tmpdir)
             client = TestClient(test_app)
 
             # Эмулируем отказ в доступе через iterdir, а не через chmod:
             # под root права на директорию не проверяются
             with mock.patch(
                 "pathlib.Path.iterdir",
-                side_effect=PermissionError(
-                    errno.EACCES, "Permission denied", str(test_dir)
-                ),
+                side_effect=PermissionError(errno.EACCES, "Permission denied", tmpdir),
             ):
                 response = client.get("/files")
-                # Должны получить ошибку 403 из-за отказа в доступе
+                # Должны получить ошибку 403 из-за отказа в доступе,
+                # а текст исходного исключения должен попасть в detail
                 assert response.status_code == 403
-                assert "Permission denied" in response.json()["detail"]
+                detail = response.json()["detail"]
+                assert detail.startswith("Permission denied when reading")
+                assert tmpdir in detail
 
     def test_list_files_oserror(self):
         """Проверить обработку OSError при чтении директории."""
-        from unittest import mock
-
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
@@ -540,8 +531,6 @@ class TestExceptionHandling:
 
     def test_list_files_unexpected_error(self):
         """Проверить обработку неожиданных исключений."""
-        from unittest import mock
-
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
@@ -562,8 +551,6 @@ class TestExceptionHandling:
 
     def test_security_value_error_with_mock(self):
         """Проверить, что ValueError в commonpath перехватывается."""
-        from unittest import mock
-
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "test.txt"
             test_file.write_text("content")
@@ -583,8 +570,6 @@ class TestExceptionHandling:
 
     def test_security_common_path_not_equal_base_dir(self):
         """Проверить отклонение файлов вне базовой директории."""
-        from unittest import mock
-
         with tempfile.TemporaryDirectory() as tmpdir:
             # Создаем базовую директорию и файл
             test_file = Path(tmpdir) / "test.txt"
@@ -612,8 +597,6 @@ class TestMainExecution:
         """Проверить выполнение app/__main__.py с __name__,
         установленным в '__main__'.
         """
-        from unittest import mock
-
         with tempfile.TemporaryDirectory() as tmpdir:
             files_dir = Path(tmpdir) / "main_test_dir"
 
