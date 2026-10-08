@@ -1,0 +1,3 @@
+# bat-скрипты нужны с CRLF: cmd.exe с LF-окончаниями ошибается в goto
+# и метках, а релиз собирается на Linux
+*.bat text eol=crlf
