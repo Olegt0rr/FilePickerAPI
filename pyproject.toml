@@ -13,6 +13,10 @@ dependencies = [
     "uvicorn[standard]==0.54.0",
     "pydantic==2.14.0",
     "pydantic-settings==2.15.0",
+    # Транзитивная зависимость FastAPI (он допускает starlette>=0.46):
+    # точная версия не даёт оставить уязвимую Starlette < 1.0.1 и
+    # позволяет Dependabot видеть её advisory
+    "starlette==1.7.0",
 ]
 
 [tool.setuptools]

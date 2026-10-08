@@ -2,7 +2,7 @@
 
 ## 1. Зависимости
 
-- [x] 1.1 Обновить точные версии в `pyproject.toml` (FastAPI, Uvicorn, Pydantic, pydantic-settings, pytest, pytest-cov); проверить установкой `pip install -e .[dev]` на Python 3.11, что ставится Starlette 1.x
+- [x] 1.1 Обновить точные версии в `pyproject.toml` (FastAPI, Uvicorn, Pydantic, pydantic-settings, pytest, pytest-cov) и явно закрепить Starlette; проверить установкой `pip install -e .[dev]` на Python 3.11, что ставится Starlette 1.x
 - [x] 1.2 Добавить `.github/dependabot.yml` для pip и GitHub Actions; проверить, что файл разбирается как YAML
 
 ## 2. CORS

@@ -514,8 +514,29 @@ class TestCORSConfiguration:
         assert response.status_code == 200
 
     def test_cors_no_credentials_for_all_origins(self, client):
-        """Проверить, что при `*` учётные данные не разрешаются."""
-        response = client.get("/files", headers={"Origin": "http://example.com"})
+        """Проверить, что при `*` учётные данные не разрешаются даже
+        для запроса с куками: источник запроса не возвращается.
+        """
+        response = client.get(
+            "/files",
+            headers={"Origin": "http://example.com", "Cookie": "session=1"},
+        )
+        assert response.headers["access-control-allow-origin"] == "*"
+        assert "access-control-allow-credentials" not in response.headers
+
+    def test_cors_preflight_no_credentials_for_all_origins(self, client):
+        """Проверить, что preflight-ответ при `*` тоже не разрешает
+        учётные данные и не возвращает источник запроса.
+        """
+        response = client.options(
+            "/files",
+            headers={
+                "Origin": "http://example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == "*"
         assert "access-control-allow-credentials" not in response.headers
 
     def test_cors_credentials_for_custom_origins(self, monkeypatch, test_files_dir):
@@ -531,6 +552,10 @@ class TestCORSConfiguration:
             response.headers["access-control-allow-origin"] == "http://localhost:3000"
         )
         assert response.headers["access-control-allow-credentials"] == "true"
+
+        # Источник не из списка не получает разрешения
+        response = client.get("/files", headers={"Origin": "http://evil.example"})
+        assert "access-control-allow-origin" not in response.headers
 
     def test_cors_empty_string_falls_back_to_default(self, monkeypatch, test_files_dir):
         """Проверить, что пустая строка CORS_ORIGINS возвращается

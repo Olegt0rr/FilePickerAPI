@@ -8,7 +8,7 @@ Starlette 1.x при `allow_origins=["*"]` и `allow_credentials=True` боль�
 
 ## What Changes
 
-- Обновить зависимости в `pyproject.toml`: FastAPI 0.143.0 (Starlette 1.7.0), Uvicorn 0.54.0, Pydantic 2.14.0, pydantic-settings 2.15.0, pytest 9.1.1, pytest-cov 7.1.0. httpx 0.28.1 и Nuitka 4.2.2 уже последние.
+- Обновить зависимости в `pyproject.toml`: FastAPI 0.143.0 (Starlette 1.7.0), Uvicorn 0.54.0, Pydantic 2.14.0, pydantic-settings 2.15.0, pytest 9.1.1, pytest-cov 7.1.0. Starlette закрепить явно (`starlette==1.7.0`): FastAPI допускает `starlette>=0.46`, и без своей записи уязвимая версия могла бы остаться в уже созданном окружении, а Dependabot не видел бы её advisory. httpx 0.28.1 и Nuitka 4.2.2 уже последние.
 - Разрешать передачу учётных данных в CORS только для явного списка источников в `CORS_ORIGINS`. Когда разрешены все источники (`*`), ответ по-прежнему содержит `Access-Control-Allow-Origin: *` без `Access-Control-Allow-Credentials`.
 - Добавить `.github/dependabot.yml`: еженедельные обновления pip и GitHub Actions, minor и patch для Python собираются в один PR.
 
