@@ -513,6 +513,25 @@ class TestCORSConfiguration:
         response = client.get("/files", headers={"Origin": "http://localhost:3000"})
         assert response.status_code == 200
 
+    def test_cors_no_credentials_for_all_origins(self, client):
+        """Проверить, что при `*` учётные данные не разрешаются."""
+        response = client.get("/files", headers={"Origin": "http://example.com"})
+        assert "access-control-allow-credentials" not in response.headers
+
+    def test_cors_credentials_for_custom_origins(self, monkeypatch, test_files_dir):
+        """Проверить, что для явного списка источников разрешаются
+        учётные данные, а в ответе возвращается источник запроса.
+        """
+        monkeypatch.setenv("CORS_ORIGINS", "http://localhost:3000,https://example.com")
+        test_app = reload_app(files_directory=test_files_dir)
+        client = TestClient(test_app)
+
+        response = client.get("/files", headers={"Origin": "http://localhost:3000"})
+        assert (
+            response.headers["access-control-allow-origin"] == "http://localhost:3000"
+        )
+        assert response.headers["access-control-allow-credentials"] == "true"
+
     def test_cors_empty_string_falls_back_to_default(self, monkeypatch, test_files_dir):
         """Проверить, что пустая строка CORS_ORIGINS возвращается
         к значению по умолчанию.

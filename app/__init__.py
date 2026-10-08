@@ -18,11 +18,14 @@ app = FastAPI(
     version=__version__,
 )
 
-# Включение CORS для фронтенд-приложений
+# Включение CORS для фронтенд-приложений. Учётные данные разрешаются
+# только для явного списка источников: при `*` Starlette иначе
+# возвращает Origin запроса и пускает запросы с куками с любого сайта.
+cors_origins = get_settings().cors_origins_list
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=get_settings().cors_origins_list,
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials="*" not in cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

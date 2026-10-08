@@ -9,10 +9,10 @@ description = "FastAPI приложение для просмотра списк
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi==0.124.2",
-    "uvicorn[standard]==0.38.0",
-    "pydantic==2.12.5",
-    "pydantic-settings==2.7.1",
+    "fastapi==0.143.0",
+    "uvicorn[standard]==0.54.0",
+    "pydantic==2.14.0",
+    "pydantic-settings==2.15.0",
 ]
 
 [tool.setuptools]
@@ -26,9 +26,9 @@ fallback_version = "0.0.0"
 
 [project.optional-dependencies]
 dev = [
-    "pytest==9.0.3",
+    "pytest==9.1.1",
     "httpx==0.28.1",
-    "pytest-cov==7.0.0",
+    "pytest-cov==7.1.0",
     "ruff>=0.14.9",
 ]
 build = [

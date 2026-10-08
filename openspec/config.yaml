@@ -62,6 +62,7 @@ context: |
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
     подписывает в окружении code-signing и публикует
     FilePickerAPI-Windows.zip
+  - .github/dependabot.yml: еженедельные обновления pip и GitHub Actions
 
 rules:
   proposal:

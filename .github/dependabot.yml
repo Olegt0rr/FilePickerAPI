@@ -1,0 +1,35 @@
+# Обновления зависимостей. Уязвимости Dependabot закрывает отдельными
+# PR сразу, а плановые обновления собираются раз в неделю в один PR
+# на экосистему, чтобы не плодить PR на каждую библиотеку.
+version: 2
+updates:
+  # Зависимости Python из pyproject.toml (точные версии)
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      python:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Действия в .github/workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
