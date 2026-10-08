@@ -23,8 +23,9 @@ context: |
   ## Технологический стек
   - Python 3.11 (target-version py311), пакет `app` (`python -m app`)
   - FastAPI + Uvicorn, Pydantic v2, pydantic-settings
-  - Зависимости закреплены точными версиями в pyproject.toml — единственном
-    источнике конфигурации (зависимости, pytest, ruff)
+  - Зависимости закреплены точными версиями в pyproject.toml (кроме ruff,
+    указанного как >=) — единственном источнике конфигурации (зависимости,
+    pytest, ruff)
   - Поставка: Windows .exe через PyInstaller (основной сценарий),
     Docker-образ, запуск из исходников
 
@@ -42,7 +43,8 @@ context: |
   - JSON-ответы в camelCase (alias_generator=to_camel)
   - ruff с select = ["ALL"]; длина строки 88, docstring/комментарии — 72;
     исключения правил описываются в pyproject.toml с комментарием-причиной
-  - Покрытие тестами 100% — обязательное требование
+  - Покрытие тестами 100% — обязательное требование (pytest не проверяет
+    порог автоматически: сверяй TOTAL в отчёте --cov-report=term-missing)
   - Ошибки возвращаются через HTTPException с осмысленным `detail`
 
   ## Проверки перед коммитом

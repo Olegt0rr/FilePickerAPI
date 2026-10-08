@@ -140,7 +140,7 @@ async def list_files() -> FileListResponse:
     Только файлы .txt возвращаются в ответе. Файлы
     разделяются на две категории:
     - availableFiles: файлы .txt размером меньше 10 МБ
-    - notAvailableFiles: файлы .txt размером 10 МБ и больше
+    - unavailableFiles: файлы .txt размером 10 МБ и больше
 
     Returns:
         Объект с двумя списками файлов, отсортированными по дате
