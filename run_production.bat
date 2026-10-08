@@ -54,6 +54,17 @@ if not errorlevel 1 (
     goto fail
 )
 
+REM A FilePickerAPI.exe that does not answer yet (still starting, or left
+REM running by an earlier failed start) could take the port later, and the
+REM check below would then get its answer instead of the new one's
+"%SYS32%\tasklist.exe" /FI "IMAGENAME eq FilePickerAPI.exe" /NH | "%SYS32%\find.exe" /I "FilePickerAPI.exe" >nul
+if not errorlevel 1 (
+    echo Error: FilePickerAPI.exe is already running but does not answer on port 8000.
+    echo Stop it in Task Manager or wait until it answers, then run this script again.
+    set "FAIL_REASON=FilePickerAPI.exe is already running but does not answer, stop it or wait"
+    goto fail
+)
+
 REM Start the application minimized in background. Use the original path
 REM of this folder (not the drive letter pushd may have mapped for a UNC
 REM path), so the popd at the end cannot pull the drive from under the app.
