@@ -34,5 +34,6 @@
 - `run_production.bat` — проверка запуска, новый формат строк в журнале, код выхода.
 - `.gitattributes` — bat-файлы в рабочей копии (и значит в сборке) с CRLF: с LF `cmd.exe` ошибается в `goto` и метках.
 - `README.md` — раздел о проверке запуска в `run_production.bat`.
+- `.github/workflows/release.yml` — описание `run_production.bat` в тексте релиза.
 - `openspec/specs/distribution/spec.md` — после архивации изменения.
 - Новая зависимость скрипта — системный `curl.exe` (`%SystemRoot%\System32\curl.exe`, есть в Windows 10 1803+ и Windows Server 2019+, подписан Microsoft, поэтому не мешает WDAC/AppLocker). Python-код и зависимости приложения не меняются.
