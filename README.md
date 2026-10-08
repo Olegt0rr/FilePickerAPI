@@ -232,7 +232,7 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 ### Release (`.github/workflows/release.yml`)
 
 Автоматически создаёт релизы с собранными артефактами:
-- Срабатывает при создании тега версии (формат: `v*.*.*`)
+- Срабатывает при создании тега версии (формат: `vX.Y.Z` из цифр, например `v2.3.0`)
 - Создаёт GitHub Release с описанием
 - Собирает Windows-версию и подписывает её в окружении `code-signing` (без сертификата релиз падает)
 - Прикрепляет `FilePickerAPI-Windows.zip` к релизу

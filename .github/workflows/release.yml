@@ -60,7 +60,18 @@ jobs:
           Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 
         $binaries = Get-ChildItem dist/FilePickerAPI -Recurse -File -Include *.exe, *.dll, *.pyd
-        $unsigned = $binaries | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
+        $status = @{}
+        $binaries | ForEach-Object { $status[$_.FullName] = (Get-AuthenticodeSignature $_.FullName).Status }
+
+        # Файл с чужой подписью и HashMismatch изменён после подписи: свою
+        # подпись поверх не ставим, иначе подмена станет незаметной.
+        $tampered = $binaries | Where-Object { $status[$_.FullName] -eq 'HashMismatch' }
+        if ($tampered) {
+          $tampered | ForEach-Object { Write-Output "::error::Signature hash mismatch: $($_.FullName)" }
+          exit 1
+        }
+
+        $unsigned = $binaries | Where-Object { $status[$_.FullName] -ne 'Valid' }
 
         if ($unsigned) {
           $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'

@@ -629,8 +629,8 @@ class TestFilesDirectoryIsFixed:
     def settings_module(self, monkeypatch, tmp_path):
         """Чистый модуль настроек, запущенный из временной папки."""
         monkeypatch.chdir(tmp_path)
+        # reload создаёт новый get_settings с пустым lru_cache
         module = importlib.reload(importlib.import_module("app.settings"))
-        module.get_settings.cache_clear()
         yield module
         # Перезагружаем и обработчики с приложением: иначе они остаются
         # привязаны к get_settings из модуля до перезагрузки. Сначала
