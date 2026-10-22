@@ -87,8 +87,8 @@ class FailingEntry:
         raise self._error
 
 
-def fail_entry_stat_for(name, error):
-    """Вернуть патч os.scandir: DirEntry.stat() падает для файла name.
+def wrap_entry_for(name, wrap):
+    """Вернуть патч os.scandir: элемент name обёрнут функцией wrap.
 
     Методы DirEntry нельзя подменить напрямую, поэтому подменяем сами
     элементы перечисления.
@@ -98,9 +98,40 @@ def fail_entry_stat_for(name, error):
     @contextmanager
     def fake(path):
         with original(path) as it:
-            yield [FailingEntry(e, error) if e.name == name else e for e in it]
+            yield [wrap(e) if e.name == name else e for e in it]
 
     return mock.patch("os.scandir", side_effect=fake)
+
+
+def fail_entry_stat_for(name, error):
+    """Вернуть патч os.scandir: DirEntry.stat() падает для name."""
+    return wrap_entry_for(name, lambda entry: FailingEntry(entry, error))
+
+
+class TimedEntry:
+    """Обёртка DirEntry, у которой stat() отдаёт заданное время."""
+
+    def __init__(self, entry, timestamp):
+        self._entry = entry
+        self._timestamp = timestamp
+
+    def __getattr__(self, name):
+        return getattr(self._entry, name)
+
+    def stat(self, **_kwargs):
+        real = self._entry.stat()
+        return SimpleNamespace(
+            st_mode=real.st_mode,
+            st_size=real.st_size,
+            st_birthtime=self._timestamp,
+            st_ctime=self._timestamp,
+            st_mtime=self._timestamp,
+        )
+
+
+def entry_time_for(name, timestamp):
+    """Вернуть патч os.scandir: у файла name время равно timestamp."""
+    return wrap_entry_for(name, lambda entry: TimedEntry(entry, timestamp))
 
 
 def symlink_or_skip(link, target):
@@ -653,6 +684,22 @@ class TestAPIDocumentation:
         assert response.status_code == 200
         assert "swagger" in response.text.lower() or "html" in response.text.lower()
 
+    def test_openapi_version_without_installed_package(
+        self, test_files_dir, monkeypatch
+    ):
+        """Проверить версию 0.0.0, если app/_version.py нет."""
+        # None в sys.modules: import app._version даёт ImportError.
+        # Не patch.dict: при восстановлении он очищает sys.modules и
+        # теряет модули, импортированные внутри блока
+        with monkeypatch.context() as m:
+            m.setitem(sys.modules, "app._version", None)
+            client = TestClient(reload_app(files_directory=test_files_dir))
+            response = client.get("/openapi.json")
+        # Вернуть app настоящую версию для следующих тестов
+        reload_app()
+        assert response.status_code == 200
+        assert response.json()["info"]["version"] == "0.0.0"
+
 
 class TestExceptionHandling:
     """Тесты для обработки исключений и ошибочных случаев."""
@@ -1009,6 +1056,24 @@ class TestCreatedAt:
         file_stat = SimpleNamespace(st_ctime=timestamp, st_mtime=timestamp)
         with mock.patch.object(files.sys, "platform", "linux"):
             assert files.file_created_at(file_stat) == expected
+
+    @pytest.mark.parametrize(
+        ("timestamp", "expected"),
+        [
+            # FILETIME 0: такое оставляют архиваторы и robocopy
+            (-11644473600.0, "1601-01-01T00:00:00Z"),
+            (1e12, "9999-12-31T23:59:59.999999Z"),
+            (-1e12, "0001-01-01T00:00:00Z"),
+        ],
+    )
+    def test_list_files_edge_created_at(self, client, timestamp, expected):
+        """Проверить: краевая метка времени не роняет список."""
+        with entry_time_for("test1.txt", timestamp):
+            response = client.get("/files")
+        assert response.status_code == 200
+        items = {f["name"]: f for f in response.json()["availableFiles"]}
+        assert items["test1.txt"]["createdAt"] == expected
+        assert "test2.txt" in items
 
 
 class TestListingScandir:

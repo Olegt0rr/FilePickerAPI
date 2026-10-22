@@ -141,12 +141,18 @@ class TestBranchesCli:
 
         assert json.loads(capsys.readouterr().out) == branches.load_branches()
 
-    def test_configure_writes_build_config(self, branches, tmp_path, monkeypatch):
+    def test_configure_writes_build_config(
+        self, branches, tmp_path, monkeypatch, capsys
+    ):
         target = tmp_path / "_build_config.py"
         monkeypatch.setattr(branches, "BUILD_CONFIG_FILE", target)
         expected = branches.load_branches()[0]
 
         branches.main(["configure", expected["name"]])
+
+        assert capsys.readouterr().out == (
+            f"{expected['name']}: {expected['files_directory']}\n"
+        )
 
         namespace = {}
         exec(target.read_text(encoding="utf-8"), namespace)
@@ -158,10 +164,14 @@ class TestBranchesCli:
         with pytest.raises(KeyError, match="не найден"):
             branches.main(["configure", "no-such-branch"])
 
-    def test_usage_on_bad_arguments(self, branches):
+    @pytest.mark.parametrize("argv", [[], ["unknown"], ["configure"]])
+    def test_usage_on_bad_arguments(self, branches, capsys, argv):
         with pytest.raises(SystemExit) as exc_info:
-            branches.main([])
+            branches.main(argv)
         assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "Использование:" in captured.err
 
 
 class TestSettingsFilesDirectory:
