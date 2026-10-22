@@ -79,9 +79,12 @@ jobs:
       with:
         python-version: '3.11'
     
+    # setuptools и wheel обновляем так же, как в audit.yml: иначе в
+    # сборке остался бы setuptools из Python 3.11, а аудит проверял бы
+    # уже обновлённый.
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
+        python -m pip install --upgrade pip setuptools wheel
         pip install -e .[build]
 
     - name: Configure files directory for branch ${{ matrix.name }}
