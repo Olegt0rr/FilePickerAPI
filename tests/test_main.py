@@ -2264,7 +2264,10 @@ class TestMainExecution:
             with mock.patch("uvicorn.run") as mock_run:
                 # Выполняем файл app/__main__.py напрямую
                 main_file = Path(__file__).parent.parent / "app" / "__main__.py"
-                with open(main_file) as f:
+                # Кодировка явно: на Windows по умолчанию берётся
+                # кодовая страница системы (cp1252 в CI), а в файле
+                # кириллица
+                with open(main_file, encoding="utf-8") as f:
                     code = compile(f.read(), str(main_file), "exec")
 
                 # Создаем пространство имен с __name__
