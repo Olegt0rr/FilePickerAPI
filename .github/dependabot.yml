@@ -34,3 +34,17 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # openspec для проверки спецификаций в docs.yml (package-lock.json)
+  - package-ecosystem: "npm"
+    directory: "/.github/openspec"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      openspec:
+        patterns:
+          - "*"

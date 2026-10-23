@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Изменения только в документации проверяются без сборки
-Если в push или pull request в `main`/`master` изменены только файлы документации (`*.md` в любой папке, `openspec/`, `.claude/`), Build and Test и Dependency Audit MUST NOT запускаться, а CI SHALL проверять только спецификации и изменения OpenSpec (`openspec validate --all --strict`) на Linux без зависимостей проекта. Ручной запуск, ежедневная проверка зависимостей и релиз по тегу SHALL выполняться всегда.
+Если в push или pull request в `main`/`master` изменены только файлы документации (`*.md` в любой папке, `openspec/`, `.claude/`, `.github/openspec/`), Build and Test и Dependency Audit MUST NOT запускаться, а CI SHALL проверять только спецификации и изменения OpenSpec (`openspec validate --all --strict`) на Linux без зависимостей проекта. Ручной запуск, ежедневная проверка зависимостей и релиз по тегу SHALL выполняться всегда.
 
 #### Scenario: Изменена только документация
 - **WHEN** открыт pull request в `main`, который меняет только `README.md` и `openspec/specs/distribution/spec.md`

@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Команды scripts/branches.py
-`scripts/branches.py` SHALL проверять `branches.toml` (см. «Список филиалов») перед любой командой и предоставлять CI две команды:
+`scripts/branches.py` SHALL предоставлять CI две команды, каждая из которых сначала проверяет `branches.toml` (см. «Список филиалов»):
 - `matrix` — выводит в stdout одной строкой JSON-массив объектов `{"name": ..., "files_directory": ...}` в порядке блоков `[[branch]]`;
 - `configure <филиал>` — записывает `app/_build_config.py` с константами `BRANCH_NAME` и `FILES_DIRECTORY` этого филиала и выводит строку `<филиал>: <путь>`.
 

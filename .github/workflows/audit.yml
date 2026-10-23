@@ -6,8 +6,9 @@ name: Dependency Audit
 # сборка с известной уязвимостью не подписывается и не публикуется.
 # Изменения только в документации набор пакетов не меняют, поэтому
 # такие коммиты и PR проверку не запускают (список как в build-exe.yml
-# и docs.yml),
-# а новые CVE всё равно ловит ежедневный запуск.
+# и docs.yml, сверяет tests/test_workflows.py), а новые CVE всё равно
+# ловит ежедневный запуск. npm-пакеты в .github/openspec в exe не
+# попадают и pip-audit их не проверяет.
 on:
   push:
     branches: [ main, master ]
@@ -15,6 +16,7 @@ on:
       - '**.md'
       - 'openspec/**'
       - '.claude/**'
+      - '.github/openspec/**'
   pull_request:
     branches: [ main, master ]
     paths-ignore: *docs-only

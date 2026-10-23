@@ -5,6 +5,7 @@
 [![Code Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](https://github.com/Olegt0rr/FilePickerAPI)
 [![Build and Test](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/build-exe.yml/badge.svg)](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/build-exe.yml)
 [![Dependency Audit](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/audit.yml/badge.svg)](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/audit.yml)
+[![Docs](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/docs.yml/badge.svg)](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/docs.yml)
 
 Веб-сервер на базе FastAPI для просмотра списка и загрузки файлов из настроенной директории.
 
@@ -323,7 +324,7 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 - Pull request в ветку main/master (кроме изменений только в документации)
 - Ручной запуск workflow
 
-Если в push или PR изменена только документация (`*.md`, `openspec/`, `.claude/`), workflow не запускается: код и сборка от неё не меняются. Если вместе с ней изменён любой другой файл, workflow запускается целиком. Так же устроен Dependency Audit, а вместо них запускается лёгкая проверка Docs.
+Если в push или PR изменена только документация (`*.md`, `openspec/`, `.claude/`, `.github/openspec/`), workflow не запускается: код и сборка от неё не меняются. Если вместе с ней изменён любой другой файл, workflow запускается целиком. Так же устроен Dependency Audit, а вместо них запускается лёгкая проверка Docs.
 
 Артефакты:
 - Сборка для Windows: хранится 30 дней
@@ -346,10 +347,10 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 ### Docs (`.github/workflows/docs.yml`)
 
-Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет спецификации и незаархивированные изменения OpenSpec командой `openspec validate --all --strict`. Версия openspec закреплена в workflow и обновляется вручную.
+Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет спецификации и незаархивированные изменения OpenSpec командой `openspec validate --all --strict`. Версии Node и openspec закреплены: openspec со всеми зависимостями — в `.github/openspec/package-lock.json`, его обновляет Dependabot. Списки путей в трёх workflow сверяет тест `tests/test_workflows.py`.
 
 Триггеры workflow:
-- Push и pull request в ветку main/master, если изменены `*.md`, `openspec/`, `.claude/` или сам `docs.yml`
+- Push и pull request в ветку main/master, если изменены `*.md`, `openspec/`, `.claude/`, `.github/openspec/` или сам `docs.yml`
 - Ручной запуск workflow
 
 ### Release (`.github/workflows/release.yml`)

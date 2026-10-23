@@ -1,13 +1,13 @@
 name: Docs
 
 # Лёгкая проверка документации вместо полного CI: build-exe.yml и
-# audit.yml при изменении только *.md, openspec/ и .claude/ не
-# запускаются (paths-ignore), а здесь проверяются спецификации и
-# изменения OpenSpec. Работает на Ubuntu с предустановленным Node, без
-# зависимостей проекта и Nuitka. Список путей держать одинаковым с
-# paths-ignore в build-exe.yml и audit.yml. Сам docs.yml в списке,
-# чтобы изменение workflow (например, версии openspec) проверялось
-# в своём PR; в paths-ignore других workflow его нет.
+# audit.yml при изменении только *.md, openspec/, .claude/ и
+# .github/openspec/ не запускаются (paths-ignore), а здесь проверяются
+# спецификации и изменения OpenSpec. Работает на Ubuntu, без
+# зависимостей проекта и Nuitka. Список путей тот же, что в
+# paths-ignore build-exe.yml и audit.yml (сверяет
+# tests/test_workflows.py), плюс сам docs.yml: изменение workflow
+# проверяется в своём PR.
 on:
   push:
     branches: [ main, master ]
@@ -15,6 +15,7 @@ on:
       - '**.md'
       - 'openspec/**'
       - '.claude/**'
+      - '.github/openspec/**'
       - '.github/workflows/docs.yml'
   pull_request:
     branches: [ main, master ]
@@ -33,11 +34,23 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
-    # Версия закреплена: Dependabot её не обновляет (в репозитории нет
-    # package.json), поднимать вручную вместе с локальной openspec.
-    # Проверяются и основные спецификации, и незаархивированные
-    # изменения из openspec/changes.
+    # Node закреплён, а не берётся из образа раннера: обновление образа
+    # не должно ломать проверку
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+        cache: npm
+        cache-dependency-path: .github/openspec/package-lock.json
+
+    # openspec и все его зависимости закреплены в package-lock.json,
+    # версии обновляет Dependabot (ecosystem npm). Скрипты пакетов при
+    # установке не выполняются: для проверки они не нужны.
+    - name: Install openspec
+      working-directory: .github/openspec
+      run: npm ci --ignore-scripts --no-audit --no-fund
+
     - name: Validate OpenSpec specs and changes
       env:
         OPENSPEC_TELEMETRY: '0'
-      run: npx --yes @fission-ai/openspec@1.14.1 validate --all --strict
+      run: .github/openspec/node_modules/.bin/openspec validate --all --strict

@@ -172,7 +172,7 @@ CI SHALL проверять через pip-audit по базе PyPI Advisory в�
 - **THEN** сборки не подписываются, релиз не публикуется
 
 ### Requirement: Изменения только в документации проверяются без сборки
-Если в push или pull request в `main`/`master` изменены только файлы документации (`*.md` в любой папке, `openspec/`, `.claude/`), Build and Test и Dependency Audit MUST NOT запускаться, а CI SHALL проверять только спецификации и изменения OpenSpec (`openspec validate --all --strict`) на Linux без зависимостей проекта. Ручной запуск, ежедневная проверка зависимостей и релиз по тегу SHALL выполняться всегда.
+Если в push или pull request в `main`/`master` изменены только файлы документации (`*.md` в любой папке, `openspec/`, `.claude/`, `.github/openspec/`), Build and Test и Dependency Audit MUST NOT запускаться, а CI SHALL проверять только спецификации и изменения OpenSpec (`openspec validate --all --strict`) на Linux без зависимостей проекта. Ручной запуск, ежедневная проверка зависимостей и релиз по тегу SHALL выполняться всегда.
 
 #### Scenario: Изменена только документация
 - **WHEN** открыт pull request в `main`, который меняет только `README.md` и `openspec/specs/distribution/spec.md`
@@ -195,7 +195,7 @@ CI SHALL проверять через pip-audit по базе PyPI Advisory в�
 - **THEN** release.yml по тегу собирает, проверяет и публикует релиз как обычно
 
 ### Requirement: Команды scripts/branches.py
-`scripts/branches.py` SHALL проверять `branches.toml` (см. «Список филиалов») перед любой командой и предоставлять CI две команды:
+`scripts/branches.py` SHALL предоставлять CI две команды, каждая из которых сначала проверяет `branches.toml` (см. «Список филиалов»):
 - `matrix` — выводит в stdout одной строкой JSON-массив объектов `{"name": ..., "files_directory": ...}` в порядке блоков `[[branch]]`;
 - `configure <филиал>` — записывает `app/_build_config.py` с константами `BRANCH_NAME` и `FILES_DIRECTORY` этого филиала и выводит строку `<филиал>: <путь>`.
 

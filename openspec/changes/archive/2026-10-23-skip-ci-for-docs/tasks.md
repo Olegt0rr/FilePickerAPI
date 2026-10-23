@@ -2,9 +2,11 @@
 
 ## 1. CI
 
-- [x] 1.1 Добавить `paths-ignore` (`**.md`, `openspec/**`, `.claude/**`) к `push` и `pull_request` в `build-exe.yml`
+- [x] 1.1 Добавить `paths-ignore` (`**.md`, `openspec/**`, `.claude/**`, `.github/openspec/**`) к `push` и `pull_request` в `build-exe.yml`
 - [x] 1.2 Добавить тот же список в `audit.yml`; расписание, ручной запуск и `workflow_call` не трогать
-- [x] 1.3 Добавить `docs.yml`: те же пути и сам `docs.yml` в `paths`, `npx @fission-ai/openspec@1.14.1 validate --all --strict` на Ubuntu
+- [x] 1.3 Добавить `docs.yml`: те же пути и сам `docs.yml` в `paths`, Node 24 через `setup-node`, `npm ci` в `.github/openspec` и `openspec validate --all --strict` на Ubuntu
+- [x] 1.3.1 Закрепить openspec в `.github/openspec/package-lock.json`, добавить npm в Dependabot, `node_modules/` в `.gitignore`
+- [x] 1.3.2 Тест `tests/test_workflows.py`: списки путей в трёх workflow совпадают, workflow сборки и аудита в них нет
 - [x] 1.4 Заархивировать `document-uncovered-behavior`, чтобы `validate --all --strict` проходил на `main`
 - [x] 1.5 Убедиться, что в ruleset `main` нет обязательных проверок статуса, иначе PR только с документацией не слить
 
