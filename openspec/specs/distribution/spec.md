@@ -201,6 +201,14 @@ npm-пакеты, которыми CI проверяет спецификаци�
 - **WHEN** в зависимости openspec из `package-lock.json` опубликована уязвимость
 - **THEN** ближайший плановый запуск джоба npm-audit падает, а проверка спецификаций в PR с документацией продолжает работать
 
+#### Scenario: PR обновляет пакеты openspec
+- **WHEN** pull request (например, от Dependabot) меняет `.github/openspec/package-lock.json`
+- **THEN** в этом PR, кроме проверки спецификаций, выполняется npm-audit, и уязвимая версия пакета роняет его до слияния
+
+#### Scenario: PR без изменений пакетов openspec
+- **WHEN** pull request меняет только `README.md`
+- **THEN** npm-audit в этом PR не выполняется и отображается как пропущенный, а не как пройденный
+
 ### Requirement: Команды scripts/branches.py
 `scripts/branches.py` SHALL предоставлять CI две команды, каждая из которых сначала проверяет `branches.toml` (см. «Список филиалов»):
 - `matrix` — выводит в stdout одной строкой JSON-массив объектов `{"name": ..., "files_directory": ...}` в порядке блоков `[[branch]]`;

@@ -39,9 +39,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      openspec-changed: ${{ steps.changes.outputs.openspec-changed }}
 
     steps:
     - uses: actions/checkout@v7
+
+    # Для джоба npm-audit: менялся ли .github/openspec в этом push/PR.
+    # Хватает одного базового коммита (без всей истории); если его не
+    # удалось получить или сравнить, считаем, что менялся.
+    - name: Check openspec changes
+      id: changes
+      env:
+        BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        if git fetch --quiet --depth=1 origin "$BASE" &&
+           git diff --quiet "$BASE" HEAD -- .github/openspec; then
+          echo "openspec-changed=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "openspec-changed=true" >> "$GITHUB_OUTPUT"
+        fi
 
     # Node закреплён, а не берётся из образа раннера: обновление образа
     # не должно ломать проверку
@@ -74,7 +91,18 @@ jobs:
   # Dependabot alerts по тому же package-lock.json видны только
   # администраторам репозитория и ничего не роняют, а этот джоб виден
   # всем в Actions, поэтому он остаётся и при включённых alerts.
+  #
+  # Решение принимается до старта джоба: в push/PR без изменений
+  # .github/openspec он не занимает раннер и в PR виден как skipped, а
+  # не как пройденный аудит. По расписанию джоб openspec пропущен, а
+  # !cancelled() не даёт пропустить из-за этого и npm-audit; падение
+  # проверки спецификаций аудит тоже не отменяет.
   npm-audit:
+    needs: openspec
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      needs.openspec.outputs.openspec-changed == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -82,29 +110,14 @@ jobs:
     steps:
     - uses: actions/checkout@v7
       with:
-        fetch-depth: 0  # для сравнения с базой push/PR
-
-    # В push и PR аудит нужен, только если менялся .github/openspec;
-    # по расписанию и вручную шаг пропускается, и аудит идёт всегда.
-    # Если базу сравнить не удалось, аудит тоже выполняется.
-    - name: Check openspec changes
-      id: changes
-      if: github.event_name == 'push' || github.event_name == 'pull_request'
-      env:
-        BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-      run: |
-        if git diff --quiet "$BASE" HEAD -- .github/openspec; then
-          echo "changed=false" >> "$GITHUB_OUTPUT"
-        fi
+        sparse-checkout: .github/openspec
 
     - name: Set up Node
-      if: steps.changes.outputs.changed != 'false'
       uses: actions/setup-node@v7
       with:
         node-version: '24'
 
     # npm audit читает только package-lock.json, ставить пакеты не нужно
     - name: Audit openspec packages
-      if: steps.changes.outputs.changed != 'false'
       working-directory: .github/openspec
       run: npm audit --audit-level=low
