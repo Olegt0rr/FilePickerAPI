@@ -172,7 +172,7 @@ CI SHALL проверять через pip-audit по базе PyPI Advisory в�
 - **THEN** сборки не подписываются, релиз не публикуется
 
 ### Requirement: Изменения только в документации проверяются без сборки
-Если в push или pull request в `main`/`master` изменены только файлы документации (`*.md` в любой папке, `openspec/`, `.claude/`), Build and Test и Dependency Audit MUST NOT запускаться, а CI SHALL проверять только основные спецификации OpenSpec (`openspec validate --specs --strict`) на Linux без зависимостей проекта. Ручной запуск, ежедневная проверка зависимостей и релиз по тегу SHALL выполняться всегда.
+Если в push или pull request в `main`/`master` изменены только файлы документации (`*.md` в любой папке, `openspec/`, `.claude/`), Build and Test и Dependency Audit MUST NOT запускаться, а CI SHALL проверять только спецификации и изменения OpenSpec (`openspec validate --all --strict`) на Linux без зависимостей проекта. Ручной запуск, ежедневная проверка зависимостей и релиз по тегу SHALL выполняться всегда.
 
 #### Scenario: Изменена только документация
 - **WHEN** открыт pull request в `main`, который меняет только `README.md` и `openspec/specs/distribution/spec.md`
@@ -193,3 +193,27 @@ CI SHALL проверять через pip-audit по базе PyPI Advisory в�
 #### Scenario: Релиз после изменения документации
 - **WHEN** последний коммит перед тегом `v2.3.0` менял только документацию
 - **THEN** release.yml по тегу собирает, проверяет и публикует релиз как обычно
+
+### Requirement: Команды scripts/branches.py
+`scripts/branches.py` SHALL проверять `branches.toml` (см. «Список филиалов») перед любой командой и предоставлять CI две команды:
+- `matrix` — выводит в stdout одной строкой JSON-массив объектов `{"name": ..., "files_directory": ...}` в порядке блоков `[[branch]]`;
+- `configure <филиал>` — записывает `app/_build_config.py` с константами `BRANCH_NAME` и `FILES_DIRECTORY` этого филиала и выводит строку `<филиал>: <путь>`.
+
+#### Scenario: Матрица для CI
+- **WHEN** CI выполняет `python scripts/branches.py matrix`
+- **THEN** в stdout выводится JSON-массив, по элементу на каждый филиал из `branches.toml`, и по нему строится матрица сборок
+
+#### Scenario: Запись пути филиала
+- **WHEN** CI выполняет `python scripts/branches.py configure 5400`
+- **THEN** в `app/_build_config.py` записываются `BRANCH_NAME = '5400'` и `FILES_DIRECTORY` с путём филиала 5400 из `branches.toml`
+
+### Requirement: Ошибки в аргументах scripts/branches.py
+Для филиала, которого нет в `branches.toml`, команда `configure` MUST завершаться с ошибкой и ненулевым кодом. При неверных аргументах `scripts/branches.py` SHALL выводить справку в stderr и завершаться с кодом 2.
+
+#### Scenario: Неизвестный филиал
+- **WHEN** выполняется `python scripts/branches.py configure no-such-branch`
+- **THEN** скрипт завершается ошибкой с сообщением, что филиал не найден в `branches.toml`, и сборка этого филиала не выполняется
+
+#### Scenario: Неверные аргументы
+- **WHEN** скрипт запущен без аргументов или с неизвестной командой
+- **THEN** скрипт выводит справку по использованию в stderr и завершается с кодом 2
