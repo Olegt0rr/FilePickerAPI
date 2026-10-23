@@ -9,7 +9,7 @@ from app.settings import get_settings
 try:
     # Файл генерирует setuptools-scm при pip install (в git его нет)
     from app._version import __version__
-except ImportError:  # pragma: no cover - запуск без установки пакета
+except ImportError:  # Запуск без установки пакета
     __version__ = "0.0.0"
 
 app = FastAPI(
