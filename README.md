@@ -321,11 +321,7 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 - Pull request в ветку main/master (кроме изменений только в документации)
 - Ручной запуск workflow
 
-Если в push или PR изменена только документация (`*.md`, `openspec/`, `.claude/`), workflow не запускается: код и сборка от неё не меняются. Если вместе с ней изменён любой другой файл, workflow запускается целиком. Так же устроен Dependency Audit.
-
-### Docs (`.github/workflows/docs.yml`)
-
-Лёгкая проверка для изменений документации (`*.md`, `openspec/`, `.claude/`): на Ubuntu, без зависимостей проекта и сборки, проверяет основные спецификации командой `openspec validate --specs --strict`. Версия openspec закреплена в workflow и обновляется вручную.
+Если в push или PR изменена только документация (`*.md`, `openspec/`, `.claude/`), workflow не запускается: код и сборка от неё не меняются. Если вместе с ней изменён любой другой файл, workflow запускается целиком. Так же устроен Dependency Audit, а вместо них запускается лёгкая проверка Docs.
 
 Артефакты:
 - Сборка для Windows: хранится 30 дней
@@ -345,6 +341,14 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 - Ручной запуск workflow
 
 Если проверка упала, обновите уязвимый пакет в `pyproject.toml` (транзитивную зависимость закрепите явно, как `starlette`). Пропускать уязвимость через `--ignore-vuln` можно только с комментарием-причиной в workflow.
+
+### Docs (`.github/workflows/docs.yml`)
+
+Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет основные спецификации командой `openspec validate --specs --strict`. Версия openspec закреплена в workflow и обновляется вручную.
+
+Триггеры workflow:
+- Push и pull request в ветку main/master, если изменены `*.md`, `openspec/`, `.claude/` или сам `docs.yml`
+- Ручной запуск workflow
 
 ### Release (`.github/workflows/release.yml`)
 

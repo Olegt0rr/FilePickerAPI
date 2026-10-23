@@ -5,7 +5,9 @@ name: Docs
 # запускаются (paths-ignore), а здесь проверяются спецификации
 # OpenSpec. Работает на Ubuntu с предустановленным Node, без
 # зависимостей проекта и Nuitka. Список путей держать одинаковым с
-# paths-ignore в build-exe.yml и audit.yml.
+# paths-ignore в build-exe.yml и audit.yml. Сам docs.yml в списке,
+# чтобы изменение workflow (например, версии openspec) проверялось
+# в своём PR; в paths-ignore других workflow его нет.
 on:
   push:
     branches: [ main, master ]
@@ -13,6 +15,7 @@ on:
       - '**.md'
       - 'openspec/**'
       - '.claude/**'
+      - '.github/workflows/docs.yml'
   pull_request:
     branches: [ main, master ]
     paths: *docs
