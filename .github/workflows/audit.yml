@@ -4,11 +4,19 @@ name: Dependency Audit
 # Advisory). Новые CVE публикуются без коммитов в репозиторий, поэтому
 # проверка идёт и по расписанию. Перед релизом её вызывает release.yml:
 # сборка с известной уязвимостью не подписывается и не публикуется.
+# Изменения только в документации набор пакетов не меняют, поэтому
+# такие коммиты и PR проверку не запускают (список как в build-exe.yml),
+# а новые CVE всё равно ловит ежедневный запуск.
 on:
   push:
     branches: [ main, master ]
+    paths-ignore: &docs-only
+      - '**.md'
+      - 'openspec/**'
+      - '.claude/**'
   pull_request:
     branches: [ main, master ]
+    paths-ignore: *docs-only
   schedule:
     - cron: '0 4 * * *'  # ежедневно, 07:00 МСК
   workflow_dispatch:

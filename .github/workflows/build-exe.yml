@@ -1,10 +1,20 @@
 name: Build and Test
 
+# Коммиты и PR, где изменена только документация (*.md, OpenSpec,
+# инструкции агентов в .claude), тесты и сборку не запускают: код и
+# exe от них не меняются. Если вместе с ними изменён любой другой
+# файл, workflow запускается целиком. Список держать одинаковым с
+# audit.yml.
 on:
   push:
     branches: [ main, master ]
+    paths-ignore: &docs-only
+      - '**.md'
+      - 'openspec/**'
+      - '.claude/**'
   pull_request:
     branches: [ main, master ]
+    paths-ignore: *docs-only
   workflow_dispatch:
   workflow_call:
 

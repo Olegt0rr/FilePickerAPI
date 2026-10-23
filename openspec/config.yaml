@@ -99,6 +99,9 @@ context: |
   - .github/workflows/audit.yml: pip-audit всех установленных зависимостей
     на Windows (push, PR, ежедневно; вызывается из release.yml перед
     подписью)
+  - build-exe.yml и audit.yml не запускаются по push и PR, если
+    изменена только документация (paths-ignore: **.md, openspec/**,
+    .claude/**); списки в двух файлах держать одинаковыми
   - .github/dependabot.yml: еженедельные обновления pip и GitHub Actions
 
 rules:

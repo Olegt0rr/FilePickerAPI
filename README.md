@@ -317,9 +317,11 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 - Проверяет скрипт подписи (`.github/scripts/sign.ps1`) на этих сборках с одноразовым самоподписанным сертификатом — боевой сертификат здесь не используется
 
 Триггеры workflow:
-- Push в ветку main/master
-- Pull request в ветку main/master
+- Push в ветку main/master (кроме изменений только в документации)
+- Pull request в ветку main/master (кроме изменений только в документации)
 - Ручной запуск workflow
+
+Если в push или PR изменена только документация (`*.md`, `openspec/`, `.claude/`), workflow не запускается: код и сборка от неё не меняются. Если вместе с ней изменён любой другой файл, workflow запускается целиком. Так же устроен Dependency Audit.
 
 Артефакты:
 - Сборка для Windows: хранится 30 дней
@@ -333,8 +335,8 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 - Вызывается из Release: релиз с известной уязвимостью не подписывается и не публикуется
 
 Триггеры workflow:
-- Push в ветку main/master
-- Pull request в ветку main/master
+- Push в ветку main/master (кроме изменений только в документации)
+- Pull request в ветку main/master (кроме изменений только в документации)
 - Ежедневно по расписанию (новые CVE выходят без коммитов в репозиторий)
 - Ручной запуск workflow
 
