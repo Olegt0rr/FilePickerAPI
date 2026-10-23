@@ -263,8 +263,10 @@ pytest
 ```bash
 npm install -g @fission-ai/openspec
 openspec list --specs
-openspec validate --specs --strict
+openspec validate --all --strict
 ```
+
+Ту же проверку (`--all`: спецификации и незаархивированные изменения) выполняет CI в workflow Docs.
 
 ### Локальная сборка исполняемого файла
 
@@ -344,7 +346,7 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 ### Docs (`.github/workflows/docs.yml`)
 
-Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет основные спецификации командой `openspec validate --specs --strict`. Версия openspec закреплена в workflow и обновляется вручную.
+Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет спецификации и незаархивированные изменения OpenSpec командой `openspec validate --all --strict`. Версия openspec закреплена в workflow и обновляется вручную.
 
 Триггеры workflow:
 - Push и pull request в ветку main/master, если изменены `*.md`, `openspec/`, `.claude/` или сам `docs.yml`
