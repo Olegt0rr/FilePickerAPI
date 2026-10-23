@@ -13,13 +13,18 @@ jobs:
   build:
     uses: ./.github/workflows/build-exe.yml
 
+  # Проверка зависимостей на известные уязвимости: CVE могла выйти
+  # после последнего прогона на main, а релиз с ней не подписываем.
+  audit:
+    uses: ./.github/workflows/audit.yml
+
   # Подпись вынесена в отдельный джоб с окружением code-signing: секреты
   # сертификата лежат только в этом окружении, а его правила развёртывания
   # пускают лишь теги v*. Сборки из PR и веток (даже с изменённым
   # воркфлоу) до сертификата не дотягиваются.
   sign:
     runs-on: windows-latest
-    needs: build
+    needs: [build, audit]
     environment: code-signing
     permissions:
       contents: read

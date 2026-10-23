@@ -1,0 +1,57 @@
+name: Dependency Audit
+
+# Проверка зависимостей на известные уязвимости (pip-audit, база PyPI
+# Advisory). Новые CVE публикуются без коммитов в репозиторий, поэтому
+# проверка идёт и по расписанию. Перед релизом её вызывает release.yml:
+# сборка с известной уязвимостью не подписывается и не публикуется.
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 4 * * *'  # ежедневно, 07:00 МСК
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    # Windows, как у сборки: набор пакетов зависит от платформы
+    # (uvicorn[standard] ставит uvloop только не на Windows), а
+    # проверять нужно то, что попадает в exe.
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+
+    # Ставим все extras: в exe попадают основные зависимости, а dev и
+    # build выполняются в CI и на машинах разработчиков. setuptools и
+    # wheel обновляем вместе с pip: Python 3.11 приходит со старым
+    # setuptools с известными CVE, а они тоже проверяются ниже.
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools wheel
+        pip install -e .[dev,build,audit]
+
+    # Проверяем точный список установленных пакетов без самого проекта:
+    # его нет на PyPI, а --strict считает ошибкой любой пропущенный
+    # пакет, в том числе editable. --all: без него freeze пропускает
+    # pip, setuptools и wheel. --strict нужен, чтобы пакет, который
+    # не удалось проверить, не проходил молча. Исключения
+    # (--ignore-vuln) добавлять только с комментарием-причиной.
+    - name: Audit installed packages
+      run: |
+        $requirements = Join-Path $env:RUNNER_TEMP audit-requirements.txt
+        pip freeze --all --exclude-editable > $requirements
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        pip-audit --requirement $requirements --no-deps --disable-pip --strict --aliases --desc

@@ -69,8 +69,12 @@ context: |
     FilePickerAPI-<филиал>) и пробная подпись одноразовым сертификатом
     (sign-smoke, .github/scripts/sign.ps1)
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
-    подписывает в окружении code-signing и публикует
-    FilePickerAPI-<филиал>.zip для каждого филиала
+    проверяет зависимости (audit.yml), подписывает в окружении
+    code-signing и публикует FilePickerAPI-<филиал>.zip для каждого
+    филиала
+  - .github/workflows/audit.yml: pip-audit всех установленных зависимостей
+    на Windows (push, PR, ежедневно; вызывается из release.yml перед
+    подписью)
   - .github/dependabot.yml: еженедельные обновления pip и GitHub Actions
 
 rules:

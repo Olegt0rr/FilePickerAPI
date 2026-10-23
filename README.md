@@ -4,6 +4,7 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Code Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](https://github.com/Olegt0rr/FilePickerAPI)
 [![Build and Test](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/build-exe.yml/badge.svg)](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/build-exe.yml)
+[![Dependency Audit](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/audit.yml/badge.svg)](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/audit.yml)
 
 Веб-сервер на базе FastAPI для просмотра списка и загрузки файлов из настроенной директории.
 
@@ -279,11 +280,26 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 - Сборка для Windows: хранится 30 дней
 - Отчет о покрытии: хранится 7 дней
 
+### Dependency Audit (`.github/workflows/audit.yml`)
+
+Проверяет зависимости на известные уязвимости через [pip-audit](https://github.com/pypa/pip-audit):
+- Ставит проект со всеми extras (`dev`, `build`, `audit`) на Windows, как для сборки, и проверяет каждый установленный пакет по базе PyPI Advisory
+- Падает, если у какого-либо пакета есть известная уязвимость или пакет не удалось проверить; в логе — идентификаторы (CVE, GHSA) и версии с исправлением
+- Вызывается из Release: релиз с известной уязвимостью не подписывается и не публикуется
+
+Триггеры workflow:
+- Push в ветку main/master
+- Pull request в ветку main/master
+- Ежедневно по расписанию (новые CVE выходят без коммитов в репозиторий)
+- Ручной запуск workflow
+
+Если проверка упала, обновите уязвимый пакет в `pyproject.toml` (транзитивную зависимость закрепите явно, как `starlette`). Пропускать уязвимость через `--ignore-vuln` можно только с комментарием-причиной в workflow.
+
 ### Release (`.github/workflows/release.yml`)
 
 Автоматически создаёт релизы с собранными артефактами:
 - Срабатывает при создании тега версии (формат: `vX.Y.Z` из цифр, например `v2.3.0`)
-- Собирает Windows-версии всех филиалов и подписывает их в окружении `code-signing` (без сертификата релиз падает)
+- Собирает Windows-версии всех филиалов и подписывает их в окружении `code-signing` (без сертификата или при известной уязвимости в зависимостях релиз падает)
 - Создаёт GitHub Release с описанием и прикрепляет к нему архив `FilePickerAPI-<код филиала>.zip` для каждого филиала
 
 **Создание нового релиза:**

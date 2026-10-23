@@ -38,6 +38,11 @@ dev = [
 build = [
     "nuitka==4.3",
 ]
+# Проверка зависимостей на известные уязвимости (.github/workflows/audit.yml).
+# Здесь, а не в workflow, чтобы версию обновлял Dependabot.
+audit = [
+    "pip-audit==2.10.1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
