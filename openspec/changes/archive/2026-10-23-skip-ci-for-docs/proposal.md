@@ -7,13 +7,15 @@ Build and Test и Dependency Audit запускаются на каждый push
 ## What Changes
 
 - В `build-exe.yml` и `audit.yml` у триггеров `push` и `pull_request` появляется `paths-ignore` с одним и тем же списком: `**.md`, `openspec/**`, `.claude/**`. Если в коммите или PR изменены только такие файлы, workflow не запускается; если изменён хотя бы один другой файл — запускается целиком, как раньше.
+- Новый лёгкий workflow `.github/workflows/docs.yml` запускается на тот же список путей (`paths`) и проверяет основные спецификации: `openspec validate --specs --strict` на Ubuntu через `npx` с закреплённой версией, без зависимостей проекта и Nuitka. Незаархивированные изменения в `openspec/changes` не проверяются: на `main` они могут расходиться с основными спецификациями.
 - Ручной запуск, ежедневный запуск аудита и вызов обоих workflow из `release.yml` не меняются: релиз по тегу всегда собирается и проверяется.
 - README и `openspec/config.yaml` описывают новое правило.
 
 Контракт HTTP API не меняется: поля, коды ответов и тексты `detail` остаются прежними.
 
 Вне рамок изменения:
-- Автоматическое ревью Copilot в PR: оно включено правилом репозитория (ruleset `main`), а не workflow, и настраивается в GitHub.
+- Автоматическое ревью Copilot в PR остаётся как есть: оно включено правилом репозитория (ruleset `main`), а не workflow.
+- Проверка ссылок и оформления Markdown.
 - Пропуск CI для других не влияющих на код файлов (`.gitignore`, `.gitattributes`, `.github/dependabot.yml`): они меняются редко, и ошибиться в списке дороже, чем один лишний прогон.
 - Способы задать директорию с файлами при запуске не добавляются.
 
@@ -22,11 +24,12 @@ Build and Test и Dependency Audit запускаются на каждый push
 ### New Capabilities
 
 ### Modified Capabilities
-- `distribution`: новое требование «CI не запускается для изменений только в документации».
+- `distribution`: новое требование «Изменения только в документации проверяются без сборки».
 
 ## Impact
 
 - `.github/workflows/build-exe.yml`, `.github/workflows/audit.yml` — `paths-ignore` у `push` и `pull_request`.
+- `.github/workflows/docs.yml` — новый файл.
 - `README.md`, `openspec/config.yaml` — описание правила.
 - `openspec/specs/distribution/spec.md` — после архивации изменения.
-- В ruleset `main` нет обязательных проверок статуса, поэтому PR только с документацией можно слить без прогона CI.
+- В ruleset `main` нет обязательных проверок статуса, поэтому PR только с документацией можно слить без Build and Test.

@@ -4,7 +4,8 @@
 
 - [x] 1.1 Добавить `paths-ignore` (`**.md`, `openspec/**`, `.claude/**`) к `push` и `pull_request` в `build-exe.yml`
 - [x] 1.2 Добавить тот же список в `audit.yml`; расписание, ручной запуск и `workflow_call` не трогать
-- [x] 1.3 Убедиться, что в ruleset `main` нет обязательных проверок статуса, иначе PR только с документацией не слить
+- [x] 1.3 Добавить `docs.yml`: те же пути в `paths`, `npx @fission-ai/openspec@1.14.1 validate --specs --strict` на Ubuntu
+- [x] 1.4 Убедиться, что в ruleset `main` нет обязательных проверок статуса, иначе PR только с документацией не слить
 
 ## 2. Документация
 
@@ -12,8 +13,8 @@
 
 ## 3. Проверки
 
-- [x] 3.1 Прогнать `ruff check app tests scripts`, `ruff format --check app tests scripts` и `pytest` (покрытие 100%)
+- [x] 3.1 Прогнать `ruff check app tests scripts`, `ruff format --check app tests scripts` и `pytest` (Python-код не менялся; локально 32 теста для Windows пропущены, покрытие 100% проверяет CI)
 
 ## Workflow follow-up
 
-- Убедиться, что PR только с документацией не запускает Build and Test и Dependency Audit, а PR с этим изменением (он меняет workflow) запускает оба.
+- Убедиться, что PR только с документацией запускает только Docs, а PR с этим изменением (он меняет workflow) запускает и Build and Test, и Dependency Audit.

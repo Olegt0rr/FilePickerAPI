@@ -101,7 +101,9 @@ context: |
     подписью)
   - build-exe.yml и audit.yml не запускаются по push и PR, если
     изменена только документация (paths-ignore: **.md, openspec/**,
-    .claude/**); списки в двух файлах держать одинаковыми
+    .claude/**); для неё .github/workflows/docs.yml на Ubuntu
+    запускает openspec validate --specs --strict. Списки путей в трёх
+    файлах держать одинаковыми
   - .github/dependabot.yml: еженедельные обновления pip и GitHub Actions
 
 rules:

@@ -1,0 +1,40 @@
+name: Docs
+
+# Лёгкая проверка документации вместо полного CI: build-exe.yml и
+# audit.yml при изменении только *.md, openspec/ и .claude/ не
+# запускаются (paths-ignore), а здесь проверяются спецификации
+# OpenSpec. Работает на Ubuntu с предустановленным Node, без
+# зависимостей проекта и Nuitka. Список путей держать одинаковым с
+# paths-ignore в build-exe.yml и audit.yml.
+on:
+  push:
+    branches: [ main, master ]
+    paths: &docs
+      - '**.md'
+      - 'openspec/**'
+      - '.claude/**'
+  pull_request:
+    branches: [ main, master ]
+    paths: *docs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openspec:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v7
+
+    # Версия закреплена: Dependabot её не обновляет (в репозитории нет
+    # package.json), поднимать вручную вместе с локальной openspec.
+    # Проверяются только основные спецификации: незаархивированные
+    # изменения из openspec/changes могут расходиться с ними.
+    - name: Validate OpenSpec specs
+      env:
+        OPENSPEC_TELEMETRY: '0'
+      run: npx --yes @fission-ai/openspec@1.14.1 validate --specs --strict

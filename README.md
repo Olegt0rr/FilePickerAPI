@@ -323,6 +323,10 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 Если в push или PR изменена только документация (`*.md`, `openspec/`, `.claude/`), workflow не запускается: код и сборка от неё не меняются. Если вместе с ней изменён любой другой файл, workflow запускается целиком. Так же устроен Dependency Audit.
 
+### Docs (`.github/workflows/docs.yml`)
+
+Лёгкая проверка для изменений документации (`*.md`, `openspec/`, `.claude/`): на Ubuntu, без зависимостей проекта и сборки, проверяет основные спецификации командой `openspec validate --specs --strict`. Версия openspec закреплена в workflow и обновляется вручную.
+
 Артефакты:
 - Сборка для Windows: хранится 30 дней
 - Отчет о покрытии: хранится 7 дней
