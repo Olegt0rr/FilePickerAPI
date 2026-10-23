@@ -1,5 +1,6 @@
 """Обработчики для работы с файлами."""
 
+import ctypes
 import errno
 import functools
 import logging
@@ -9,7 +10,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from stat import S_ISDIR, S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
@@ -84,6 +85,113 @@ _INVALID_NAME_WINERRORS = frozenset({123, 206, 1921})
 _INVALID_NAME_ERRNOS = frozenset({errno.ENAMETOOLONG, errno.ELOOP})
 
 
+# Имена устройств Windows. Устройством считается и имя с расширением
+# (nul.txt) и пробелами перед ним, поэтому сравнивается часть до первой
+# точки. На Windows 11 имена с расширением уже не устройства, но на
+# Windows 10 сервис обратился бы к порту или консоли, а не к файлу.
+# COM0 и LPT0 Microsoft тоже относит к зарезервированным именам
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"{port}{n}" for port in ("COM", "LPT") for n in "0123456789\xb9\xb2\xb3"}
+)
+
+# Символы, недопустимые в именах файлов Windows. Кроме того, это
+# шаблоны поиска для FindFirstFileExW (см. _real_file_name)
+_WINDOWS_INVALID_CHARS = frozenset('*?"<>|')
+
+
+def _is_invalid_windows_name(name: str) -> bool:
+    """Проверить, что на Windows имя не может быть именем файла.
+
+    В именах файлов Windows не бывает двоеточия (диск или
+    альтернативный поток NTFS), символов *?"<>| и точек или пробелов
+    в конце: Win32 их отбрасывает, и ".. " превращается в "..". Имена
+    устройств (CON, nul.txt, COM1) ведут к устройству, а не к файлу.
+
+    Args:
+        name: Непустое имя файла
+
+    Returns:
+        True, если сервис работает на Windows и имя недопустимо
+
+    """
+    return sys.platform == "win32" and (
+        ":" in name
+        or not _WINDOWS_INVALID_CHARS.isdisjoint(name)
+        or name[-1] in ". "
+        or name.partition(".")[0].rstrip(" ").upper() in _WINDOWS_RESERVED_NAMES
+    )
+
+
+class _Win32FindData(ctypes.Structure):
+    """Структура WIN32_FIND_DATAW — ответ FindFirstFileExW.
+
+    Поля описаны типами фиксированного размера, а не ctypes.wintypes:
+    модуль импортируется и на Linux, где тесты подменяют вызовы WinAPI.
+    """
+
+    _fields_ = (
+        ("attributes", ctypes.c_uint32),
+        ("times", ctypes.c_uint32 * 6),
+        ("size", ctypes.c_uint32 * 2),
+        ("reserved", ctypes.c_uint32 * 2),
+        ("name", ctypes.c_wchar * 260),
+        ("alternate_name", ctypes.c_wchar * 14),
+    )
+
+
+# FINDEX_INFO_LEVELS.FindExInfoBasic: без короткого имени 8.3
+_FIND_EX_INFO_BASIC = 1
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+def _real_file_name(path: Path) -> str:
+    """Вернуть имя файла в том виде, в каком оно записано в директории.
+
+    Windows находит файл по имени без учёта регистра и по короткому
+    имени 8.3 (REPORT~1.TXT для report.txtx). FindFirstFileExW
+    возвращает настоящее длинное имя. Это поиск в директории, а не
+    открытие файла, поэтому по символическим ссылкам он не переходит.
+
+    Args:
+        path: Путь к файлу; имя без символов-шаблонов *?"<>
+
+    Returns:
+        Имя файла в директории
+
+    Raises:
+        OSError: Если файла нет или директория недоступна (на Windows —
+            подкласс по коду ошибки, например FileNotFoundError)
+
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    find_first = kernel32.FindFirstFileExW
+    find_first.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    find_first.restype = ctypes.c_void_p
+    data = _Win32FindData()
+    handle = find_first(str(path), _FIND_EX_INFO_BASIC, ctypes.byref(data), 0, None, 0)
+    if handle in {None, _INVALID_HANDLE_VALUE}:
+        # По коду ошибки Windows OSError сам выбирает подкласс и errno
+        winerror = ctypes.get_last_error()
+        msg = "FindFirstFileExW failed"
+        raise OSError(None, msg, str(path), winerror)
+    kernel32.FindClose.argtypes = (ctypes.c_void_p,)
+    kernel32.FindClose(handle)
+    return data.name
+
+
+def _invalid_filename() -> HTTPException:
+    """Вернуть ошибку 400 «Invalid filename» для такого fileId."""
+    return HTTPException(status_code=400, detail="Invalid filename")
+
+
 def _is_invalid_name_error(error: OSError) -> bool:
     """Проверить, вызвана ли ошибка ОС недопустимым именем файла."""
     winerror = getattr(error, "winerror", None)
@@ -110,6 +218,12 @@ def _directory_errors(*, not_found: bool = False) -> Iterator[None]:
     try:
         yield
     except OSError as e:
+        # «Сетевой путь не найден» (ERROR_BAD_NETPATH, 53) и «сетевое
+        # имя не найдено» (ERROR_BAD_NET_NAME, 67) Python на Windows сам
+        # превращает в FileNotFoundError, поэтому недоступная сетевая
+        # папка — 404, как и отсутствующая. Отдельной проверки
+        # winerror здесь нет: на это поведение опирается спецификация
+        # (тест test_list_files_network_path_not_found)
         if not_found and isinstance(e, (FileNotFoundError, NotADirectoryError)):
             msg = "Files directory not found"
             raise HTTPException(status_code=404, detail=msg) from e
@@ -140,12 +254,10 @@ def _file_errors(file_id: str) -> Iterator[None]:
     except (ValueError, RuntimeError) as e:
         # ValueError — NUL-байт в имени, RuntimeError — петля
         # символических ссылок в resolve() на Python 3.11
-        msg = "Invalid filename"
-        raise HTTPException(status_code=400, detail=msg) from e
+        raise _invalid_filename() from e
     except OSError as e:
         if _is_invalid_name_error(e):
-            msg = "Invalid filename"
-            raise HTTPException(status_code=400, detail=msg) from e
+            raise _invalid_filename() from e
         if isinstance(e, (FileNotFoundError, NotADirectoryError)):
             msg = "File not found"
             raise HTTPException(status_code=404, detail=msg) from e
@@ -166,6 +278,10 @@ def file_created_at(file_stat: os.stat_result) -> datetime:
 
     На Windows до Python 3.12 время создания лежит в st_ctime, с 3.12 —
     в st_birthtime. На Linux время создания недоступно.
+
+    Для файла в сетевой папке время создания отдаёт файловый сервер:
+    это время появления файла на ресурсе (или время, сохранённое при
+    копировании, например robocopy), а не время на машине сервиса.
     """
     if hasattr(file_stat, "st_birthtime"):
         timestamp = file_stat.st_birthtime
@@ -204,9 +320,14 @@ def _stat_listed_item(
         # получены при перечислении, и запроса к сетевой папке нет
         if entry.is_symlink():
             # Ссылку показываем, только если её можно скачать: цель —
-            # .txt прямо в директории (см. get_file)
-            target = Path(entry.path).resolve()
-            if target.parent != base_dir() or target.suffix.lower() != ".txt":
+            # .txt прямо в директории. На Windows ссылки не показываем
+            # и к их цели не обращаемся. Подробнее — в get_file
+            target = None if sys.platform == "win32" else Path(entry.path).resolve()
+            if (
+                target is None
+                or target.parent != base_dir()
+                or target.suffix.lower() != ".txt"
+            ):
                 return None, False
         # Для ссылки stat() идёт к цели
         file_stat = entry.stat()
@@ -247,10 +368,15 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
     try:
         # Директория могла исчезнуть после проверки в list_files
         # Отбор по расширению сразу при перечислении: он не требует
-        # обращения к ФС, и прочие элементы не держатся в памяти
+        # обращения к ФС, и прочие элементы не держатся в памяти. Не
+        # показываем и файлы, которые get_file не отдаст из-за имени,
+        # как nul.txt на Windows 11
         with _directory_errors(not_found=True), os.scandir(files_path) as it:
             entries = [
-                entry for entry in it if Path(entry.name).suffix.lower() == ".txt"
+                entry
+                for entry in it
+                if Path(entry.name).suffix.lower() == ".txt"
+                and not _is_invalid_windows_name(entry.name)
             ]
         with _directory_errors():
             for entry in entries:
@@ -346,9 +472,10 @@ def list_files() -> FileListResponse:
     )
 
 
-# Разрешённый путь к директории с файлами. Ключ — только путь из
-# настроек, зашитый в сборку, поэтому кэш не даёт способа подменить
-# директорию. Сюда попадает только результат строгого resolve()
+# Разрешённый путь к директории с файлами (не на Windows, см.
+# get_file). Ключ — только путь из настроек, зашитый в сборку, поэтому
+# кэш не даёт способа подменить директорию. Сюда попадает только
+# результат строгого resolve()
 _real_path_cache: dict[Path, Path] = {}
 
 
@@ -388,46 +515,27 @@ def _resolve_files_directory(files_directory: Path, *, refresh: bool = False) ->
     return real_path
 
 
-@router.get("/{fileId}")
-def get_file(
-    file_id: Annotated[str, PathParam(alias="fileId")],
-) -> FileResponse:
-    """Скачать определенный файл из настроенной директории.
+def _resolve_in_directory(candidate: Path, files_directory: Path, file_id: str) -> Path:
+    """Разрешить путь к файлу и проверить, что он прямо в директории.
+
+    Используется не на Windows: там символическим ссылкам сервис не
+    следует (см. get_file).
 
     Args:
-        file_id: ID файла для загрузки (имя файла)
+        candidate: Путь к файлу в директории из настроек
+        files_directory: Директория из настроек
+        file_id: Запрошенный идентификатор файла
 
     Returns:
-        Ответ с запрашиваемым файлом
+        Разрешённый путь к файлу
 
     Raises:
-        HTTPException: 403 если файл недоступен для загрузки
-            (не соответствует критериям availableFiles)
+        HTTPException: 400, если путь ведёт не прямо в директорию, и
+            ошибки _file_errors и _resolve_files_directory
 
     """
-    files_directory = Path(get_settings().files_directory)
-
-    # Безопасность: fileId должен быть просто именем, и проверяется это
-    # до любого обращения к ФС. Абсолютный путь (на Windows и
-    # UNC-путь \\host\share) заменил бы директорию при склейке, и
-    # resolve() пошёл бы на чужой хост, отдав ему NTLM-хеш учётной
-    # записи сервиса. На Windows в именах файлов не бывает двоеточия
-    # (диск или альтернативный поток NTFS) и точек или пробелов в
-    # конце: Win32 их отбрасывает, и ".. " превращается в ".."
-    candidate = files_directory / file_id
-    if (
-        # Склейка нормализует путь: на Windows ".\\x.txt", "x.txt\\" и
-        # полный путь к файлу в директории — тот же файл, но не имя
-        candidate.name != file_id
-        or "\x00" in file_id
-        or file_id in {".", ".."}
-        or (sys.platform == "win32" and (":" in file_id or file_id[-1] in ". "))
-    ):
-        msg = "Invalid filename"
-        raise HTTPException(status_code=400, detail=msg)
-
     # Директория не меняется, поэтому её путь разрешается один раз:
-    # это экономит запросы к сетевой папке на каждом скачивании
+    # это экономит запросы к ФС на каждом скачивании
     cached_dir = _real_path_cache.get(files_directory)
     base_dir = (
         cached_dir
@@ -442,17 +550,91 @@ def get_file(
     # списке: символическая ссылка не должна уводить в поддиректорию
     # или за пределы директории. Если путь директории взят из кэша,
     # перед отказом сверяемся с заново разрешённым: закэшированный
-    # мог устареть (например, DFS переключил сетевую папку на другой
-    # сервер)
+    # мог устареть (например, сама директория — ссылка, которую
+    # перенаправили)
     if file_path.parent != base_dir and (
         cached_dir is None
         or file_path.parent != _resolve_files_directory(files_directory, refresh=True)
     ):
-        msg = "Invalid filename"
-        raise HTTPException(status_code=400, detail=msg)
+        raise _invalid_filename()
+    return file_path
 
-    with _file_errors(file_id):
-        file_stat = file_path.stat()
+
+@router.get("/{fileId}")
+def get_file(
+    file_id: Annotated[str, PathParam(alias="fileId")],
+) -> FileResponse:
+    """Скачать определенный файл из настроенной директории.
+
+    Обращения к файловой системе ограничены настроенной директорией:
+    fileId проверяется как имя до любого обращения к ней, а на Windows
+    символическим ссылкам сервис не следует. Поэтому ни данные
+    запроса, ни ссылки в директории не заставят сервис подключиться к
+    чужому хосту.
+
+    Args:
+        file_id: ID файла для загрузки (имя файла)
+
+    Returns:
+        Ответ с запрашиваемым файлом
+
+    Raises:
+        HTTPException: 400 «Invalid filename», если fileId — не имя
+            файла (путь, UNC-путь, имя устройства Windows и т.п.),
+            ОС отвергает имя, файл — символическая ссылка на Windows
+            или лежит не прямо в директории; 400 «Path is not a file»
+            для директории; 403 «File is not available for download»,
+            если файл не соответствует критериям availableFiles;
+            403/500 при ошибке ОС (текст ошибки — только в лог);
+            404 «File not found», если файла нет или сетевая папка
+            недоступна; 500, если не удалось разрешить путь самой
+            директории (кроме Windows)
+
+    """
+    files_directory = Path(get_settings().files_directory)
+
+    # Безопасность: fileId должен быть просто именем, и проверяется это
+    # до любого обращения к ФС. Абсолютный путь (на Windows и
+    # UNC-путь \\host\share) заменил бы директорию при склейке, и
+    # resolve() пошёл бы на чужой хост, отдав ему NTLM-хеш учётной
+    # записи сервиса
+    candidate = files_directory / file_id
+    if (
+        # Склейка нормализует путь: на Windows ".\\x.txt", "x.txt\\" и
+        # полный путь к файлу в директории — тот же файл, но не имя
+        candidate.name != file_id
+        or "\x00" in file_id
+        or file_id in {".", ".."}
+        or _is_invalid_windows_name(file_id)
+    ):
+        raise _invalid_filename()
+
+    if sys.platform == "win32":
+        # На Windows символическим ссылкам не следуем: ОС открыла бы
+        # цель, и ссылка на \\host\share отдала бы хосту NTLM-хеш
+        # учётной записи сервиса. lstat() читает саму ссылку, не
+        # обращаясь к цели. fileId — уже проверенное имя, и раз это не
+        # ссылка, файл лежит прямо в директории: resolve() и сверка с
+        # директорией не нужны, а атрибуты для проверок и ответа уже
+        # получены
+        with _file_errors(file_id):
+            file_stat = candidate.lstat()
+        if S_ISLNK(file_stat.st_mode):
+            raise _invalid_filename()
+        # Windows находит файл и без учёта регистра, и по короткому
+        # имени 8.3: report.txtx отдался бы как REPORT~1.TXT в обход
+        # проверки расширения. Проверки и имя в ответе — по настоящему
+        # имени, как в списке. Второе и последнее обращение к сетевой
+        # папке до чтения файла
+        with _file_errors(file_id):
+            real_name = _real_file_name(candidate)
+        if _is_invalid_windows_name(real_name):
+            raise _invalid_filename()
+        file_path = candidate.with_name(real_name)
+    else:
+        file_path = _resolve_in_directory(candidate, files_directory, file_id)
+        with _file_errors(file_id):
+            file_stat = file_path.stat()
 
     if not S_ISREG(file_stat.st_mode):
         msg = "Path is not a file"

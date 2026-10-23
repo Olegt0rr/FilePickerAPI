@@ -2,16 +2,23 @@
 Комплексные тесты для File Picker API.
 """
 
+import ctypes
 import errno
 import importlib
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
+import types
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
@@ -46,31 +53,84 @@ def reload_app(files_directory=None):
 def assert_sorted_by_created_at(files: list[dict]) -> None:
     """Проверить, что файлы отсортированы по дате создания
     (убывание).
+
+    Сравниваем datetime, а не строки: "…00Z" как строка больше более
+    позднего "…00.5Z".
     """
-    if len(files) > 1:
-        created_times = [item["createdAt"] for item in files]
-        assert created_times == sorted(created_times, reverse=True)
+    created_times = [datetime.fromisoformat(item["createdAt"]) for item in files]
+    assert created_times == sorted(created_times, reverse=True)
+
+
+# Проверки, которые имеют смысл только на Windows: на Linux обратный
+# слэш — обычный символ имени, а время создания файла недоступно
+windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Только Windows")
+linux_only = pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Только Linux"
+)
+# На Windows сервис символическим ссылкам не следует (см.
+# TestWindowsSymlinks), поэтому сценарии с переходом по ссылке — для
+# остальных ОС
+follows_symlinks = pytest.mark.skipif(
+    sys.platform == "win32", reason="На Windows ссылкам не следуем"
+)
 
 
 def fail_for(method, name, error):
     """Вернуть патч метода Path, который падает только для файла name.
 
-    Падать на всех путях нельзя: ошибка случилась бы уже на базовой
-    директории (на Python 3.11 resolve() сам вызывает stat()).
+    name — имя или кортеж имён. Падать на всех путях нельзя: ошибка
+    случилась бы уже на базовой директории (на Python 3.11 resolve()
+    сам вызывает stat()).
     """
     original = getattr(Path, method)
+    names = {name} if isinstance(name, str) else set(name)
 
     def fake(self, *args, **kwargs):
-        if self.name == name:
+        if self.name in names:
             raise error
         return original(self, *args, **kwargs)
 
     return mock.patch.object(Path, method, autospec=True, side_effect=fake)
 
 
+@contextmanager
 def fail_stat_for(name, error):
-    """Вернуть патч Path.stat, который падает только для файла name."""
-    return fail_for("stat", name, error)
+    """Подменить Path.stat и Path.lstat: падают только для name.
+
+    lstat() тоже: на Windows атрибуты скачиваемого файла сервис читает
+    через него (на Python 3.12+ lstat() не вызывает stat()).
+    """
+    with fail_for("stat", name, error), fail_for("lstat", name, error):
+        yield
+
+
+@contextmanager
+def as_windows():
+    """Подменить платформу на Windows только для app.handlers.files.
+
+    sys.platform подменяется не глобально: иначе по Windows-веткам
+    пошли бы и библиотеки, обслуживающие запрос (anyio, starlette).
+    Вызывать после reload_app: подменяется атрибут модуля.
+
+    Поиск настоящего имени файла (WinAPI) заменяется заглушкой: имя
+    совпадает с запрошенным. Сам поиск проверяет
+    TestWindowsRealFileName.
+    """
+    from app.handlers import files
+
+    with (
+        mock.patch.object(files, "sys", SimpleNamespace(platform="win32")),
+        mock.patch.object(files, "_real_file_name", side_effect=lambda p: p.name),
+    ):
+        yield
+
+
+# На Windows путь к скачиваемому файлу не разрешается через resolve(), и
+# кэша пути директории нет (см. get_file): эти сценарии — для остальных
+# ОС
+resolves_paths = pytest.mark.skipif(
+    sys.platform == "win32", reason="На Windows путь не разрешается"
+)
 
 
 class FailingEntry:
@@ -134,11 +194,24 @@ def entry_time_for(name, timestamp):
     return wrap_entry_for(name, lambda entry: TimedEntry(entry, timestamp))
 
 
-def symlink_or_skip(link, target):
-    """Создать символическую ссылку или пропустить тест."""
+def symlink_or_skip(link, target, *, target_is_directory=None):
+    """Создать символическую ссылку или пропустить тест.
+
+    target_is_directory=None — определить по цели; для цели на
+    сетевом ресурсе его нужно передать явно, чтобы не обращаться к ней.
+    """
     try:
-        Path(link).symlink_to(target)
+        # На Windows ссылка на директорию должна создаваться как ссылка
+        # на директорию, иначе через неё нельзя зайти внутрь
+        # Относительная цель считается от папки ссылки, а не от текущей
+        if target_is_directory is None:
+            target_is_directory = (Path(link).parent / target).is_dir()
+        Path(link).symlink_to(target, target_is_directory=target_is_directory)
     except OSError:
+        # В CI (REQUIRE_SYMLINKS) ссылки создать можно всегда: пропуск
+        # там скрыл бы непроверенные сценарии
+        if os.environ.get("REQUIRE_SYMLINKS"):
+            raise
         # На Windows без прав администратора или режима
         # разработчика символические ссылки создать нельзя
         pytest.skip("Символические ссылки недоступны")
@@ -324,6 +397,82 @@ class TestListFilesEndpoint:
             assert len(data["availableFiles"]) == 1
             assert len(data["unavailableFiles"]) == 2
 
+    def test_list_files_uppercase_extension(self, test_files_dir):
+        """Проверить: REPORT.TXT есть в списке и скачивается."""
+        (Path(test_files_dir) / "REPORT.TXT").write_text("upper")
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        names = [f["name"] for f in client.get("/files").json()["availableFiles"]]
+        assert "REPORT.TXT" in names
+        response = client.get("/files/REPORT.TXT")
+        assert response.status_code == 200
+        assert response.content == b"upper"
+
+    def test_list_files_sorted_newest_first(self, tmp_path):
+        """Проверить порядок «новые первыми» в обоих списках.
+
+        Время подменяем: время создания на Windows не выставить через
+        os.utime. Метки отличаются долями секунды — на них ломалось бы
+        сравнение строк.
+        """
+        from app.handlers import files
+
+        # Файлы различаются размером, по нему и выбираем время
+        sizes = {"old.txt": 1, "new.txt": 2, "old_big.txt": 101, "new_big.txt": 102}
+        base = datetime(2024, 1, 1, 10, tzinfo=UTC)
+        created = {
+            1: base,
+            2: base + timedelta(milliseconds=500),
+            101: base,
+            102: base + timedelta(milliseconds=500),
+        }
+        for name, size in sizes.items():
+            (tmp_path / name).write_bytes(b"x" * size)
+        client = TestClient(reload_app(files_directory=str(tmp_path)))
+
+        with (
+            mock.patch.object(files, "MAX_AVAILABLE_FILE_SIZE", 100),
+            mock.patch.object(
+                files, "file_created_at", side_effect=lambda st: created[st.st_size]
+            ),
+        ):
+            data = client.get("/files").json()
+        assert [f["name"] for f in data["availableFiles"]] == ["new.txt", "old.txt"]
+        assert [f["name"] for f in data["unavailableFiles"]] == [
+            "new_big.txt",
+            "old_big.txt",
+        ]
+        assert_sorted_by_created_at(data["availableFiles"])
+
+    def test_list_files_created_at_is_utc(self, client):
+        """Проверить, что createdAt передаётся в UTC."""
+        for item in client.get("/files").json()["availableFiles"]:
+            created_at = datetime.fromisoformat(item["createdAt"])
+            assert created_at.utcoffset() == timedelta(0)
+
+    @windows_only
+    def test_list_files_created_at_is_creation_time_on_windows(
+        self, client, test_files_dir
+    ):
+        """Проверить: на Windows createdAt — время создания, а не
+        изменения.
+        """
+        old = datetime(2020, 1, 1, tzinfo=UTC).timestamp()
+        os.utime(Path(test_files_dir) / "test1.txt", (old, old))
+
+        items = {f["name"]: f for f in client.get("/files").json()["availableFiles"]}
+        created_at = datetime.fromisoformat(items["test1.txt"]["createdAt"])
+        assert created_at > datetime.now(UTC) - timedelta(hours=1)
+
+    @linux_only
+    def test_list_files_created_at_is_mtime_on_linux(self, client, test_files_dir):
+        """Проверить: на Linux createdAt — время изменения файла."""
+        old = datetime(2020, 1, 1, tzinfo=UTC)
+        os.utime(Path(test_files_dir) / "test1.txt", (old.timestamp(),) * 2)
+
+        items = {f["name"]: f for f in client.get("/files").json()["availableFiles"]}
+        assert datetime.fromisoformat(items["test1.txt"]["createdAt"]) == old
+
     def test_list_files_txt_only_in_available(self, client):
         """Проверить, что только .txt файлы в availableFiles."""
         response = client.get("/files")
@@ -449,29 +598,43 @@ class TestSecurityDirectoryTraversal:
         names = [f["name"] for f in client.get("/files").json()["availableFiles"]]
         assert "link.txt" not in names
 
+    @follows_symlinks
     @pytest.mark.parametrize(
         ("target", "listed"),
         [("test1.txt", True), ("document.pdf", False)],
     )
     def test_symlink_listed_only_if_downloadable(self, test_files_dir, target, listed):
         """Проверить: ссылка в списке, только если её можно скачать."""
-        try:
-            (Path(test_files_dir) / "link.txt").symlink_to(target)
-        except OSError:
-            pytest.skip("Символические ссылки недоступны")
+        symlink_or_skip(Path(test_files_dir) / "link.txt", target)
         client = TestClient(reload_app(files_directory=test_files_dir))
 
         names = [f["name"] for f in client.get("/files").json()["availableFiles"]]
         assert ("link.txt" in names) is listed
         download = client.get("/files/link.txt")
         assert (download.status_code == 200) is listed
+        if listed:
+            assert download.content == b"Test content 1"
+
+    def test_symlink_outside_directory(self, test_files_dir, tmp_path):
+        """Проверить: ссылка за пределы директории не видна и не
+        скачивается.
+        """
+        outside = tmp_path / "outside.txt"
+        outside.write_text("secret")
+        symlink_or_skip(Path(test_files_dir) / "link.txt", outside)
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files/link.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+        data = client.get("/files").json()
+        names = [f["name"] for f in data["availableFiles"] + data["unavailableFiles"]]
+        assert "link.txt" not in names
 
     def test_symlink_loop_skipped_in_listing(self, test_files_dir):
         """Проверить: петля ссылок на Python 3.11 не роняет список."""
-        try:
-            (Path(test_files_dir) / "loop.txt").symlink_to("test1.txt")
-        except OSError:
-            pytest.skip("Символические ссылки недоступны")
+        symlink_or_skip(Path(test_files_dir) / "loop.txt", "test1.txt")
         client = TestClient(reload_app(files_directory=test_files_dir))
 
         error = RuntimeError("Symlink loop from 'loop.txt'")
@@ -516,6 +679,374 @@ class TestSecurityDirectoryTraversal:
         """
         response = client.get("/files/test1.txt")
         assert response.status_code == 200
+
+
+class TestWindowsSymlinks:
+    """На Windows сервис символическим ссылкам не следует.
+
+    Платформа подменяется, поэтому тесты идут и на Linux; на Windows
+    (CI) они проверяют и то, что ОС не переходит по ссылке.
+    """
+
+    # Хост в зоне .invalid не существует: даже если сервис пойдёт по
+    # ссылке, подключения никуда не будет
+    UNC_TARGET = r"\\attacker.invalid\s\x.txt"
+
+    @pytest.fixture(params=["test1.txt", UNC_TARGET])
+    def link_client(self, request, test_files_dir):
+        """Клиент на Windows и link.txt — ссылка на файл или UNC."""
+        symlink_or_skip(
+            Path(test_files_dir) / "link.txt", request.param, target_is_directory=False
+        )
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        # resolve() или stat() ссылки — уже переход по ней:
+        # AssertionError даст 500. stat(follow_symlinks=False) — это
+        # lstat() (так он устроен на Python 3.11), ссылку он не
+        # раскрывает
+        error = AssertionError("symlink must not be followed")
+        original_stat = Path.stat
+
+        def stat_without_following(self, *args, **kwargs):
+            if self.name == "link.txt" and kwargs.get("follow_symlinks", True):
+                raise error
+            return original_stat(self, *args, **kwargs)
+
+        with (
+            as_windows(),
+            fail_for("resolve", "link.txt", error),
+            mock.patch.object(
+                Path, "stat", autospec=True, side_effect=stat_without_following
+            ),
+        ):
+            yield client
+
+    def test_symlink_not_listed(self, link_client):
+        """Проверить: ссылки нет в списке, остальные файлы на месте."""
+        response = link_client.get("/files")
+        assert response.status_code == 200
+        data = response.json()
+        names = [f["name"] for f in data["availableFiles"] + data["unavailableFiles"]]
+        assert sorted(names) == ["test1.txt", "test2.txt"]
+
+    def test_symlink_download_rejected(self, link_client):
+        """Проверить: скачивание ссылки — 400 без перехода по ней."""
+        response = link_client.get("/files/link.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    def test_regular_file_still_downloaded(self, link_client):
+        """Проверить: обычный файл рядом со ссылкой скачивается."""
+        response = link_client.get("/files/test1.txt")
+        assert response.status_code == 200
+        assert response.content == b"Test content 1"
+
+
+def short_name_or_skip(path):
+    """Вернуть короткое имя 8.3 файла или пропустить тест.
+
+    На томе с отключёнными короткими именами (fsutil 8dot3name)
+    короткое имя совпадает с длинным, и проверять нечего.
+    """
+    get_short = ctypes.WinDLL("kernel32").GetShortPathNameW
+    buffer = ctypes.create_unicode_buffer(1024)
+    if not get_short(str(path), buffer, len(buffer)):
+        pytest.skip("Не удалось получить короткое имя")
+    short = Path(buffer.value).name
+    if short == path.name:
+        pytest.skip("Короткие имена 8.3 на этом томе отключены")
+    return short
+
+
+class TestWindowsRealFileName:
+    """На Windows проверки и имя в ответе — по настоящему имени файла.
+
+    Windows находит файл без учёта регистра и по короткому имени 8.3,
+    поэтому сервис узнаёт настоящее имя через FindFirstFileExW.
+    """
+
+    @pytest.fixture
+    def real_file_name(self, test_files_dir):
+        reload_app(files_directory=test_files_dir)
+        from app.handlers.files import _real_file_name
+
+        return _real_file_name
+
+    def download_as(self, test_files_dir, requested, real_name):
+        """Скачать requested на «Windows» с настоящим именем."""
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        from app.handlers import files
+
+        with (
+            as_windows(),
+            mock.patch.object(files, "_real_file_name", return_value=real_name),
+        ):
+            return client.get("/files/" + quote(requested))
+
+    def test_short_name_checked_by_real_extension(self, test_files_dir):
+        """Проверить: REPORT~1.TXT для report.txtx — 403."""
+        (Path(test_files_dir) / "REPORT~1.TXT").write_text("not a txt")
+        response = self.download_as(test_files_dir, "REPORT~1.TXT", "report.txtx")
+        assert response.status_code == 403
+        assert response.json()["detail"] == "File is not available for download"
+
+    def test_response_uses_real_name(self, test_files_dir):
+        """Проверить: в Content-Disposition настоящее имя."""
+        # На Linux это два файла, на Windows — один и тот же
+        for name in ("payment.txt", "Payment.txt"):
+            (Path(test_files_dir) / name).write_text("content")
+        response = self.download_as(test_files_dir, "payment.txt", "Payment.txt")
+        assert response.status_code == 200
+        assert response.content == b"content"
+        assert 'filename="Payment.txt"' in response.headers["content-disposition"]
+
+    def test_real_name_is_device_name(self, test_files_dir):
+        """Проверить: короткое имя файла nul.txt — 400."""
+        (Path(test_files_dir) / "NUL~1.TXT").write_text("device")
+        response = self.download_as(test_files_dir, "NUL~1.TXT", "nul.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    def test_file_removed_before_name_lookup(self, test_files_dir):
+        """Проверить: файл пропал до поиска имени — 404."""
+        client = TestClient(reload_app(files_directory=test_files_dir))
+        from app.handlers import files
+
+        error = FileNotFoundError(errno.ENOENT, "No such file")
+        with (
+            as_windows(),
+            mock.patch.object(files, "_real_file_name", side_effect=error),
+        ):
+            response = client.get("/files/test1.txt")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "File not found"
+
+    def fake_kernel32(self, name=None):
+        """Вернуть поддельный kernel32, который находит name."""
+        kernel32 = mock.MagicMock()
+
+        def find_first(_path, _level, data, *_args):
+            if name is None:
+                return ctypes.c_void_p(-1).value
+            data._obj.name = name  # noqa: SLF001 - объект за ctypes.byref
+            return 1234
+
+        kernel32.FindFirstFileExW.side_effect = find_first
+        return kernel32
+
+    def test_real_file_name_found(self, real_file_name, test_files_dir):
+        """Проверить вызов WinAPI: имя из ответа, поиск закрыт."""
+        kernel32 = self.fake_kernel32("Payment.txt")
+        with mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32):
+            name = real_file_name(Path(test_files_dir) / "payment.txt")
+        assert name == "Payment.txt"
+        args = kernel32.FindFirstFileExW.call_args.args
+        assert args[0] == str(Path(test_files_dir) / "payment.txt")
+        # FindExInfoBasic: короткое имя не запрашивается
+        assert args[1] == 1
+        kernel32.FindClose.assert_called_once_with(1234)
+
+    def test_real_file_name_not_found(self, real_file_name, test_files_dir):
+        """Проверить: ошибка поиска — OSError с путём без FindClose."""
+        kernel32 = self.fake_kernel32()
+        path = Path(test_files_dir) / "missing.txt"
+        with (
+            mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32),
+            mock.patch.object(ctypes, "get_last_error", create=True, return_value=2),
+            pytest.raises(OSError, match="FindFirstFileExW failed") as exc_info,
+        ):
+            real_file_name(path)
+        assert exc_info.value.filename == str(path)
+        kernel32.FindClose.assert_not_called()
+
+    @windows_only
+    def test_real_file_name_on_windows(self, real_file_name, test_files_dir):
+        """Проверить поиск на Windows: регистр и отсутствие файла."""
+        (Path(test_files_dir) / "Payment.txt").write_text("content")
+        real = real_file_name(Path(test_files_dir) / "PAYMENT.TXT")
+        assert real == "Payment.txt"
+        with pytest.raises(FileNotFoundError):
+            real_file_name(Path(test_files_dir) / "missing.txt")
+
+    @windows_only
+    def test_short_name_download_on_windows(self, test_files_dir):
+        """Проверить: короткое имя не обходит проверку .txt."""
+        other = Path(test_files_dir) / "report.txtx"
+        other.write_text("not a txt")
+        payment = Path(test_files_dir) / "long payment name.txt"
+        payment.write_text("payment")
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files/" + quote(short_name_or_skip(other)))
+        assert response.status_code == 403
+        response = client.get("/files/" + quote(short_name_or_skip(payment)))
+        assert response.status_code == 200
+        assert response.content == b"payment"
+        assert "long%20payment%20name.txt" in response.headers["content-disposition"]
+
+
+# Отдельный SMB-ресурс для тестов сетевой папки. В CI его создаёт джоб
+# test-windows (build-exe.yml) и передаёт имя и локальную папку
+# ресурса; без них тесты пропускаются. Тесты убирают ресурс и создают
+# его заново, поэтому нужны права администратора (раннер CI их даёт)
+SMB_SHARE_NAME = os.environ.get("SMB_TEST_SHARE")
+SMB_SHARE_DIR = os.environ.get("SMB_TEST_SHARE_DIR")
+# Значения передаются через переменные окружения, а не подставляются в
+# текст команды. Параметры создания — те же, что в build-exe.yml
+_CURRENT_USER = "([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+SMB_SHARE_CREATE = (
+    "New-SmbShare -Name $env:SHARE_NAME -Path $env:SHARE_DIR"
+    f" -FullAccess {_CURRENT_USER} | Out-Null"
+)
+SMB_SHARE_REMOVE = "Remove-SmbShare -Name $env:SHARE_NAME -Force"
+SMB_SHARE_BLOCK = (
+    f"Block-SmbShareAccess -Name $env:SHARE_NAME -AccountName {_CURRENT_USER}"
+    " -Force | Out-Null"
+)
+SMB_SHARE_UNBLOCK = (
+    f"Unblock-SmbShareAccess -Name $env:SHARE_NAME -AccountName {_CURRENT_USER}"
+    " -Force | Out-Null"
+)
+
+
+def smb_share(command):
+    """Выполнить команду PowerShell над тестовым SMB-ресурсом."""
+    powershell = (
+        Path(os.environ["SYSTEMROOT"])
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    subprocess.run(  # noqa: S603 - команда и параметры задаются тестами
+        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", command],
+        env={**os.environ, "SHARE_NAME": SMB_SHARE_NAME, "SHARE_DIR": SMB_SHARE_DIR},
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+
+def wait_for_status(client, url, expected, timeout=60):
+    """Повторять запрос, пока не придёт статус expected.
+
+    SMB-клиент Windows несколько секунд кэширует атрибуты файлов и
+    директорий и то, что файла нет, поэтому изменение ресурса видно не
+    сразу. Возвращает последний ответ и все полученные статусы.
+    """
+    deadline = time.monotonic() + timeout
+    statuses = []
+    while True:
+        response = client.get(url)
+        statuses.append(response.status_code)
+        if response.status_code == expected or time.monotonic() > deadline:
+            return response, statuses
+        time.sleep(1)
+
+
+@windows_only
+@pytest.mark.skipif(
+    not (SMB_SHARE_NAME and SMB_SHARE_DIR),
+    reason="Нет тестового SMB-ресурса (SMB_TEST_SHARE, SMB_TEST_SHARE_DIR)",
+)
+class TestSmbShare:
+    """Директория на настоящем SMB-ресурсе этого компьютера."""
+
+    @pytest.fixture
+    def share_dir(self):
+        """Своя подпапка ресурса с test1.txt для каждого теста."""
+        local = Path(SMB_SHARE_DIR) / f"t{uuid.uuid4().hex[:12]}"
+        local.mkdir()
+        (local / "test1.txt").write_text("Test content 1")
+        yield local
+        shutil.rmtree(local, ignore_errors=True)
+
+    @staticmethod
+    def unc(host, local):
+        """Вернуть UNC-путь к подпапке ресурса через хост host."""
+        return f"\\\\{host}\\{SMB_SHARE_NAME}\\{local.name}"
+
+    def test_download_over_unc(self, share_dir):
+        """Проверить список и скачивание по UNC-пути ресурса."""
+        (share_dir / "Payment.txt").write_text("payment")
+        client = TestClient(
+            reload_app(files_directory=self.unc("localhost", share_dir))
+        )
+
+        data = client.get("/files").json()
+        names = [f["name"] for f in data["availableFiles"]]
+        assert sorted(names) == ["Payment.txt", "test1.txt"]
+
+        response = client.get("/files/test1.txt")
+        assert response.status_code == 200
+        assert response.content == b"Test content 1"
+
+        # Настоящее имя файла на ресурсе ищется по SMB
+        response = client.get("/files/PAYMENT.TXT")
+        assert response.status_code == 200
+        assert response.content == b"payment"
+        assert 'filename="Payment.txt"' in response.headers["content-disposition"]
+
+        response = client.get("/files/missing.txt")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "File not found"
+
+    def test_share_access_denied(self, share_dir):
+        """Проверить: запрет доступа к ресурсу — 403."""
+        # Права ресурса проверяются при подключении к нему, поэтому
+        # нужно новое подключение: по имени компьютера, а не localhost,
+        # к которому могли подключиться другие тесты
+        files_directory = self.unc(os.environ["COMPUTERNAME"], share_dir)
+        smb_share(SMB_SHARE_BLOCK)
+        try:
+            client = TestClient(reload_app(files_directory=files_directory))
+            listing = client.get("/files")
+            download = client.get("/files/test1.txt")
+        finally:
+            smb_share(SMB_SHARE_UNBLOCK)
+
+        assert listing.status_code == 403
+        assert listing.json()["detail"].startswith(
+            "Permission denied when reading directory:"
+        )
+        assert download.status_code == 403
+        assert download.json()["detail"] == "Permission denied when reading file"
+
+    def test_share_removed_and_restored(self, share_dir):
+        """Проверить: пропавший ресурс — 404, вернувшийся — снова 200.
+
+        Сервис не перезапускается: тот же клиент до и после.
+        """
+        client = TestClient(
+            reload_app(files_directory=self.unc("localhost", share_dir))
+        )
+        assert client.get("/files").status_code == 200
+
+        smb_share(SMB_SHARE_REMOVE)
+        try:
+            listing, listing_statuses = wait_for_status(client, "/files", 404)
+            download, download_statuses = wait_for_status(
+                client, "/files/test1.txt", 404
+            )
+        finally:
+            smb_share(SMB_SHARE_CREATE)
+
+        # Пока кэш SMB-клиента не устарел, возможен прежний ответ, а
+        # в момент удаления — сбой ОС (500); итог — 404
+        assert listing.status_code == 404, listing_statuses
+        assert listing.json()["detail"] == "Files directory not found"
+        assert set(listing_statuses) <= {200, 404, 500}, listing_statuses
+        assert download.status_code == 404, download_statuses
+        assert download.json()["detail"] == "File not found"
+        assert set(download_statuses) <= {200, 404, 500}, download_statuses
+
+        listing, statuses = wait_for_status(client, "/files", 200)
+        assert listing.status_code == 200, statuses
+        names = [f["name"] for f in listing.json()["availableFiles"]]
+        assert names == ["test1.txt"]
+        response, statuses = wait_for_status(client, "/files/test1.txt", 200)
+        assert response.status_code == 200, statuses
+        assert response.content == b"Test content 1"
 
 
 class TestCORSConfiguration:
@@ -599,7 +1130,56 @@ class TestCORSConfiguration:
         response = client.get("/files", headers={"Origin": "http://example.com"})
         assert response.status_code == 200
         # Должно вернуться к разрешению всех источников
-        assert "access-control-allow-origin" in response.headers
+        assert response.headers["access-control-allow-origin"] == "*"
+        assert "access-control-allow-credentials" not in response.headers
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (
+                " http://a.example , ,http://b.example ",
+                ["http://a.example", "http://b.example"],
+            ),
+            (" , ", ["*"]),
+            ("", ["*"]),
+        ],
+    )
+    def test_cors_origins_parsing(self, value, expected):
+        """Проверить: пробелы и пустые элементы отбрасываются."""
+        from app.settings import Settings
+
+        assert Settings(cors_origins=value).cors_origins_list == expected
+
+    def test_cors_origins_from_dotenv(self, monkeypatch, tmp_path, test_files_dir):
+        """Проверить: CORS_ORIGINS читается из .env рабочей папки."""
+        monkeypatch.delenv("CORS_ORIGINS", raising=False)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "CORS_ORIGINS=http://localhost:3000\n", encoding="utf-8"
+        )
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files", headers={"Origin": "http://localhost:3000"})
+        assert (
+            response.headers["access-control-allow-origin"] == "http://localhost:3000"
+        )
+        assert response.headers["access-control-allow-credentials"] == "true"
+
+    def test_cors_preflight_allows_any_method_and_header(self, client):
+        """Проверить: preflight разрешает любые методы и заголовки."""
+        response = client.options(
+            "/files",
+            headers={
+                "Origin": "http://example.com",
+                "Access-Control-Request-Method": "DELETE",
+                "Access-Control-Request-Headers": "X-Custom-Header",
+            },
+        )
+        assert response.status_code == 200
+        assert "DELETE" in response.headers["access-control-allow-methods"]
+        assert "x-custom-header" in (
+            response.headers["access-control-allow-headers"].lower()
+        )
 
 
 class TestEdgeCases:
@@ -642,6 +1222,25 @@ class TestEdgeCases:
             assert response.status_code == 200
             assert response.content == b"Special content"
 
+    def test_cyrillic_filename(self, tmp_path):
+        """Проверить имя на кириллице: в списке и при скачивании.
+
+        Имя не из ASCII передаётся в Content-Disposition через
+        filename* (RFC 5987).
+        """
+        name = "Платёжка №1.txt"
+        (tmp_path / name).write_text("content", encoding="utf-8")
+        client = TestClient(reload_app(files_directory=str(tmp_path)))
+
+        names = [f["id"] for f in client.get("/files").json()["availableFiles"]]
+        assert names == [name]
+        response = client.get("/files/" + quote(name))
+        assert response.status_code == 200
+        assert response.content == b"content"
+        assert response.headers["content-disposition"] == (
+            f"attachment; filename*=utf-8''{quote(name)}"
+        )
+
     def test_large_file_listing(self):
         """Проверить вывод списка директории с большим количеством
         файлов.
@@ -678,11 +1277,43 @@ class TestAPIDocumentation:
         assert "info" in schema
         assert schema["info"]["title"] == "File Picker API"
 
+    def test_openapi_schema_version(self, client):
+        """Проверить, что версия в схеме — версия пакета."""
+        import app
+
+        schema = client.get("/openapi.json").json()
+        assert schema["info"]["version"] == app.__version__
+
+    def test_openapi_schema_describes_files_endpoints(self, client):
+        """Проверить описание эндпоинтов /files и моделей ответа."""
+        schema = client.get("/openapi.json").json()
+
+        assert "get" in schema["paths"]["/files"]
+        download = schema["paths"]["/files/{fileId}"]["get"]
+        assert [p["name"] for p in download["parameters"]] == ["fileId"]
+        models = schema["components"]["schemas"]
+        assert set(models["FileListResponse"]["properties"]) == {
+            "availableFiles",
+            "unavailableFiles",
+        }
+        assert set(models["FileInfo"]["properties"]) == {
+            "id",
+            "name",
+            "size",
+            "createdAt",
+        }
+
     def test_docs_endpoint_accessible(self, client):
         """Проверить, что конечная точка /docs доступна."""
         response = client.get("/docs")
         assert response.status_code == 200
-        assert "swagger" in response.text.lower() or "html" in response.text.lower()
+        assert "swagger-ui" in response.text
+
+    def test_redoc_endpoint_accessible(self, client):
+        """Проверить, что конечная точка /redoc доступна."""
+        response = client.get("/redoc")
+        assert response.status_code == 200
+        assert "redoc" in response.text
 
     def test_openapi_version_without_installed_package(
         self, test_files_dir, monkeypatch
@@ -767,7 +1398,9 @@ class TestExceptionHandling:
         ("error", "status_code", "prefix"),
         [
             (PermissionError("Access is denied"), 403, "Permission denied"),
-            (OSError("Network path not found"), 500, "OS error"),
+            # Не «сетевой путь не найден»: на Windows это
+            # FileNotFoundError и 404 (см. *_network_path_not_found)
+            (OSError(errno.EIO, "Input/output error"), 500, "OS error"),
         ],
     )
     def test_list_files_directory_check_error(self, error, status_code, prefix):
@@ -785,19 +1418,105 @@ class TestExceptionHandling:
         ("error", "status_code", "prefix"),
         [
             (PermissionError("Access is denied"), 403, "Permission denied"),
-            (OSError("Network path not found"), 500, "OS error"),
+            # Не «сетевой путь не найден»: на Windows это
+            # FileNotFoundError и 404 (см. *_network_path_not_found)
+            (OSError(errno.EIO, "Input/output error"), 500, "OS error"),
         ],
     )
-    def test_download_file_check_error(self, client, error, status_code, prefix):
+    def test_download_file_check_error(
+        self, client, caplog, error, status_code, prefix
+    ):
         """Проверить ошибку ОС при проверке скачиваемого файла.
 
         Текст исходной ошибки (с путём к сетевой папке) в ответ не
-        попадает.
+        попадает, а пишется в лог.
         """
         with fail_stat_for("test1.txt", error):
             response = client.get("/files/test1.txt")
         assert response.status_code == status_code
         assert response.json()["detail"] == f"{prefix} when reading file"
+        assert str(error) in caplog.text
+        assert "test1.txt" in caplog.text
+
+    @windows_only
+    @pytest.mark.parametrize("winerror", [53, 67])
+    def test_list_files_network_path_not_found(self, winerror):
+        """Проверить: «сетевой путь не найден» на Windows — 404.
+
+        ERROR_BAD_NETPATH (53) и ERROR_BAD_NET_NAME (67) Python
+        превращает в FileNotFoundError.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = TestClient(reload_app(files_directory=tmpdir))
+            error = OSError(None, "The network path was not found", None, winerror)
+            with mock.patch("pathlib.Path.stat", side_effect=error):
+                response = client.get("/files")
+            assert response.status_code == 404
+            assert response.json()["detail"] == "Files directory not found"
+
+    @windows_only
+    @pytest.mark.parametrize(
+        "file_id", ["a%2A.txt", "a%3F.txt", "a%3Cb.txt", "a%3Eb.txt", "a%7Cb.txt"]
+    )
+    def test_download_invalid_chars_on_windows(self, client, file_id):
+        """Проверить: имя с недопустимыми в Windows символами — 400."""
+        response = client.get("/files/" + file_id)
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    @windows_only
+    @pytest.mark.parametrize(
+        "file_id", ["NUL", "nul.txt", "CON", "COM1.txt", "COM0.txt", "AUX", "CONIN$"]
+    )
+    def test_download_reserved_device_names_on_windows(self, client, file_id):
+        """Проверить: имя устройства — 400 без обращения к ФС."""
+        error = AssertionError("resolve() must not be called")
+        with mock.patch("pathlib.Path.resolve", side_effect=error):
+            response = client.get("/files/" + file_id)
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "console.txt",
+            "COM10.txt",
+            "LPT00.txt",
+            "nul_report.txt",
+            "LPT.txt",
+            "xcon.txt",
+        ],
+    )
+    def test_download_name_resembling_device(self, test_files_dir, name):
+        """Проверить: имя, похожее на имя устройства, скачивается."""
+        (Path(test_files_dir) / name).write_text("content")
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        with as_windows():
+            response = client.get("/files/" + name)
+        assert response.status_code == 200
+        assert response.content == b"content"
+
+    def test_list_files_skips_device_name(self, test_files_dir):
+        """Проверить: файл с именем устройства не попадает в список.
+
+        Скачать его нельзя (400), поэтому и показывать нельзя. На
+        Windows 10 такой файл не создать: запись уходит в устройство.
+        """
+        try:
+            (Path(test_files_dir) / "nul.txt").write_text("device")
+        except OSError:
+            pytest.skip("ОС не даёт создать файл с именем устройства")
+        if "nul.txt" not in [p.name for p in Path(test_files_dir).iterdir()]:
+            pytest.skip("ОС не даёт создать файл с именем устройства")
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        with as_windows():
+            data = client.get("/files").json()
+            download = client.get("/files/nul.txt")
+        names = [f["name"] for f in data["availableFiles"] + data["unavailableFiles"]]
+        assert sorted(names) == ["test1.txt", "test2.txt"]
+        assert download.status_code == 400
 
     @pytest.mark.parametrize(
         "error",
@@ -838,6 +1557,7 @@ class TestExceptionHandling:
         assert response.status_code == 400
         assert response.json()["detail"] == "Invalid filename"
 
+    @resolves_paths
     def test_download_symlink_loop_on_python_311(self, client):
         """Проверить RuntimeError из resolve() при петле ссылок."""
         error = RuntimeError("Symlink loop from 'loop.txt'")
@@ -887,6 +1607,100 @@ class TestExceptionHandling:
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail == "Invalid filename"
 
+    @windows_only
+    @pytest.mark.parametrize(
+        "file_id",
+        [
+            # UNC-пути в любом написании и пути к устройствам
+            r"\\attacker\s\x.txt",
+            "//attacker/s/x.txt",
+            r"\/attacker\s\x.txt",
+            r"\\attacker",
+            r"\\?\UNC\attacker\s\x.txt",
+            r"\\?\C:\Windows\win.ini",
+            r"\\.\C:\Windows\win.ini",
+            r"\\.\pipe\x",
+            r"\??\C:\Windows\win.ini",
+            # Диск и корень диска
+            r"C:\x.txt",
+            "C:/x.txt",
+            r"\Windows\win.ini",
+            # Разделители и точки
+            r"subdir\inner.txt",
+            r"subdir\..\test1.txt",
+            "test1.txt\\",
+            r".\test1.txt",
+            r"..\main.py",
+            "test1.txt. .",
+            # Альтернативный поток NTFS
+            "test1.txt::$DATA",
+        ],
+    )
+    def test_security_rejects_windows_paths_before_fs_access(
+        self, test_files_dir, file_id
+    ):
+        """Проверить отказ для пути Windows до обращения к ФС.
+
+        UNC-путь заменил бы директорию при склейке, и resolve()
+        подключился бы к чужому хосту, отдав ему NTLM-хеш.
+        """
+        from fastapi import HTTPException
+
+        reload_app(files_directory=test_files_dir)
+        from app.handlers.files import get_file
+
+        error = AssertionError("resolve() must not be called")
+        with (
+            mock.patch("pathlib.Path.resolve", side_effect=error),
+            mock.patch("pathlib.Path.stat", side_effect=error),
+            pytest.raises(HTTPException) as exc_info,
+        ):
+            get_file(file_id)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "Invalid filename"
+
+    @windows_only
+    @pytest.mark.parametrize(
+        "url", ["/files/%5C%5Cattacker%5Cs%5Cx.txt", "/files/subdir%5Cinner.txt"]
+    )
+    def test_security_rejects_windows_paths_over_http(self, client, url):
+        """Проверить отказ для UNC-пути и обратного слэша в URL."""
+        error = AssertionError("resolve() must not be called")
+        with mock.patch("pathlib.Path.resolve", side_effect=error):
+            response = client.get(url)
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
+
+    @windows_only
+    @pytest.mark.parametrize(
+        "unc_prefix", ["\\\\localhost\\", "\\\\?\\UNC\\localhost\\"]
+    )
+    def test_unc_files_directory(self, tmp_path, unc_prefix):
+        """Проверить работу с директорией по UNC-пути, как в сборке.
+
+        Сетевую папку заменяет административный ресурс диска (C$) этой
+        же машины. Без него тест пропускается, а в CI
+        (REQUIRE_UNC_SHARE) падает: пропуск скрыл бы непроверенный
+        сценарий.
+        """
+        local = tmp_path.resolve()
+        unc = f"{unc_prefix}{local.drive[0]}${str(local)[2:]}"
+        if not Path(unc).is_dir():
+            msg = f"Административный ресурс недоступен: {unc}"
+            if os.environ.get("REQUIRE_UNC_SHARE"):
+                pytest.fail(msg)
+            pytest.skip(msg)
+        (local / "test1.txt").write_text("Test content 1")
+        client = TestClient(reload_app(files_directory=unc))
+
+        names = [f["name"] for f in client.get("/files").json()["availableFiles"]]
+        assert names == ["test1.txt"]
+        # Скачивание по UNC-пути: lstat() и поиск настоящего имени в
+        # директории ресурса, без resolve()
+        response = client.get("/files/test1.txt")
+        assert response.status_code == 200
+        assert response.content == b"Test content 1"
+
     def test_security_rejects_full_path_inside_directory(self, test_files_dir):
         """Проверить отказ для полного пути даже к своему файлу."""
         from fastapi import HTTPException
@@ -903,7 +1717,35 @@ class TestExceptionHandling:
         assert exc_info.value.status_code == 400
 
     @pytest.mark.parametrize(
-        "file_id", ["test1.txt:stream", "C:x.txt", ".. ", "...", "test1.txt."]
+        "file_id",
+        [
+            "test1.txt:stream",
+            "C:x.txt",
+            ".. ",
+            "...",
+            "test1.txt.",
+            # Имена устройств, в том числе с расширением и пробелами
+            "CON",
+            "prn",
+            "nul.txt",
+            "NUL .txt",
+            "aux.tar.gz",
+            "com1.txt",
+            "COM9",
+            "COM0.txt",
+            "lpt0.TXT",
+            "LPT9.log",
+            "LPT\xb9",
+            "CONIN$",
+            "conout$.txt",
+            # Недопустимые символы, они же шаблоны поиска Windows
+            "a*.txt",
+            "a?.txt",
+            'a"b.txt',
+            "a<b.txt",
+            "a>b.txt",
+            "a|b.txt",
+        ],
     )
     def test_security_rejects_windows_only_names(self, test_files_dir, file_id):
         """Проверить отказ для имён, недопустимых на Windows."""
@@ -929,6 +1771,7 @@ class TestExceptionHandling:
             RuntimeError("Symlink loop from '/secret/share'"),
         ],
     )
+    @resolves_paths
     def test_base_directory_error_does_not_leak_path(self, test_files_dir, error):
         """Проверить: сбой resolve() базы — 500 без пути в detail."""
         client = TestClient(reload_app(files_directory=test_files_dir))
@@ -966,12 +1809,14 @@ class TestExceptionHandling:
         assert names == ["test1.txt"]
 
     def test_list_files_ignores_directory_named_txt(self, test_files_dir):
-        """Проверить, что директория *.txt не попадает в список."""
+        """Проверить: директории и файлы в них не попадают в список."""
         (Path(test_files_dir) / "folder.txt").mkdir()
+        (Path(test_files_dir) / "folder.txt" / "nested.txt").write_text("x")
+        (Path(test_files_dir) / "subdir" / "inner.txt").write_text("x")
         client = TestClient(reload_app(files_directory=test_files_dir))
-        response = client.get("/files")
-        names = [f["name"] for f in response.json()["availableFiles"]]
-        assert "folder.txt" not in names
+        data = client.get("/files").json()
+        names = [f["name"] for f in data["availableFiles"] + data["unavailableFiles"]]
+        assert sorted(names) == ["test1.txt", "test2.txt"]
 
     def test_list_files_skips_invalid_name(self, client):
         """Проверить пропуск файла с ошибкой «недопустимое имя»."""
@@ -1100,6 +1945,7 @@ class TestListingScandir:
         assert response.status_code == 200
         assert scandir.call_count == 1
 
+    @follows_symlinks
     def test_list_files_follows_symlink_to_file(self, test_files_dir):
         """Проверить: ссылка на файл в списке с атрибутами цели."""
         target = Path(test_files_dir) / "target.txt"
@@ -1170,6 +2016,7 @@ def fail_strict_resolve(directory):
 class TestFilesDirectoryCache:
     """Тесты кэша разрешённого пути к директории с файлами."""
 
+    @resolves_paths
     def test_directory_resolved_once(self, client, test_files_dir):
         """Проверить, что путь к директории разрешается один раз."""
         patch, calls = count_resolve(test_files_dir)
@@ -1178,6 +2025,7 @@ class TestFilesDirectoryCache:
                 assert client.get("/files/test1.txt").status_code == 200
         assert calls == [True]
 
+    @resolves_paths
     def test_error_does_not_fill_cache(self, client, test_files_dir):
         """Проверить, что при сбое директории кэш не заполняется."""
         error = OSError(errno.EIO, "Network error")
@@ -1191,6 +2039,7 @@ class TestFilesDirectoryCache:
                 assert client.get("/files/test1.txt").status_code == 200
         assert calls == [True]
 
+    @resolves_paths
     def test_unavailable_directory_is_not_cached(self, client, test_files_dir):
         """Проверить: нестрогий resolve() не попадает в кэш.
 
@@ -1229,10 +2078,64 @@ class TestFilesDirectoryCache:
         assert response.status_code == 200
         assert response.content == b"content"
 
-    def test_stale_cache_is_refreshed(self, tmp_path):
-        """Проверить: устаревший путь в кэше разрешается заново.
+    def test_listing_recovers_when_directory_appears(self, tmp_path):
+        """Проверить: список снова работает, когда папка появилась.
 
-        Например, DFS переключил сетевую папку на другой сервер.
+        Сценарий «Сетевая папка снова доступна»: без перезапуска сервиса
+        следующий GET /files отвечает 200.
+        """
+        files_dir = tmp_path / "share"
+        client = TestClient(reload_app(files_directory=str(files_dir)))
+
+        response = client.get("/files")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Files directory not found"
+
+        files_dir.mkdir()
+        (files_dir / "test1.txt").write_text("content")
+        response = client.get("/files")
+        assert response.status_code == 200
+        names = [f["name"] for f in response.json()["availableFiles"]]
+        assert names == ["test1.txt"]
+
+    @pytest.mark.parametrize(
+        ("error", "status_code"),
+        [
+            (FileNotFoundError(errno.ENOENT, "The network path was not found"), 404),
+            (OSError(errno.EIO, "The network name is no longer available"), 500),
+        ],
+    )
+    def test_listing_and_download_recover_after_network_error(
+        self, client, test_files_dir, error, status_code
+    ):
+        """Проверить восстановление после сбоя сетевой папки.
+
+        Пока папка недоступна, строгий resolve() директории и stat() и
+        lstat() директории и файла падают, а нестрогий resolve()
+        отрабатывает — так ведёт себя недоступная сетевая папка. После
+        сбоя оба эндпоинта работают без перезапуска: сбой не оставляет
+        следа в кэше пути директории.
+        """
+        with (
+            fail_strict_resolve(test_files_dir),
+            fail_stat_for((Path(test_files_dir).name, "test1.txt"), error),
+        ):
+            assert client.get("/files").status_code == status_code
+            assert client.get("/files/test1.txt").status_code == status_code
+
+        response = client.get("/files")
+        assert response.status_code == 200
+        assert len(response.json()["availableFiles"]) == 2
+        download = client.get("/files/test1.txt")
+        assert download.status_code == 200
+        assert download.content == b"Test content 1"
+
+    def test_stale_cache_is_refreshed(self, tmp_path):
+        """Проверить: директория-ссылка перенаправлена — файл берётся
+        из новой цели.
+
+        Не на Windows устаревший путь в кэше разрешается заново; на
+        Windows кэша нет, и файл открывается по пути из настроек.
         """
         for name in ("a", "b"):
             (tmp_path / name).mkdir()
@@ -1243,11 +2146,12 @@ class TestFilesDirectoryCache:
         assert client.get("/files/test1.txt").content == b"a"
 
         link.unlink()
-        link.symlink_to(tmp_path / "b")
+        link.symlink_to(tmp_path / "b", target_is_directory=True)
         response = client.get("/files/test1.txt")
         assert response.status_code == 200
         assert response.content == b"b"
 
+    @follows_symlinks
     @pytest.mark.usefixtures("subdir_link")
     def test_cache_is_refreshed_before_rejecting(self, test_files_dir):
         """Проверить: перед отказом 400 путь разрешается заново.
@@ -1266,6 +2170,7 @@ class TestFilesDirectoryCache:
         assert response.json()["detail"] == "Invalid filename"
         assert calls == [True]
 
+    @follows_symlinks
     @pytest.mark.usefixtures("subdir_link")
     def test_refresh_unavailable_directory_is_server_error(self, test_files_dir):
         """Проверить: папка, недоступная при повторной проверке, — 500.
@@ -1287,6 +2192,7 @@ class TestFilesDirectoryCache:
             assert client.get("/files/test1.txt").status_code == 200
         assert calls == [True]
 
+    @resolves_paths
     @pytest.mark.usefixtures("subdir_link")
     def test_fresh_directory_is_not_resolved_twice(self, test_files_dir):
         """Проверить: свежий путь директории не перепроверяется."""
@@ -1299,6 +2205,7 @@ class TestFilesDirectoryCache:
         assert response.json()["detail"] == "Invalid filename"
         assert calls == [True]
 
+    @resolves_paths
     @pytest.mark.usefixtures("subdir_link")
     def test_unavailable_directory_rejects_as_before(self, test_files_dir):
         """Проверить: без кэша несовпадение даёт 400, как и раньше.
@@ -1312,6 +2219,7 @@ class TestFilesDirectoryCache:
         assert response.status_code == 400
         assert response.json()["detail"] == "Invalid filename"
 
+    @follows_symlinks
     @pytest.mark.usefixtures("subdir_link")
     @pytest.mark.parametrize(
         "error",
@@ -1364,8 +2272,10 @@ class TestMainExecution:
                 namespace = {"__name__": "__main__"}
                 exec(code, namespace)
 
-                # Проверяем, что uvicorn.run был вызван
-                assert mock_run.called
+                # Сервис слушает все интерфейсы на порту 8000
+                mock_run.assert_called_once_with(
+                    namespace["app"], host="0.0.0.0", port=8000
+                )
                 # Проверяем, что директория была создана
                 assert files_dir.exists()
 
@@ -1423,6 +2333,63 @@ class TestFilesDirectoryIsFixed:
 
         with pytest.raises(ValidationError):
             settings_module.Settings()
+
+    @pytest.fixture
+    def served_dir(self, settings_module, monkeypatch, tmp_path):  # noqa: ARG002
+        """Директория, зашитая в сборку, и директория злоумышленника.
+
+        Путь задаётся так же, как в сборке: через app._build_config.
+        Переменная окружения FILES_DIRECTORY указывает на чужую
+        директорию с файлом-меткой. settings_module нужна ради её
+        завершения: она снимает эти подмены и перезагружает приложение.
+        """
+        served = tmp_path / "served"
+        attacker = tmp_path / "attacker"
+        attacker.mkdir()
+        (attacker / "marker.txt").write_text("attacker")
+
+        build_config = types.ModuleType("app._build_config")
+        build_config.FILES_DIRECTORY = str(served)
+        monkeypatch.setitem(sys.modules, "app._build_config", build_config)
+        monkeypatch.setenv("FILES_DIRECTORY", str(attacker))
+        return served, attacker
+
+    def test_build_config_directory_is_served(self, served_dir):
+        """Проверить: API работает с директорией из сборки, а
+        переменная окружения не подменяет её.
+        """
+        served, _ = served_dir
+        served.mkdir()
+        (served / "payment.txt").write_text("payment")
+        client = TestClient(reload_app())
+
+        data = client.get("/files").json()
+        assert [f["name"] for f in data["availableFiles"]] == ["payment.txt"]
+        assert client.get("/files/payment.txt").content == b"payment"
+        response = client.get("/files/marker.txt")
+        assert response.status_code == 404
+
+    def test_command_line_does_not_override(self, served_dir, monkeypatch):
+        """Проверить: аргументы командной строки не задают директорию.
+
+        При запуске создаётся директория из сборки, а не переданная.
+        """
+        served, attacker = served_dir
+        other = attacker.parent / "from_argv"
+        monkeypatch.setattr(
+            sys, "argv", ["FilePickerAPI.exe", "--files-directory", str(other)]
+        )
+        reload_app()
+
+        main_file = Path(__file__).parent.parent / "app" / "__main__.py"
+        code = compile(main_file.read_text(encoding="utf-8"), str(main_file), "exec")
+        namespace = {"__name__": "__main__"}
+        with mock.patch("uvicorn.run") as mock_run:
+            exec(code, namespace)
+
+        mock_run.assert_called_once_with(namespace["app"], host="0.0.0.0", port=8000)
+        assert served.is_dir()
+        assert not other.exists()
 
     def test_constructor_argument_does_not_override(self, settings_module):
         """Проверить, что путь нельзя передать при создании настроек."""
