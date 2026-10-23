@@ -107,7 +107,10 @@ context: |
     .claude/**, .github/openspec/**); для неё .github/workflows/docs.yml
     на Ubuntu запускает openspec validate --all --strict (openspec
     закреплён в .github/openspec/package-lock.json); отдельный джоб
-    npm-audit там же проверяет пакеты openspec раз в три дня и вручную.
+    npm-audit там же проверяет пакеты openspec раз в три дня, вручную
+    и в push/PR с изменениями .github/openspec. О падении планового
+    запуска GitHub пишет только автору последней правки cron, поэтому
+    падения смотреть в Actions и по бейджам.
     Совпадение списков путей в трёх файлах проверяет
     tests/test_workflows.py
   - .github/dependabot.yml: еженедельные обновления pip, GitHub Actions

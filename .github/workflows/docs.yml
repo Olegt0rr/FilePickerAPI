@@ -22,7 +22,9 @@ on:
     paths: *docs
   # Только для джоба npm-audit: CVE в npm-пакетах openspec выходят без
   # коммитов в репозиторий. Дни 1, 4, 7, … месяца: на стыке месяцев
-  # интервал бывает 1–2 дня
+  # интервал бывает 1–2 дня. О падении GitHub пишет только тому, кто
+  # последним менял cron, а через 60 дней без активности в репозитории
+  # отключает расписание (см. README, раздел Docs)
   schedule:
     - cron: '0 4 */3 * *'  # раз в три дня, 07:00 МСК
   workflow_dispatch:
@@ -66,10 +68,13 @@ jobs:
 
   # pip-audit в audit.yml проверяет только Python-пакеты, поэтому
   # npm-пакеты openspec, которые выполняются в джобе выше, проверяем
-  # здесь: раз в три дня и вручную. Релиз и проверку спецификаций это
-  # не блокирует: в exe эти пакеты не попадают.
+  # здесь: раз в три дня, вручную и в push/PR, которые меняют
+  # .github/openspec (в том числе PR Dependabot). Релиз и проверку
+  # спецификаций это не блокирует: в exe эти пакеты не попадают.
+  # Dependabot alerts по тому же package-lock.json видны только
+  # администраторам репозитория и ничего не роняют, а этот джоб виден
+  # всем в Actions, поэтому он остаётся и при включённых alerts.
   npm-audit:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -77,14 +82,29 @@ jobs:
     steps:
     - uses: actions/checkout@v7
       with:
-        sparse-checkout: .github/openspec
+        fetch-depth: 0  # для сравнения с базой push/PR
+
+    # В push и PR аудит нужен, только если менялся .github/openspec;
+    # по расписанию и вручную шаг пропускается, и аудит идёт всегда.
+    # Если базу сравнить не удалось, аудит тоже выполняется.
+    - name: Check openspec changes
+      id: changes
+      if: github.event_name == 'push' || github.event_name == 'pull_request'
+      env:
+        BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        if git diff --quiet "$BASE" HEAD -- .github/openspec; then
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Set up Node
+      if: steps.changes.outputs.changed != 'false'
       uses: actions/setup-node@v7
       with:
         node-version: '24'
 
     # npm audit читает только package-lock.json, ставить пакеты не нужно
     - name: Audit openspec packages
+      if: steps.changes.outputs.changed != 'false'
       working-directory: .github/openspec
       run: npm audit --audit-level=low
