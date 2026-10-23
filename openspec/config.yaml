@@ -84,6 +84,9 @@ context: |
   - ruff check app tests scripts
   - ruff format --check app tests scripts
   - pytest
+  - openspec validate --all --strict (версия из .github/openspec:
+    npm ci --prefix .github/openspec, затем
+    npm exec --prefix .github/openspec -- openspec validate --all --strict)
 
   ## CI/CD
   - .github/workflows/build-exe.yml: ruff + pytest на Ubuntu и pytest на
@@ -103,8 +106,9 @@ context: |
     изменена только документация (paths-ignore: **.md, openspec/**,
     .claude/**, .github/openspec/**); для неё .github/workflows/docs.yml
     на Ubuntu запускает openspec validate --all --strict (openspec
-    закреплён в .github/openspec/package-lock.json). Совпадение списков
-    путей в трёх файлах проверяет tests/test_workflows.py
+    закреплён в .github/openspec/package-lock.json) и npm audit его
+    пакетов; npm audit ещё и ежедневно. Совпадение списков путей в трёх
+    файлах проверяет tests/test_workflows.py
   - .github/dependabot.yml: еженедельные обновления pip, GitHub Actions
     и npm (.github/openspec)
 

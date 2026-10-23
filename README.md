@@ -261,13 +261,15 @@ pytest
 
 Изменения поведения начинаются с предложения (`/opsx:propose` в Claude Code или `openspec new change`), а после реализации архивируются (`openspec archive`), обновляя `openspec/specs/`.
 
+Версия openspec закреплена в `.github/openspec/package-lock.json` — той же версией проверяет CI. Установите её и запускайте из корня репозитория:
+
 ```bash
-npm install -g @fission-ai/openspec
-openspec list --specs
-openspec validate --all --strict
+npm ci --prefix .github/openspec
+npm exec --prefix .github/openspec -- openspec list --specs
+npm exec --prefix .github/openspec -- openspec validate --all --strict
 ```
 
-Ту же проверку (`--all`: спецификации и незаархивированные изменения) выполняет CI в workflow Docs.
+Ту же проверку (`--all`: спецификации и незаархивированные изменения) выполняет CI в workflow Docs. Если openspec установлен глобально (нужен для `/opsx:*` в Claude Code), держите его версию такой же: `npm install -g @fission-ai/openspec@<версия из package.json>`.
 
 ### Локальная сборка исполняемого файла
 
@@ -347,10 +349,11 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 ### Docs (`.github/workflows/docs.yml`)
 
-Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет спецификации и незаархивированные изменения OpenSpec командой `openspec validate --all --strict`. Версии Node и openspec закреплены: openspec со всеми зависимостями — в `.github/openspec/package-lock.json`, его обновляет Dependabot. Списки путей в трёх workflow сверяет тест `tests/test_workflows.py`.
+Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет спецификации и незаархивированные изменения OpenSpec командой `openspec validate --all --strict`. Версии Node и openspec закреплены: openspec со всеми зависимостями — в `.github/openspec/package-lock.json`, его обновляет Dependabot. Эти npm-пакеты проверяются на уязвимости (`npm audit`); релиз это не блокирует, в exe они не попадают. Списки путей в трёх workflow сверяет тест `tests/test_workflows.py`.
 
 Триггеры workflow:
 - Push и pull request в ветку main/master, если изменены `*.md`, `openspec/`, `.claude/`, `.github/openspec/` или сам `docs.yml`
+- Ежедневно по расписанию (новые уязвимости в npm-пакетах)
 - Ручной запуск workflow
 
 ### Release (`.github/workflows/release.yml`)

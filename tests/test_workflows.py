@@ -27,16 +27,19 @@ def anchored_list(workflow: str, key: str) -> list[str]:
     `- '...'`. pull_request ссылается на тот же якорь.
     """
     text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
-    match = re.search(
-        rf"^ +{re.escape(key)}: &[\w-]+\n((?: +- '[^']+'\n)+)", text, re.MULTILINE
+    key_re = re.escape(key)
+    lists = re.findall(
+        rf"^ +{key_re}: &([\w-]+)\n((?: +- '[^']+'\n)+)", text, re.MULTILINE
     )
-    assert match, f"{workflow}: нет списка {key} с якорем"
-    paths = re.findall(r"- '([^']+)'", match.group(1))
-    # Оба триггера используют один и тот же список
-    assert re.search(rf"^ +{re.escape(key)}: \*[\w-]+$", text, re.MULTILINE), (
-        f"{workflow}: pull_request не ссылается на список push"
+    assert len(lists) == 1, f"{workflow}: нужен ровно один список {key} с якорем"
+    [(anchor, items)] = lists
+    # Оба триггера используют один и тот же список: других значений
+    # у ключа, кроме самого списка и ссылки на его якорь, нет
+    values = re.findall(rf"^ +{key_re}:(.*)$", text, re.MULTILINE)
+    assert values == [f" &{anchor}", f" *{anchor}"], (
+        f"{workflow}: pull_request должен ссылаться на список push (*{anchor})"
     )
-    return paths
+    return re.findall(r"- '([^']+)'", items)
 
 
 @pytest.mark.parametrize("workflow", ["build-exe.yml", "audit.yml"])

@@ -20,6 +20,10 @@ on:
   pull_request:
     branches: [ main, master ]
     paths: *docs
+  # Ежедневно, как audit.yml: CVE в npm-пакетах openspec выходят без
+  # коммитов в репозиторий
+  schedule:
+    - cron: '0 4 * * *'  # ежедневно, 07:00 МСК
   workflow_dispatch:
 
 permissions:
@@ -49,6 +53,13 @@ jobs:
     - name: Install openspec
       working-directory: .github/openspec
       run: npm ci --ignore-scripts --no-audit --no-fund
+
+    # pip-audit в audit.yml проверяет только Python-пакеты, поэтому
+    # npm-пакеты, которые здесь выполняются, проверяем отдельно. Релиз
+    # это не блокирует: в exe они не попадают.
+    - name: Audit openspec packages
+      working-directory: .github/openspec
+      run: npm audit --audit-level=low
 
     - name: Validate OpenSpec specs and changes
       env:
