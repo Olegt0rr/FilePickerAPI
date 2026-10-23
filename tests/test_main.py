@@ -168,6 +168,25 @@ def fail_entry_stat_for(name, error):
     return wrap_entry_for(name, lambda entry: FailingEntry(entry, error))
 
 
+class NoFollowEntry:
+    """Обёртка DirEntry: stat() с переходом по ссылке — ошибка теста.
+
+    AssertionError в обработчике даёт ответ 500.
+    """
+
+    def __init__(self, entry):
+        self._entry = entry
+
+    def __getattr__(self, name):
+        return getattr(self._entry, name)
+
+    def stat(self, *, follow_symlinks=True):
+        if follow_symlinks:
+            msg = "DirEntry.stat() must not follow links"
+            raise AssertionError(msg)
+        return self._entry.stat(follow_symlinks=False)
+
+
 class TimedEntry:
     """Обёртка DirEntry, у которой stat() отдаёт заданное время."""
 
@@ -700,10 +719,10 @@ class TestWindowsSymlinks:
         )
         client = TestClient(reload_app(files_directory=test_files_dir))
 
-        # resolve() или stat() ссылки — уже переход по ней:
-        # AssertionError даст 500. stat(follow_symlinks=False) — это
-        # lstat() (так он устроен на Python 3.11), ссылку он не
-        # раскрывает
+        # resolve(), stat() или DirEntry.stat() ссылки с переходом — уже
+        # переход по ней: AssertionError даст 500.
+        # stat(follow_symlinks=False) — это lstat() (так он устроен на
+        # Python 3.11), ссылку он не раскрывает
         error = AssertionError("symlink must not be followed")
         original_stat = Path.stat
 
@@ -718,6 +737,7 @@ class TestWindowsSymlinks:
             mock.patch.object(
                 Path, "stat", autospec=True, side_effect=stat_without_following
             ),
+            wrap_entry_for("link.txt", NoFollowEntry),
         ):
             yield client
 
@@ -740,6 +760,40 @@ class TestWindowsSymlinks:
         response = link_client.get("/files/test1.txt")
         assert response.status_code == 200
         assert response.content == b"Test content 1"
+
+    def test_listing_reads_attributes_without_following(self, client):
+        """Проверить: на Windows атрибуты файлов списка читаются без
+        перехода по ссылкам (stat(follow_symlinks=False)).
+
+        Иначе junction, которую is_symlink() не распознаёт, увела бы
+        stat() к своей цели.
+        """
+        with as_windows(), wrap_entry_for("test1.txt", NoFollowEntry):
+            response = client.get("/files")
+        assert response.status_code == 200
+        files = {f["name"]: f for f in response.json()["availableFiles"]}
+        assert files["test1.txt"]["size"] == 14
+
+    @windows_only
+    def test_junction_not_followed(self, test_files_dir, tmp_path):
+        """Проверить: junction с именем .txt не показывается, не
+        скачивается, и сервис не идёт через неё к цели.
+        """
+        import _winapi
+
+        target = tmp_path / "target"
+        target.mkdir()
+        junction = Path(test_files_dir) / "redirect.txt"
+        _winapi.CreateJunction(str(target), str(junction))
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        with wrap_entry_for("redirect.txt", NoFollowEntry):
+            response = client.get("/files")
+        assert response.status_code == 200
+        data = response.json()
+        names = [f["name"] for f in data["availableFiles"] + data["unavailableFiles"]]
+        assert sorted(names) == ["test1.txt", "test2.txt"]
+        assert client.get("/files/redirect.txt").status_code == 400
 
 
 def short_name_or_skip(path):

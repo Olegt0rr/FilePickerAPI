@@ -329,8 +329,13 @@ def _stat_listed_item(
                 or target.suffix.lower() != ".txt"
             ):
                 return None, False
-        # Для ссылки stat() идёт к цели
-        file_stat = entry.stat()
+        # Для ссылки stat() идёт к цели. На Windows ни к какой цели не
+        # обращаемся: is_symlink() не распознаёт junction, а stat() с
+        # переходом пошёл бы через неё дальше (в том числе по ссылке на
+        # \\host\share). Без перехода junction — директория и
+        # отсеивается ниже, а для обычного файла атрибуты те же, что
+        # получены при перечислении
+        file_stat = entry.stat(follow_symlinks=sys.platform != "win32")
     except RuntimeError:
         # Петля ссылок в resolve() на Python 3.11
         return None, False
