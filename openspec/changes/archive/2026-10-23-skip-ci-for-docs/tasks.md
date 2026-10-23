@@ -6,7 +6,7 @@
 - [x] 1.2 Добавить тот же список в `audit.yml`; расписание, ручной запуск и `workflow_call` не трогать
 - [x] 1.3 Добавить `docs.yml`: те же пути и сам `docs.yml` в `paths`, Node 24 через `setup-node`, `npm ci` в `.github/openspec` и `openspec validate --all --strict` на Ubuntu
 - [x] 1.4 Закрепить openspec в `.github/openspec/package-lock.json`, добавить npm в Dependabot, `node_modules/` в `.gitignore`
-- [x] 1.5 `npm audit` пакетов openspec в `docs.yml` и ежедневный запуск `docs.yml` по расписанию
+- [x] 1.5 Отдельный джоб `npm-audit` в `docs.yml`: `npm audit` по `package-lock.json` раз в три дня и вручную; проверка спецификаций по расписанию не запускается
 - [x] 1.6 Тест `tests/test_workflows.py`: списки путей в трёх workflow совпадают, `pull_request` ссылается на список `push`, workflow сборки и аудита в них нет
 - [x] 1.7 Заархивировать `document-uncovered-behavior`, чтобы `validate --all --strict` проходил на `main`
 - [x] 1.8 Убедиться, что в ruleset `main` нет обязательных проверок статуса, иначе PR только с документацией не слить

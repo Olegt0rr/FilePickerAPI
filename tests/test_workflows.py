@@ -28,15 +28,22 @@ def anchored_list(workflow: str, key: str) -> list[str]:
     """
     text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
     key_re = re.escape(key)
+    comment = r"(?: +#[^\n]*)?"
     lists = re.findall(
-        rf"^ +{key_re}: &([\w-]+)\n((?: +- '[^']+'\n)+)", text, re.MULTILINE
+        rf"^ +{key_re}: &([\w-]+){comment}\n((?: +- '[^']+'{comment}\n)+)",
+        text,
+        re.MULTILINE,
     )
     assert len(lists) == 1, f"{workflow}: нужен ровно один список {key} с якорем"
     [(anchor, items)] = lists
     # Оба триггера используют один и тот же список: других значений
-    # у ключа, кроме самого списка и ссылки на его якорь, нет
-    values = re.findall(rf"^ +{key_re}:(.*)$", text, re.MULTILINE)
-    assert values == [f" &{anchor}", f" *{anchor}"], (
+    # у ключа, кроме самого списка и ссылки на его якорь, нет.
+    # Комментарий в конце строки не мешает
+    values = [
+        value.split("#", 1)[0].strip()
+        for value in re.findall(rf"^ +{key_re}:(.*)$", text, re.MULTILINE)
+    ]
+    assert values == [f"&{anchor}", f"*{anchor}"], (
         f"{workflow}: pull_request должен ссылаться на список push (*{anchor})"
     )
     return re.findall(r"- '([^']+)'", items)

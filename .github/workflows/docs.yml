@@ -20,10 +20,11 @@ on:
   pull_request:
     branches: [ main, master ]
     paths: *docs
-  # Ежедневно, как audit.yml: CVE в npm-пакетах openspec выходят без
-  # коммитов в репозиторий
+  # Только для джоба npm-audit: CVE в npm-пакетах openspec выходят без
+  # коммитов в репозиторий. Дни 1, 4, 7, … месяца: на стыке месяцев
+  # интервал бывает 1–2 дня
   schedule:
-    - cron: '0 4 * * *'  # ежедневно, 07:00 МСК
+    - cron: '0 4 */3 * *'  # раз в три дня, 07:00 МСК
   workflow_dispatch:
 
 permissions:
@@ -31,6 +32,8 @@ permissions:
 
 jobs:
   openspec:
+    # По расписанию спецификации не меняются, проверять их незачем
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -49,19 +52,39 @@ jobs:
 
     # openspec и все его зависимости закреплены в package-lock.json,
     # версии обновляет Dependabot (ecosystem npm). Скрипты пакетов при
-    # установке не выполняются: для проверки они не нужны.
+    # установке не выполняются: для проверки они не нужны. Уязвимости
+    # проверяет отдельный джоб npm-audit, чтобы они не мешали проверке
+    # спецификаций.
     - name: Install openspec
       working-directory: .github/openspec
       run: npm ci --ignore-scripts --no-audit --no-fund
-
-    # pip-audit в audit.yml проверяет только Python-пакеты, поэтому
-    # npm-пакеты, которые здесь выполняются, проверяем отдельно. Релиз
-    # это не блокирует: в exe они не попадают.
-    - name: Audit openspec packages
-      working-directory: .github/openspec
-      run: npm audit --audit-level=low
 
     - name: Validate OpenSpec specs and changes
       env:
         OPENSPEC_TELEMETRY: '0'
       run: .github/openspec/node_modules/.bin/openspec validate --all --strict
+
+  # pip-audit в audit.yml проверяет только Python-пакеты, поэтому
+  # npm-пакеты openspec, которые выполняются в джобе выше, проверяем
+  # здесь: раз в три дня и вручную. Релиз и проверку спецификаций это
+  # не блокирует: в exe эти пакеты не попадают.
+  npm-audit:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        sparse-checkout: .github/openspec
+
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+
+    # npm audit читает только package-lock.json, ставить пакеты не нужно
+    - name: Audit openspec packages
+      working-directory: .github/openspec
+      run: npm audit --audit-level=low

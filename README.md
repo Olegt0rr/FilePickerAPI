@@ -349,11 +349,11 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 ### Docs (`.github/workflows/docs.yml`)
 
-Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет спецификации и незаархивированные изменения OpenSpec командой `openspec validate --all --strict`. Версии Node и openspec закреплены: openspec со всеми зависимостями — в `.github/openspec/package-lock.json`, его обновляет Dependabot. Эти npm-пакеты проверяются на уязвимости (`npm audit`); релиз это не блокирует, в exe они не попадают. Списки путей в трёх workflow сверяет тест `tests/test_workflows.py`.
+Лёгкая проверка для изменений документации: на Ubuntu, без зависимостей проекта и сборки, проверяет спецификации и незаархивированные изменения OpenSpec командой `openspec validate --all --strict`. Версии Node и openspec закреплены: openspec со всеми зависимостями — в `.github/openspec/package-lock.json`, его обновляет Dependabot. Эти npm-пакеты проверяет на уязвимости (`npm audit`) отдельный джоб `npm-audit` раз в три дня и при ручном запуске. Проверку спецификаций и релиз он не блокирует: в exe эти пакеты не попадают. Списки путей в трёх workflow сверяет тест `tests/test_workflows.py`.
 
 Триггеры workflow:
 - Push и pull request в ветку main/master, если изменены `*.md`, `openspec/`, `.claude/`, `.github/openspec/` или сам `docs.yml`
-- Ежедневно по расписанию (новые уязвимости в npm-пакетах)
+- Раз в три дня по расписанию — только джоб `npm-audit` (новые уязвимости в npm-пакетах)
 - Ручной запуск workflow
 
 ### Release (`.github/workflows/release.yml`)
