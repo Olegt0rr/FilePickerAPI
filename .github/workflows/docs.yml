@@ -1,0 +1,123 @@
+name: Docs
+
+# Лёгкая проверка документации вместо полного CI: build-exe.yml и
+# audit.yml при изменении только *.md, openspec/, .claude/ и
+# .github/openspec/ не запускаются (paths-ignore), а здесь проверяются
+# спецификации и изменения OpenSpec. Работает на Ubuntu, без
+# зависимостей проекта и Nuitka. Список путей тот же, что в
+# paths-ignore build-exe.yml и audit.yml (сверяет
+# tests/test_workflows.py), плюс сам docs.yml: изменение workflow
+# проверяется в своём PR.
+on:
+  push:
+    branches: [ main, master ]
+    paths: &docs
+      - '**.md'
+      - 'openspec/**'
+      - '.claude/**'
+      - '.github/openspec/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths: *docs
+  # Только для джоба npm-audit: CVE в npm-пакетах openspec выходят без
+  # коммитов в репозиторий. Дни 1, 4, 7, … месяца: на стыке месяцев
+  # интервал бывает 1–2 дня. О падении GitHub пишет только тому, кто
+  # последним менял cron, а через 60 дней без активности в репозитории
+  # отключает расписание (см. README, раздел Docs)
+  schedule:
+    - cron: '0 4 */3 * *'  # раз в три дня, 07:00 МСК
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  openspec:
+    # По расписанию спецификации не меняются, проверять их незачем
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      openspec-changed: ${{ steps.changes.outputs.openspec-changed }}
+
+    steps:
+    - uses: actions/checkout@v7
+
+    # Для джоба npm-audit: менялся ли .github/openspec в этом push/PR.
+    # Хватает одного базового коммита (без всей истории); если его не
+    # удалось получить или сравнить, считаем, что менялся.
+    - name: Check openspec changes
+      id: changes
+      env:
+        BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        if git fetch --quiet --depth=1 origin "$BASE" &&
+           git diff --quiet "$BASE" HEAD -- .github/openspec; then
+          echo "openspec-changed=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "openspec-changed=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Node закреплён, а не берётся из образа раннера: обновление образа
+    # не должно ломать проверку
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+        cache: npm
+        cache-dependency-path: .github/openspec/package-lock.json
+
+    # openspec и все его зависимости закреплены в package-lock.json,
+    # версии обновляет Dependabot (ecosystem npm). Скрипты пакетов при
+    # установке не выполняются: для проверки они не нужны. Уязвимости
+    # проверяет отдельный джоб npm-audit, чтобы они не мешали проверке
+    # спецификаций.
+    - name: Install openspec
+      working-directory: .github/openspec
+      run: npm ci --ignore-scripts --no-audit --no-fund
+
+    - name: Validate OpenSpec specs and changes
+      env:
+        OPENSPEC_TELEMETRY: '0'
+      run: .github/openspec/node_modules/.bin/openspec validate --all --strict
+
+  # pip-audit в audit.yml проверяет только Python-пакеты, поэтому
+  # npm-пакеты openspec, которые выполняются в джобе выше, проверяем
+  # здесь: раз в три дня, вручную и в push/PR, которые меняют
+  # .github/openspec (в том числе PR Dependabot). Релиз и проверку
+  # спецификаций это не блокирует: в exe эти пакеты не попадают.
+  # Dependabot alerts по тому же package-lock.json видны только
+  # администраторам репозитория и ничего не роняют, а этот джоб виден
+  # всем в Actions, поэтому он остаётся и при включённых alerts.
+  #
+  # Решение принимается до старта джоба: в push/PR без изменений
+  # .github/openspec он не занимает раннер и в PR виден как skipped, а
+  # не как пройденный аудит. По расписанию джоб openspec пропущен, а
+  # !cancelled() не даёт пропустить из-за этого и npm-audit; падение
+  # проверки спецификаций аудит тоже не отменяет.
+  npm-audit:
+    needs: openspec
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      needs.openspec.outputs.openspec-changed == 'true') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        sparse-checkout: .github/openspec
+
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: '24'
+
+    # npm audit читает только package-lock.json, ставить пакеты не нужно
+    - name: Audit openspec packages
+      working-directory: .github/openspec
+      run: npm audit --audit-level=low

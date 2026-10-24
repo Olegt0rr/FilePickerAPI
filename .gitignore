@@ -51,3 +51,6 @@ coverage.xml
 
 # Сгенерированный при сборке путь филиала
 app/_build_config.py
+
+# openspec для docs.yml (npm ci в .github/openspec)
+node_modules/

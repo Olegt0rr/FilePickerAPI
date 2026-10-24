@@ -1,10 +1,22 @@
 name: Build and Test
 
+# Коммиты и PR, где изменена только документация (*.md, OpenSpec и
+# openspec для его проверки, инструкции агентов в .claude), тесты и
+# сборку не запускают: код и exe от них не меняются; для них есть
+# лёгкая проверка docs.yml. Если вместе с ними изменён любой другой
+# файл, workflow запускается целиком. Список одинаков в audit.yml и
+# docs.yml, это проверяет tests/test_workflows.py.
 on:
   push:
     branches: [ main, master ]
+    paths-ignore: &docs-only
+      - '**.md'
+      - 'openspec/**'
+      - '.claude/**'
+      - '.github/openspec/**'
   pull_request:
     branches: [ main, master ]
+    paths-ignore: *docs-only
   workflow_dispatch:
   workflow_call:
 
