@@ -9,14 +9,14 @@ description = "FastAPI приложение для просмотра списк
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi==0.143.3",
+    "fastapi==0.157.0",
     "uvicorn[standard]==0.54.0",
     "pydantic==2.14.1",
-    "pydantic-settings==2.16.0",
+    "pydantic-settings==2.16.1",
     # Транзитивная зависимость FastAPI (он допускает starlette>=0.46):
     # точная версия не даёт оставить уязвимую Starlette < 1.0.1 и
     # позволяет Dependabot видеть её advisory
-    "starlette==1.8.0",
+    "starlette==1.9.0",
 ]
 
 [tool.setuptools]
@@ -36,7 +36,7 @@ dev = [
     "ruff>=0.14.9",
 ]
 build = [
-    "nuitka==4.3",
+    "nuitka==4.3.1",
 ]
 # Проверка зависимостей на известные уязвимости (.github/workflows/audit.yml).
 # Здесь, а не в workflow, чтобы версию обновлял Dependabot.
