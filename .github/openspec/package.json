@@ -1,0 +1,8 @@
+{
+  "name": "filepicker-api-openspec",
+  "private": true,
+  "description": "openspec для проверки спецификаций в .github/workflows/docs.yml; версии обновляет Dependabot",
+  "devDependencies": {
+    "@fission-ai/openspec": "1.14.1"
+  }
+}
