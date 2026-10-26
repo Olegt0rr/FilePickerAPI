@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Annotated
 
@@ -143,6 +143,75 @@ class _Win32FindData(ctypes.Structure):
 # FINDEX_INFO_LEVELS.FindExInfoBasic: без короткого имени 8.3
 _FIND_EX_INFO_BASIC = 1
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_ERROR_ACCESS_DENIED = 5
+# Открытие файла только для чтения атрибутов, без перехода по ссылкам
+# (FILE_FLAG_OPEN_REPARSE_POINT); BACKUP_SEMANTICS позволяет открыть и
+# директорию, чтобы на неё ответить 400, а не 403
+_FILE_READ_ATTRIBUTES = 0x80
+_FILE_SHARE_ALL = 0x7
+_OPEN_EXISTING = 3
+_OPEN_FLAGS = 0x00200000 | 0x02000000
+_FILE_NAME_NORMALIZED = 0
+# Наибольшая длина пути Windows с префиксом \\?\
+_MAX_FINAL_PATH = 32768
+# Короткое имя 8.3: до 8 символов имени и до 3 расширения, без
+# символов, которые в коротких именах недопустимы
+_SHORT_NAME_BASE = 8
+_SHORT_NAME_EXTENSION = 3
+_SHORT_NAME_INVALID_CHARS = frozenset(" +,;=[]")
+
+
+@functools.cache
+def _kernel32() -> ctypes.CDLL:
+    """Загрузить kernel32 и описать сигнатуры используемых функций.
+
+    Один раз на процесс: argtypes — общее состояние объектов функций,
+    и задавать его на каждом запросе из потоков пула незачем.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.FindFirstFileExW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    )
+    kernel32.FindFirstFileExW.restype = ctypes.c_void_p
+    kernel32.FindClose.argtypes = (ctypes.c_void_p,)
+    kernel32.CreateFileW.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.GetFinalPathNameByHandleW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    )
+    kernel32.GetFinalPathNameByHandleW.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    return kernel32
+
+
+def _winapi_error(function: str, path: Path, winerror: int) -> OSError:
+    """Вернуть OSError для неудачного вызова WinAPI с кодом winerror.
+
+    По коду ошибки Windows OSError сам выбирает подкласс и errno
+    (FileNotFoundError, PermissionError). Если код не сохранился (0),
+    подкласса не будет, а в журнале было бы «Операция успешно
+    завершена», поэтому это явная ошибка ввода-вывода.
+    """
+    if not winerror:
+        msg = f"{function} failed without an error code"
+        return OSError(errno.EIO, msg, str(path))
+    return OSError(None, f"{function} failed", str(path), winerror)
 
 
 def _real_file_name(path: Path) -> str:
@@ -152,6 +221,8 @@ def _real_file_name(path: Path) -> str:
     имени 8.3 (REPORT~1.TXT для report.txtx). FindFirstFileExW
     возвращает настоящее длинное имя. Это поиск в директории, а не
     открытие файла, поэтому по символическим ссылкам он не переходит.
+    Если права на просмотр директории нет, см.
+    _real_file_name_without_listing.
 
     Args:
         path: Путь к файлу; имя без символов-шаблонов *?"<>
@@ -164,27 +235,114 @@ def _real_file_name(path: Path) -> str:
             подкласс по коду ошибки, например FileNotFoundError)
 
     """
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    find_first = kernel32.FindFirstFileExW
-    find_first.argtypes = (
-        ctypes.c_wchar_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_int,
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-    )
-    find_first.restype = ctypes.c_void_p
+    kernel32 = _kernel32()
     data = _Win32FindData()
-    handle = find_first(str(path), _FIND_EX_INFO_BASIC, ctypes.byref(data), 0, None, 0)
+    handle = kernel32.FindFirstFileExW(
+        str(path), _FIND_EX_INFO_BASIC, ctypes.byref(data), 0, None, 0
+    )
+    if handle not in {None, _INVALID_HANDLE_VALUE}:
+        kernel32.FindClose(handle)
+        return data.name
+    winerror = ctypes.get_last_error()
+    # Поиск требует права на просмотр содержимого директории. На
+    # ресурсе может быть выдано только чтение файлов: тогда файл,
+    # который раньше скачивался, не должен стать 403
+    if winerror == _ERROR_ACCESS_DENIED:
+        return _real_file_name_without_listing(path)
+    function = "FindFirstFileExW"
+    raise _winapi_error(function, path, winerror)
+
+
+def _could_be_short_name(name: str) -> bool:
+    """Проверить, может ли имя быть коротким именем 8.3 другого файла.
+
+    Короткое имя — не больше 8 символов до точки и 3 после, одна точка
+    и без символов, недопустимых в 8.3 (пробел, +,;=[]). Короткое имя
+    может назначить и администратор (fsutil file setshortname), и тогда
+    в нём не обязательно есть «~», поэтому проверяется только форма.
+    """
+    base, dot, extension = name.partition(".")
+    return (
+        0 < len(base) <= _SHORT_NAME_BASE
+        and len(extension) <= _SHORT_NAME_EXTENSION
+        and (not dot or extension != "")
+        and "." not in extension
+        and _SHORT_NAME_INVALID_CHARS.isdisjoint(name)
+    )
+
+
+def _real_file_name_without_listing(path: Path) -> str:
+    """Вернуть настоящее имя файла без права просмотра директории.
+
+    Опасно только короткое имя 8.3: через него report.txtx отдался бы
+    как REPORT~1.TXT или как назначенный вручную REPORT.TXT. Имя,
+    которое по форме не может быть коротким (длиннее 8.3, с пробелами
+    и т. п.), — это длинное имя самого файла (с точностью до
+    регистра), и обойти им проверку расширения нельзя. Тогда никаких
+    обращений к ФС не нужно, в том числе к родительским папкам, к
+    которым у учётной записи может не быть доступа. Для имени в форме
+    8.3 настоящее имя запрашивается по дескриптору.
+
+    Args:
+        path: Путь к файлу
+
+    Returns:
+        Имя файла в директории
+
+    Raises:
+        OSError: Если для имени в форме 8.3 настоящее имя получить не
+            удалось
+
+    """
+    if not _could_be_short_name(path.name):
+        return path.name
+    return _real_file_name_by_handle(path)
+
+
+def _real_file_name_by_handle(path: Path) -> str:
+    """Вернуть настоящее имя файла по его дескриптору.
+
+    Файл открывается только для чтения атрибутов и без перехода по
+    ссылкам, а GetFinalPathNameByHandleW возвращает нормализованный
+    путь с длинными именами в их регистре. Нормализация может
+    обращаться к родительским папкам, и без доступа к ним вызов
+    завершится отказом: тогда для имени в форме 8.3 скачивание — 403,
+    это безопаснее, чем отдать файл по непроверенному короткому имени.
+
+    Args:
+        path: Путь к файлу
+
+    Returns:
+        Имя файла в директории
+
+    Raises:
+        OSError: Если файл не открылся или путь не получен
+
+    """
+    kernel32 = _kernel32()
+    handle = kernel32.CreateFileW(
+        str(path),
+        _FILE_READ_ATTRIBUTES,
+        _FILE_SHARE_ALL,
+        None,
+        _OPEN_EXISTING,
+        _OPEN_FLAGS,
+        None,
+    )
     if handle in {None, _INVALID_HANDLE_VALUE}:
-        # По коду ошибки Windows OSError сам выбирает подкласс и errno
-        winerror = ctypes.get_last_error()
-        msg = "FindFirstFileExW failed"
-        raise OSError(None, msg, str(path), winerror)
-    kernel32.FindClose.argtypes = (ctypes.c_void_p,)
-    kernel32.FindClose(handle)
-    return data.name
+        function = "CreateFileW"
+        raise _winapi_error(function, path, ctypes.get_last_error())
+    try:
+        buffer = ctypes.create_unicode_buffer(_MAX_FINAL_PATH)
+        length = kernel32.GetFinalPathNameByHandleW(
+            handle, buffer, len(buffer), _FILE_NAME_NORMALIZED
+        )
+        if not length or length >= len(buffer):
+            function = "GetFinalPathNameByHandleW"
+            raise _winapi_error(function, path, ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+    return PureWindowsPath(buffer.value).name
 
 
 def _invalid_filename() -> HTTPException:
@@ -230,6 +388,9 @@ def _directory_errors(*, not_found: bool = False) -> Iterator[None]:
         if isinstance(e, PermissionError):
             msg = f"Permission denied when reading directory: {e!s}"
             raise HTTPException(status_code=403, detail=msg) from e
+        # 500 означает сбой, который надо разбирать по журналу, а не
+        # только по detail ответа, который фронтенд не показывает
+        logger.warning("Ошибка при чтении директории с файлами: %s", e)
         msg = f"OS error when reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
@@ -406,6 +567,8 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
     except HTTPException:
         raise
     except Exception as e:
+        # С трассировкой: непредвиденную ошибку иначе не разобрать
+        logger.exception("Непредвиденная ошибка при чтении директории")
         msg = f"Unexpected error when reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
