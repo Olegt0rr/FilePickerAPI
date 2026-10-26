@@ -21,8 +21,11 @@ import time
 PACKAGE_PRELOADED = "probe_pkg" in sys.modules
 ENTRY_STARTED_AT = time.perf_counter()
 
+from pathlib import Path  # noqa: E402
+
 import pywintypes  # noqa: E402
 import servicemanager  # noqa: E402
+import win32api  # noqa: E402
 import win32event  # noqa: E402
 import win32evtlog  # noqa: E402
 import win32security  # noqa: E402
@@ -80,23 +83,42 @@ class ProbeService(win32serviceutil.ServiceFramework):
         report_event(EVENT_STOPPED, STOPPED_TEXT)
 
 
+def path_info(path: str | None) -> dict[str, object]:
+    """Вернуть путь и признак, что такой файл есть."""
+    return {"path": path, "exists": bool(path) and Path(path).exists()}
+
+
+def owner_sid(path: str) -> str:
+    """Вернуть SID владельца файла (проверка win32security)."""
+    descriptor = win32security.GetFileSecurity(
+        path, win32security.OWNER_SECURITY_INFORMATION
+    )
+    return win32security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner())
+
+
 def console_report() -> dict[str, object]:
-    """Собрать отчёт консольного режима."""
+    """Собрать отчёт консольного режима.
+
+    Какой путь указывает на сам exe в сборке Nuitka, заранее неизвестно:
+    sys.executable там может быть путём к несуществующему python.exe.
+    Поэтому в отчёте все варианты, а настоящий путь берётся у Windows.
+    """
     package = sys.modules.get("probe_pkg")
     imported_at = getattr(package, "IMPORTED_AT", None)
-    descriptor = win32security.GetFileSecurity(
-        sys.executable, win32security.OWNER_SECURITY_INFORMATION
-    )
-    owner = win32security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner())
+    module_path = win32api.GetModuleFileName(None)
+    compiled = globals().get("__compiled__")
     return {
         "mode": "console",
         "package_preloaded": PACKAGE_PRELOADED,
         "package_imported_before_entry": (
             imported_at is not None and imported_at <= ENTRY_STARTED_AT
         ),
-        "compiled": "__compiled__" in globals(),
-        "executable": sys.executable,
-        "executable_owner_sid": owner,
+        "compiled": compiled is not None,
+        "module_file_name": path_info(module_path),
+        "sys_executable": path_info(sys.executable),
+        "sys_argv0": path_info(sys.argv[0] if sys.argv else None),
+        "compiled_containing_dir": getattr(compiled, "containing_dir", None),
+        "module_file_owner_sid": owner_sid(module_path),
         "pywintypes": pywintypes.__file__,
         "threads": threading.active_count(),
     }

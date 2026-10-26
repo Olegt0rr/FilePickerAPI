@@ -46,12 +46,21 @@ try {
     $process = Start-Process -FilePath $exe -NoNewWindow -PassThru `
         -RedirectStandardOutput $stdout -RedirectStandardError (Join-Path $ResultsDir 'console.err')
     Assert-True ($process.WaitForExit(30000)) 'exe без аргументов завершился за 30 секунд'
+    if ($process.ExitCode -ne 0) {
+        Get-Content -Encoding utf8 (Join-Path $ResultsDir 'console.err') | Write-Output
+    }
     Assert-True ($process.ExitCode -eq 0) "exe без аргументов вернул 0 (код $($process.ExitCode))"
     $report = Get-Content -Raw -Encoding utf8 $stdout | ConvertFrom-Json
     Assert-True ($report.mode -eq 'console') 'exe без аргументов перешёл в консольный режим'
     Assert-True ([bool]$report.compiled) 'exe собран Nuitka'
     $summary.Add("- package_preloaded (Nuitka выполнила __init__.py до точки входа): $($report.package_preloaded)")
     $summary.Add("- package_imported_before_entry: $($report.package_imported_before_entry)")
+    foreach ($key in 'module_file_name', 'sys_executable', 'sys_argv0') {
+        $info = $report.$key
+        $summary.Add("- ${key}: $($info.path) (exists: $($info.exists))")
+    }
+    $summary.Add("- compiled_containing_dir: $($report.compiled_containing_dir)")
+    Assert-True ([bool]$report.module_file_name.exists -and (Split-Path -Leaf $report.module_file_name.path) -eq 'probe.exe') 'GetModuleFileName возвращает путь к самому exe'
 
     # 1.3: источник событий со своим файлом сообщений
     New-Item -Path $sourceKey -Force | Out-Null
