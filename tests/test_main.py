@@ -797,6 +797,30 @@ class TestWindowsSymlinks:
         assert client.get("/files/redirect.txt").status_code == 400
 
 
+@contextmanager
+def deny_listing(folder):
+    """Запретить текущему пользователю просмотр содержимого папки.
+
+    Запрет «Список содержимого папки» (RD) ставится только на саму
+    папку; чтение файлов в ней остаётся разрешённым.
+    """
+    user = os.environ["USERNAME"]
+    icacls = Path(os.environ["SYSTEMROOT"]) / "System32" / "icacls.exe"
+    subprocess.run(  # noqa: S603 - аргументы задаются тестом
+        [str(icacls), str(folder), "/deny", f"{user}:(RD)"],
+        check=True,
+        capture_output=True,
+    )
+    try:
+        yield
+    finally:
+        subprocess.run(  # noqa: S603 - аргументы задаются тестом
+            [str(icacls), str(folder), "/remove:d", user],
+            check=True,
+            capture_output=True,
+        )
+
+
 def short_name_or_skip(path):
     """Вернуть короткое имя 8.3 файла или пропустить тест.
 
@@ -929,13 +953,27 @@ class TestWindowsRealFileName:
     def test_real_file_name_without_list_permission(
         self, real_file_name, test_files_dir
     ):
-        """Проверить: без права просмотра папки — имя по дескриптору."""
-        final = "\\\\?\\UNC\\srv\\share\\dir\\Payment.txt"
-        kernel32 = self.fake_kernel32(final_path=final)
+        """Проверить: без права просмотра папки имя без «~» — как есть.
+
+        Такое имя не может быть коротким именем 8.3, и к ФС, в том
+        числе к родительским папкам, больше не обращаемся.
+        """
+        kernel32 = self.fake_kernel32()
         path = Path(test_files_dir) / "payment.txt"
         with self.winapi(kernel32, 5):
             name = real_file_name(path)
-        assert name == "Payment.txt"
+        assert name == "payment.txt"
+        kernel32.CreateFileW.assert_not_called()
+        kernel32.GetFinalPathNameByHandleW.assert_not_called()
+
+    def test_short_name_without_list_permission(self, real_file_name, test_files_dir):
+        """Проверить: без права просмотра имя с «~» — по дескриптору."""
+        final = "\\\\?\\UNC\\srv\\share\\dir\\report.txtx"
+        kernel32 = self.fake_kernel32(final_path=final)
+        path = Path(test_files_dir) / "REPORT~1.TXT"
+        with self.winapi(kernel32, 5):
+            name = real_file_name(path)
+        assert name == "report.txtx"
         args = kernel32.CreateFileW.call_args.args
         assert args[0] == str(path)
         # Только чтение атрибутов и без перехода по ссылкам
@@ -951,17 +989,21 @@ class TestWindowsRealFileName:
             self.winapi(kernel32, 5, 2),
             pytest.raises(OSError, match="CreateFileW failed"),
         ):
-            real_file_name(Path(test_files_dir) / "a.txt")
+            real_file_name(Path(test_files_dir) / "A~1.TXT")
         kernel32.CloseHandle.assert_not_called()
 
     def test_real_file_name_by_handle_no_path(self, real_file_name, test_files_dir):
-        """Проверить: путь не получен — OSError, дескриптор закрыт."""
+        """Проверить: путь не получен — OSError, дескриптор закрыт.
+
+        Так бывает, когда нормализация пути упирается в недоступную
+        родительскую папку: имя с «~» тогда не отдаётся (403).
+        """
         kernel32 = self.fake_kernel32()
         with (
-            self.winapi(kernel32, 5, 6),
+            self.winapi(kernel32, 5, 5),
             pytest.raises(OSError, match="GetFinalPathNameByHandleW failed"),
         ):
-            real_file_name(Path(test_files_dir) / "a.txt")
+            real_file_name(Path(test_files_dir) / "A~1.TXT")
         kernel32.CloseHandle.assert_called_once_with(77)
 
     def test_real_file_name_without_error_code(self, real_file_name, test_files_dir):
@@ -1018,23 +1060,40 @@ class TestWindowsRealFileName:
         folder = Path(test_files_dir) / "no-list"
         folder.mkdir()
         (folder / "Payment.txt").write_text("content")
-        user = os.environ["USERNAME"]
-        icacls = Path(os.environ["SYSTEMROOT"]) / "System32" / "icacls.exe"
-        # Запрет «Список содержимого папки» только на саму папку
-        subprocess.run(  # noqa: S603 - аргументы задаются тестом
-            [str(icacls), str(folder), "/deny", f"{user}:(RD)"],
-            check=True,
-            capture_output=True,
-        )
-        try:
-            real = real_file_name(folder / "PAYMENT.TXT")
-        finally:
-            subprocess.run(  # noqa: S603 - аргументы задаются тестом
-                [str(icacls), str(folder), "/remove:d", user],
-                check=True,
-                capture_output=True,
-            )
+        with deny_listing(folder):
+            real = real_file_name(folder / "Payment.txt")
         assert real == "Payment.txt"
+
+    @windows_only
+    def test_unc_download_without_list_permission(self, tmp_path):
+        """Проверить по UNC: без права просмотра папки файл скачивается.
+
+        А короткое имя 8.3 не обходит проверку расширения. Сетевую
+        папку заменяет административный ресурс диска, как в
+        test_unc_files_directory.
+        """
+        local = tmp_path.resolve() / "no-list"
+        local.mkdir()
+        unc = f"\\\\localhost\\{local.drive[0]}${str(local)[2:]}"
+        if not Path(unc).is_dir():
+            msg = f"Административный ресурс недоступен: {unc}"
+            if os.environ.get("REQUIRE_UNC_SHARE"):
+                pytest.fail(msg)
+            pytest.skip(msg)
+        (local / "test1.txt").write_text("Test content 1")
+        other = local / "report.txtx"
+        other.write_text("not a txt")
+        short = short_name_or_skip(other)
+        client = TestClient(reload_app(files_directory=unc))
+
+        with deny_listing(local):
+            response = client.get("/files/test1.txt")
+            short_response = client.get("/files/" + quote(short))
+        assert response.status_code == 200
+        assert response.content == b"Test content 1"
+        # 403: либо настоящее имя report.txtx не .txt, либо его не
+        # удалось проверить; в обоих случаях файл не отдаётся
+        assert short_response.status_code == 403
 
     @windows_only
     def test_short_name_download_on_windows(self, test_files_dir):
