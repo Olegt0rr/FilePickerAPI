@@ -1,0 +1,84 @@
+name: Windows service probe
+
+# Пробная сборка для изменения windows-service (задачи 1.1–1.4):
+# служба на pywin32 в сборке Nuitka standalone, файл сообщений из .mc,
+# консольный режим без аргументов и порядок импорта пакета. Приложение
+# не собирается: проверяется только то, на чём держится дизайн.
+on:
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'spike/**'
+      - '.github/workflows/spike-probe.yml'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0  # теги нужны setuptools-scm для версии
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+
+    # Те же версии, что в сборке: nuitka из extras build, pywin32 из
+    # зависимостей проекта
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools wheel
+        pip install -e .[build]
+        python -c "import win32api, servicemanager; print('pywin32 OK')"
+
+    # mc, rc и link из того же MSVC, что использует Nuitka; в PATH их нет
+    - name: Build message DLL
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if (-not $vs) { Write-Output "::error::MSVC not found"; exit 1 }
+        New-Item -ItemType Directory -Force build\msg | Out-Null
+        cmd /c "call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && mc -U -h build\msg -r build\msg spike\probe.mc && rc /nologo /fo build\msg\probe.res build\msg\probe.rc && link /nologo /DLL /NOENTRY /MACHINE:X64 /OUT:build\msg\FilePickerProbe.messages.dll build\msg\probe.res"
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        Get-ChildItem build\msg
+
+    # Точка входа — __main__.py пакета, как app/__main__.py в сборке
+    # приложения; ключи те же, кроме пакета app
+    - name: Build probe with Nuitka
+      env:
+        PYTHONPATH: spike
+      run: |
+        python -m nuitka `
+          --mode=standalone `
+          --msvc=latest `
+          --assume-yes-for-downloads `
+          --remove-output `
+          --output-dir=build `
+          --output-folder-name=probe `
+          --output-filename=probe.exe `
+          --include-package=probe_pkg `
+          --include-module=win32timezone `
+          --report=build\nuitka-report.xml `
+          spike/probe_pkg/__main__.py
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        Get-ChildItem build\probe.dist | Select-Object Name, Length
+
+    - name: Run probe
+      run: ./spike/probe-smoke.ps1 -Dist build\probe.dist -MessageDll build\msg\FilePickerProbe.messages.dll -ResultsDir build\results
+
+    - name: Upload results
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: windows-service-probe
+        path: |
+          build/nuitka-report.xml
+          build/results/
+          build/msg/
+        retention-days: 14

@@ -17,6 +17,9 @@ dependencies = [
     # точная версия не даёт оставить уязвимую Starlette < 1.0.1 и
     # позволяет Dependabot видеть её advisory
     "starlette==1.9.0",
+    # Служба Windows и журнал событий (изменение windows-service);
+    # только на Windows: на Linux тесты подменяют модули pywin32
+    "pywin32==312; sys_platform == 'win32'",
 ]
 
 [tool.setuptools]
