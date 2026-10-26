@@ -22,10 +22,12 @@
 #### Scenario: Дымовая проверка службы
 - **WHEN** CI собрал папку филиала на Windows-раннере
 - **THEN** CI проверяет по порядку:
-  - `FilePickerAPI.exe install` из копии в `C:\Program Files\FilePickerAPI` завершается с кодом 0;
-  - служба зарегистрирована с учётной записью `NT SERVICE\FilePickerAPI` и путём к exe в кавычках без аргументов;
+  - `FilePickerAPI.exe install` из копии сборки в папке, доступной на запись только администраторам, завершается с кодом 0 и копирует сборку в `C:\Program Files\FilePickerAPI\<версия>\`;
+  - служба зарегистрирована с учётной записью `NT SERVICE\FilePickerAPI` и путём к exe в папке версии, в кавычках, без аргументов;
   - `GET /openapi.json` отдаёт версию сборки, `GET /files` отвечает 404 `Files directory not found`;
   - в файле журнала и в журнале событий есть событие запуска, после остановки — событие остановки;
+  - повторный `install` при работающей службе завершается с кодом 0: служба переустановлена, работает в новом процессе, параметры прежние;
+  - после успешного `install` в `C:\Program Files\FilePickerAPI` остаются только папки текущей и прежней версии;
   - с `.env`, где указан `FILES_DIRECTORY`, служба не запускается;
   - `remove` завершается с кодом 0;
   - установка из папки, доступной пользователям на запись, отклоняется.
@@ -55,4 +57,4 @@
 
 ### Requirement: Скрипты запуска для Windows
 **Reason**: `run_test.bat` и `run_production.bat` заменены встроенной службой Windows (см. `windows-service`). Запуск, автозапуск и перезапуск выполняет диспетчер служб, журнал ведёт сама служба. Логика запуска на cmd не тестируется автоматически и даёт риск подмены системных утилит и файлов сборки, а для настройки задачи Планировщика нужны права администратора на каждой машине.
-**Migration**: удалить задачу Планировщика с `run_production.bat`, скопировать папку сборки в `C:\Program Files\FilePickerAPI` и выполнить `FilePickerAPI.exe install` от администратора. Вместо `run_test.bat` — запуск `FilePickerAPI.exe` без аргументов в консоли. Вместо `%LOCALAPPDATA%\FilePickerAPI\startup.log` — `%ProgramData%\FilePickerAPI\logs\FilePickerAPI.log` и журнал событий Application (источник `FilePickerAPI`).
+**Migration**: удалить задачу Планировщика с `run_production.bat`, распаковать архив релиза в папку, доступную на запись только администратору (например, в его «Загрузки»), и выполнить оттуда `FilePickerAPI.exe install` от администратора: сборка будет скопирована в `C:\Program Files\FilePickerAPI\<версия>\`. Вместо `run_test.bat` — запуск `FilePickerAPI.exe` без аргументов в консоли. Вместо `%LOCALAPPDATA%\FilePickerAPI\startup.log` — `%ProgramData%\FilePickerAPI\logs\FilePickerAPI.log` и журнал событий Application (источник `FilePickerAPI`).
