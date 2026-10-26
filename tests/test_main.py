@@ -953,18 +953,57 @@ class TestWindowsRealFileName:
     def test_real_file_name_without_list_permission(
         self, real_file_name, test_files_dir
     ):
-        """Проверить: без права просмотра папки имя без «~» — как есть.
+        """Проверить: без права просмотра длинное имя — как есть.
 
-        Такое имя не может быть коротким именем 8.3, и к ФС, в том
-        числе к родительским папкам, больше не обращаемся.
+        Имя длиннее 8.3 не может быть коротким именем другого файла,
+        и к ФС, в том числе к родительским папкам, больше не обращаемся.
         """
         kernel32 = self.fake_kernel32()
-        path = Path(test_files_dir) / "payment.txt"
+        path = Path(test_files_dir) / "payment_order_0001.txt"
         with self.winapi(kernel32, 5):
             name = real_file_name(path)
-        assert name == "payment.txt"
+        assert name == "payment_order_0001.txt"
         kernel32.CreateFileW.assert_not_called()
         kernel32.GetFinalPathNameByHandleW.assert_not_called()
+
+    def test_explicit_short_name_without_list_permission(
+        self, real_file_name, test_files_dir
+    ):
+        """Проверить: имя в форме 8.3 без «~» тоже проверяется.
+
+        Короткое имя REPORT.TXT для report.txtx можно назначить вручную
+        (fsutil file setshortname), и «~» в нём не будет.
+        """
+        final = "\\\\?\\UNC\\srv\\share\\dir\\report.txtx"
+        kernel32 = self.fake_kernel32(final_path=final)
+        with self.winapi(kernel32, 5):
+            name = real_file_name(Path(test_files_dir) / "REPORT.TXT")
+        assert name == "report.txtx"
+        kernel32.CreateFileW.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("REPORT.TXT", True),
+            ("report.txt", True),
+            ("REPORT~1.TXT", True),
+            ("A", True),
+            ("ABCDEFGH.TXT", True),
+            ("ABCDEFGHI.TXT", False),
+            ("REPORT.TXTX", False),
+            ("a.b.txt", False),
+            ("pay order.txt", False),
+            ("a+b.txt", False),
+            ("a.", False),
+            ("payment_order_0001.txt", False),
+        ],
+    )
+    def test_could_be_short_name(self, test_files_dir, name, expected):
+        """Проверить определение имён, похожих на короткие имена 8.3."""
+        reload_app(files_directory=test_files_dir)
+        from app.handlers import files
+
+        assert files._could_be_short_name(name) is expected  # noqa: SLF001
 
     def test_short_name_without_list_permission(self, real_file_name, test_files_dir):
         """Проверить: без права просмотра имя с «~» — по дескриптору."""
@@ -1064,13 +1103,13 @@ class TestWindowsRealFileName:
             real = real_file_name(folder / "Payment.txt")
         assert real == "Payment.txt"
 
-    @windows_only
-    def test_unc_download_without_list_permission(self, tmp_path):
-        """Проверить по UNC: без права просмотра папки файл скачивается.
+    @staticmethod
+    def unc_no_list_folder(tmp_path):
+        """Создать папку и вернуть (локальный путь, UNC-путь) к ней.
 
-        А короткое имя 8.3 не обходит проверку расширения. Сетевую
-        папку заменяет административный ресурс диска, как в
-        test_unc_files_directory.
+        Сетевую папку заменяет административный ресурс диска, как в
+        test_unc_files_directory; без него тест пропускается, а в CI
+        (REQUIRE_UNC_SHARE) падает.
         """
         local = tmp_path.resolve() / "no-list"
         local.mkdir()
@@ -1080,20 +1119,59 @@ class TestWindowsRealFileName:
             if os.environ.get("REQUIRE_UNC_SHARE"):
                 pytest.fail(msg)
             pytest.skip(msg)
-        (local / "test1.txt").write_text("Test content 1")
+        return local, unc
+
+    @windows_only
+    def test_unc_download_without_list_permission(self, tmp_path):
+        """Проверить по UNC: без права просмотра файл скачивается."""
+        local, unc = self.unc_no_list_folder(tmp_path)
+        (local / "payment_order_0001.txt").write_text("payment")
+        client = TestClient(reload_app(files_directory=unc))
+
+        with deny_listing(local):
+            response = client.get("/files/payment_order_0001.txt")
+        assert response.status_code == 200
+        assert response.content == b"payment"
+
+    @windows_only
+    def test_unc_short_name_without_list_permission(self, tmp_path):
+        """Проверить по UNC: короткое имя не обходит проверку .txt."""
+        local, unc = self.unc_no_list_folder(tmp_path)
         other = local / "report.txtx"
         other.write_text("not a txt")
         short = short_name_or_skip(other)
         client = TestClient(reload_app(files_directory=unc))
 
         with deny_listing(local):
-            response = client.get("/files/test1.txt")
-            short_response = client.get("/files/" + quote(short))
-        assert response.status_code == 200
-        assert response.content == b"Test content 1"
+            response = client.get("/files/" + quote(short))
         # 403: либо настоящее имя report.txtx не .txt, либо его не
         # удалось проверить; в обоих случаях файл не отдаётся
-        assert short_response.status_code == 403
+        assert response.status_code == 403
+
+    @windows_only
+    def test_explicit_short_name_without_list_permission_on_windows(self, tmp_path):
+        """Проверить: назначенное вручную REPORT.TXT не обходит .txt.
+
+        Назначить короткое имя может только администратор и только на
+        томе с короткими именами; иначе тест пропускается.
+        """
+        local = tmp_path.resolve() / "no-list"
+        local.mkdir()
+        other = local / "report.txtx"
+        other.write_text("not a txt")
+        fsutil = Path(os.environ["SYSTEMROOT"]) / "System32" / "fsutil.exe"
+        result = subprocess.run(  # noqa: S603 - аргументы задаются тестом
+            [str(fsutil), "file", "setshortname", str(other), "REPORT.TXT"],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            pytest.skip("Нельзя назначить короткое имя (нужны права администратора)")
+        client = TestClient(reload_app(files_directory=str(local)))
+
+        with deny_listing(local):
+            response = client.get("/files/REPORT.TXT")
+        assert response.status_code == 403
 
     @windows_only
     def test_short_name_download_on_windows(self, test_files_dir):
