@@ -5,6 +5,7 @@
 import ctypes
 import errno
 import importlib
+import logging
 import os
 import shutil
 import subprocess
@@ -822,9 +823,13 @@ class TestWindowsRealFileName:
     @pytest.fixture
     def real_file_name(self, test_files_dir):
         reload_app(files_directory=test_files_dir)
-        from app.handlers.files import _real_file_name
+        from app.handlers import files
 
-        return _real_file_name
+        # kernel32 загружается один раз на процесс: поддельный из
+        # одного теста не должен достаться другому
+        files._kernel32.cache_clear()  # noqa: SLF001 - кэш модуля
+        yield files._real_file_name  # noqa: SLF001 - проверяемая функция
+        files._kernel32.cache_clear()  # noqa: SLF001 - кэш модуля
 
     def download_as(self, test_files_dir, requested, real_name):
         """Скачать requested на «Windows» с настоящим именем."""
@@ -875,8 +880,12 @@ class TestWindowsRealFileName:
         assert response.status_code == 404
         assert response.json()["detail"] == "File not found"
 
-    def fake_kernel32(self, name=None):
-        """Вернуть поддельный kernel32, который находит name."""
+    def fake_kernel32(self, name=None, final_path=None):
+        """Вернуть поддельный kernel32.
+
+        FindFirstFileExW находит name (None — не находит), а
+        GetFinalPathNameByHandleW возвращает final_path.
+        """
         kernel32 = mock.MagicMock()
 
         def find_first(_path, _level, data, *_args):
@@ -885,8 +894,87 @@ class TestWindowsRealFileName:
             data._obj.name = name  # noqa: SLF001 - объект за ctypes.byref
             return 1234
 
+        def final_path_name(_handle, buffer, _size, _flags):
+            if final_path is None:
+                return 0
+            buffer.value = final_path
+            return len(final_path)
+
         kernel32.FindFirstFileExW.side_effect = find_first
+        kernel32.CreateFileW.return_value = 77
+        kernel32.GetFinalPathNameByHandleW.side_effect = final_path_name
         return kernel32
+
+    @contextmanager
+    def winapi(self, kernel32, *errors):
+        """Подменить WinAPI: kernel32 и коды ошибок по очереди."""
+        with (
+            mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel32),
+            mock.patch.object(
+                ctypes, "get_last_error", create=True, side_effect=list(errors)
+            ),
+        ):
+            yield
+
+    def test_kernel32_loaded_once(self, real_file_name, test_files_dir):
+        """Проверить: kernel32 и сигнатуры готовятся один раз."""
+        kernel32 = self.fake_kernel32("a.txt")
+        with mock.patch.object(
+            ctypes, "WinDLL", create=True, return_value=kernel32
+        ) as win_dll:
+            for _ in range(3):
+                real_file_name(Path(test_files_dir) / "a.txt")
+        win_dll.assert_called_once_with("kernel32", use_last_error=True)
+
+    def test_real_file_name_without_list_permission(
+        self, real_file_name, test_files_dir
+    ):
+        """Проверить: без права просмотра папки — имя по дескриптору."""
+        final = "\\\\?\\UNC\\srv\\share\\dir\\Payment.txt"
+        kernel32 = self.fake_kernel32(final_path=final)
+        path = Path(test_files_dir) / "payment.txt"
+        with self.winapi(kernel32, 5):
+            name = real_file_name(path)
+        assert name == "Payment.txt"
+        args = kernel32.CreateFileW.call_args.args
+        assert args[0] == str(path)
+        # Только чтение атрибутов и без перехода по ссылкам
+        assert args[1] == 0x80
+        assert args[5] & 0x00200000
+        kernel32.CloseHandle.assert_called_once_with(77)
+
+    def test_real_file_name_by_handle_open_fails(self, real_file_name, test_files_dir):
+        """Проверить: файл не открылся — OSError без CloseHandle."""
+        kernel32 = self.fake_kernel32()
+        kernel32.CreateFileW.return_value = ctypes.c_void_p(-1).value
+        with (
+            self.winapi(kernel32, 5, 2),
+            pytest.raises(OSError, match="CreateFileW failed"),
+        ):
+            real_file_name(Path(test_files_dir) / "a.txt")
+        kernel32.CloseHandle.assert_not_called()
+
+    def test_real_file_name_by_handle_no_path(self, real_file_name, test_files_dir):
+        """Проверить: путь не получен — OSError, дескриптор закрыт."""
+        kernel32 = self.fake_kernel32()
+        with (
+            self.winapi(kernel32, 5, 6),
+            pytest.raises(OSError, match="GetFinalPathNameByHandleW failed"),
+        ):
+            real_file_name(Path(test_files_dir) / "a.txt")
+        kernel32.CloseHandle.assert_called_once_with(77)
+
+    def test_real_file_name_without_error_code(self, real_file_name, test_files_dir):
+        """Проверить: код ошибки 0 — явная ошибка ввода-вывода."""
+        kernel32 = self.fake_kernel32()
+        path = Path(test_files_dir) / "a.txt"
+        with (
+            self.winapi(kernel32, 0),
+            pytest.raises(OSError, match="without an error code") as exc_info,
+        ):
+            real_file_name(path)
+        assert exc_info.value.errno == errno.EIO
+        assert exc_info.value.filename == str(path)
 
     def test_real_file_name_found(self, real_file_name, test_files_dir):
         """Проверить вызов WinAPI: имя из ответа, поиск закрыт."""
@@ -921,6 +1009,32 @@ class TestWindowsRealFileName:
         assert real == "Payment.txt"
         with pytest.raises(FileNotFoundError):
             real_file_name(Path(test_files_dir) / "missing.txt")
+
+    @windows_only
+    def test_real_file_name_without_list_permission_on_windows(
+        self, real_file_name, test_files_dir
+    ):
+        """Проверить на Windows: имя без права просмотра папки."""
+        folder = Path(test_files_dir) / "no-list"
+        folder.mkdir()
+        (folder / "Payment.txt").write_text("content")
+        user = os.environ["USERNAME"]
+        icacls = Path(os.environ["SYSTEMROOT"]) / "System32" / "icacls.exe"
+        # Запрет «Список содержимого папки» только на саму папку
+        subprocess.run(  # noqa: S603 - аргументы задаются тестом
+            [str(icacls), str(folder), "/deny", f"{user}:(RD)"],
+            check=True,
+            capture_output=True,
+        )
+        try:
+            real = real_file_name(folder / "PAYMENT.TXT")
+        finally:
+            subprocess.run(  # noqa: S603 - аргументы задаются тестом
+                [str(icacls), str(folder), "/remove:d", user],
+                check=True,
+                capture_output=True,
+            )
+        assert real == "Payment.txt"
 
     @windows_only
     def test_short_name_download_on_windows(self, test_files_dir):
@@ -981,20 +1095,27 @@ def smb_share(command):
     )
 
 
-def wait_for_status(client, url, expected, timeout=60):
+def wait_for_status(client, url, expected, stage, timeout=20):
     """Повторять запрос, пока не придёт статус expected.
 
-    SMB-клиент Windows несколько секунд кэширует атрибуты файлов и
-    директорий и то, что файла нет, поэтому изменение ресурса видно не
-    сразу. Возвращает последний ответ и все полученные статусы.
+    SMB-клиент Windows кэширует атрибуты файлов и директорий и то, что
+    файла нет, до 10 секунд, поэтому изменение ресурса видно не сразу:
+    20 секунд хватает с запасом. Если статус так и не пришёл, тест
+    падает сразу с названием этапа и всеми полученными статусами.
+    Возвращает последний ответ и статусы.
     """
     deadline = time.monotonic() + timeout
     statuses = []
     while True:
         response = client.get(url)
         statuses.append(response.status_code)
-        if response.status_code == expected or time.monotonic() > deadline:
+        if response.status_code == expected:
             return response, statuses
+        if time.monotonic() > deadline:
+            pytest.fail(
+                f"{stage}: за {timeout} с {url} не ответил {expected}, "
+                f"статусы: {statuses}"
+            )
         time.sleep(1)
 
 
@@ -1078,28 +1199,30 @@ class TestSmbShare:
 
         smb_share(SMB_SHARE_REMOVE)
         try:
-            listing, listing_statuses = wait_for_status(client, "/files", 404)
+            listing, listing_statuses = wait_for_status(
+                client, "/files", 404, "список после удаления ресурса"
+            )
             download, download_statuses = wait_for_status(
-                client, "/files/test1.txt", 404
+                client, "/files/test1.txt", 404, "скачивание после удаления ресурса"
             )
         finally:
             smb_share(SMB_SHARE_CREATE)
 
         # Пока кэш SMB-клиента не устарел, возможен прежний ответ, а
         # в момент удаления — сбой ОС (500); итог — 404
-        assert listing.status_code == 404, listing_statuses
         assert listing.json()["detail"] == "Files directory not found"
         assert set(listing_statuses) <= {200, 404, 500}, listing_statuses
-        assert download.status_code == 404, download_statuses
         assert download.json()["detail"] == "File not found"
         assert set(download_statuses) <= {200, 404, 500}, download_statuses
 
-        listing, statuses = wait_for_status(client, "/files", 200)
-        assert listing.status_code == 200, statuses
+        listing, _ = wait_for_status(
+            client, "/files", 200, "список после возврата ресурса"
+        )
         names = [f["name"] for f in listing.json()["availableFiles"]]
         assert names == ["test1.txt"]
-        response, statuses = wait_for_status(client, "/files/test1.txt", 200)
-        assert response.status_code == 200, statuses
+        response, _ = wait_for_status(
+            client, "/files/test1.txt", 200, "скачивание после возврата ресурса"
+        )
         assert response.content == b"Test content 1"
 
 
@@ -1409,7 +1532,7 @@ class TestExceptionHandling:
                 f"Permission denied when reading directory: {error}"
             )
 
-    def test_list_files_oserror(self):
+    def test_list_files_oserror(self, caplog):
         """Проверить обработку OSError при чтении директории."""
         with tempfile.TemporaryDirectory() as tmpdir:
             test_file = Path(tmpdir) / "test.txt"
@@ -1419,14 +1542,33 @@ class TestExceptionHandling:
             client = TestClient(test_app)
 
             # Мокируем scandir для возбуждения OSError
-            with mock.patch(
-                "os.scandir",
-                side_effect=OSError("Disk error"),
+            with (
+                mock.patch("os.scandir", side_effect=OSError("Disk error")),
+                caplog.at_level(logging.WARNING, logger="app.handlers.files"),
             ):
                 response = client.get("/files")
                 # Должны получить ошибку 500 из-за OSError
                 assert response.status_code == 500
                 assert "OS error" in response.json()["detail"]
+            # Ответ 500 виден и в журнале, а не только в detail
+            assert "Disk error" in caplog.text
+
+    def test_list_files_unexpected_error_is_logged(self, caplog):
+        """Проверить: непредвиденная ошибка — в журнале с трассой."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            client = TestClient(reload_app(files_directory=tmpdir))
+            with (
+                mock.patch("os.scandir", side_effect=RuntimeError("Boom")),
+                caplog.at_level(logging.ERROR, logger="app.handlers.files"),
+            ):
+                response = client.get("/files")
+        assert response.status_code == 500
+        assert response.json()["detail"] == (
+            "Unexpected error when reading directory: Boom"
+        )
+        [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert record.exc_info is not None
+        assert "RuntimeError: Boom" in caplog.text
 
     def test_list_files_unexpected_error(self):
         """Проверить обработку неожиданных исключений."""
