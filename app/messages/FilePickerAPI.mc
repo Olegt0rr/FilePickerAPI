@@ -1,7 +1,8 @@
-; Event log message table for the FilePickerAPI source.
-; Every message is %1: the service passes the whole event text.
-; IDs match EventId in app/event_tracking.py (checked by a test).
-; Keep this file ASCII: mc -U writes the table itself in Unicode.
+; Таблица сообщений журнала событий для источника FilePickerAPI.
+; Текст каждого сообщения - %1: всю строку события передаёт сервис.
+; Коды совпадают с EventId в app/event_tracking.py (это проверяет тест).
+; Сами сообщения - только ASCII: mc читает файл в кодовой странице ANSI,
+; а кириллицу этих комментариев копирует лишь в заголовок .h.
 
 MessageIdTypedef=DWORD
 

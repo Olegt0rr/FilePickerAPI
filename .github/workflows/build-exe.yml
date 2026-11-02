@@ -248,6 +248,8 @@ jobs:
         $fileVersion = (@($env:FILE_VERSION.Split('.')) + @('0', '0', '0') | Select-Object -First 4) -join ','
         $rc = Get-Content app\messages\FilePickerAPI.version.rc -Raw
         $rc = $rc.Replace('@FILEVERSION@', $fileVersion).Replace('@VERSION@', $env:FILE_VERSION)
+        # ascii: rc читает файл в кодовой странице ANSI; кириллица
+        # комментариев шаблона становится «?», на ресурсы это не влияет
         Set-Content "$out\version.rc" $rc -Encoding ascii
         cmd /c "call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && mc -U -h $out -r $out app\messages\FilePickerAPI.mc && rc /nologo /fo $out\FilePickerAPI.res $out\version.rc && link /nologo /DLL /NOENTRY /MACHINE:X64 /OUT:$out\FilePickerAPI.messages.dll $out\FilePickerAPI.res"
         if ($LASTEXITCODE) { exit $LASTEXITCODE }

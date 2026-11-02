@@ -890,7 +890,7 @@ class TestEventIds:
         """Проверить: каждый код есть в FilePickerAPI.mc и наоборот,
         с тем же символическим именем.
         """
-        text = MC_FILE.read_text(encoding="ascii")
+        text = MC_FILE.read_text(encoding="utf-8")
         messages = dict(
             re.findall(r"^MessageId=(\d+)\s*\nSymbolicName=(\w+)", text, re.MULTILINE)
         )
