@@ -205,6 +205,19 @@ class TestTcpListeners:
         if sys.platform == "win32":
             assert info.value.winerror == 87
 
+    def test_ipv6_table_unavailable(self, iphlpapi):
+        """Проверить: без таблицы IPv6 (стек отключён) — только IPv4."""
+        table = tcp_table(tcp_row("0.0.0.0", 8000, 42))
+        ipv4 = fake_get_table(table)
+
+        def get_table(buffer, size, order, family, *args):
+            if family == winapi.AF_INET6:
+                return 50  # ERROR_NOT_SUPPORTED
+            return ipv4(buffer, size, order, family, *args)
+
+        iphlpapi.GetExtendedTcpTable = mock.MagicMock(side_effect=get_table)
+        assert winapi.tcp_listeners() == [winapi.TcpRow(_LISTEN, "0.0.0.0", 8000, 42)]
+
     def test_success_without_buffer_allocates(self, iphlpapi):
         """Проверить: успех без буфера не считается таблицей."""
         table = tcp_table(tcp_row("127.0.0.1", 8000, 9))
@@ -252,6 +265,16 @@ class TestPortOwnerPid:
     def test_ipv4_wildcard_over_ipv6(self):
         pid = self.owner(("::", 8000, 77), ("0.0.0.0", 8000, 100))
         assert pid == 100
+
+    def test_ipv4_mapped_address(self):
+        """Проверить: сокет на ::ffff:127.0.0.1 принимает 127.0.0.1.
+
+        Запись адреса в таблице зависит от версии Python, поэтому
+        проверяются обе.
+        """
+        for mapped in ("::ffff:127.0.0.1", "::ffff:7f00:1"):
+            pid = self.owner(("0.0.0.0", 8000, 100), (mapped, 8000, 55))
+            assert pid == 55
 
     def test_dual_stack_ipv6_wildcard(self):
         """Проверить: [::] без IPV6_V6ONLY принимает и IPv4."""

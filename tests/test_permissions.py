@@ -421,8 +421,13 @@ def win32security():
     module.LookupAccountSid = lookup_account_sid
     pywintypes = types.ModuleType("pywintypes")
     pywintypes.error = FakeError
+    # Тип тома по корню: DRIVE_FIXED, если не задан в drive_types
+    win32file = types.ModuleType("win32file")
+    module.drive_types = {}
+    win32file.GetDriveType = lambda root: module.drive_types.get(root, 3)
     with mock.patch.dict(
-        sys.modules, {"win32security": module, "pywintypes": pywintypes}
+        sys.modules,
+        {"win32security": module, "pywintypes": pywintypes, "win32file": win32file},
     ):
         yield module
 
@@ -554,6 +559,18 @@ class TestCheckBuildFolder:
         violations = permissions.check_build_folder(link / build_folder.name)
         assert violations == [Violation(str(link), Problem.REPARSE_POINT)]
         assert seen == [str(p) for p in reversed(link.parents)]
+
+    def test_network_volume(self, win32security, build_folder):
+        """Проверить: папка на сетевом томе не обходится.
+
+        Проверка локальная: ни права, ни содержимое сетевой папки не
+        читаются, а сама папка — одно нарушение.
+        """
+        seen = self.read_paths(win32security)
+        win32security.drive_types[build_folder.anchor] = 4
+        violations = permissions.check_build_folder(build_folder)
+        assert violations == [Violation(str(build_folder), Problem.NETWORK_VOLUME)]
+        assert seen == []
 
     def test_link_inside_not_followed(self, win32security, tmp_path, build_folder):
         """Проверить: ссылка в папке — нарушение, внутрь не заходим."""

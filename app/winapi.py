@@ -5,6 +5,7 @@
 тесты подменяют вызовы и на Linux.
 """
 
+import contextlib
 import ctypes
 import functools
 import ipaddress
@@ -50,23 +51,11 @@ class TcpRow(NamedTuple):
     pid: int
 
 
-def _tcp_row(row: bytes) -> TcpRow:
-    state, address, port, _remote, _remote_port, pid = _TCP_ROW.unpack(row)
-    return TcpRow(
-        state, str(ipaddress.IPv4Address(address)), int.from_bytes(port, "big"), pid
-    )
-
-
-def _tcp6_row(row: bytes) -> TcpRow:
-    address, port, _remote, _remote_port, state, pid = _TCP6_ROW.unpack(row)
-    return TcpRow(
-        state, str(ipaddress.IPv6Address(address)), int.from_bytes(port, "big"), pid
-    )
-
-
-_ROW_PARSERS = {
-    AF_INET: (_TCP_ROW.size, _tcp_row),
-    AF_INET6: (_TCP6_ROW.size, _tcp6_row),
+# Строка, класс адреса и номера полей состояния, адреса, порта и PID
+# в распакованной строке
+_ROW_FORMATS = {
+    AF_INET: (_TCP_ROW, ipaddress.IPv4Address, (0, 1, 2, 5)),
+    AF_INET6: (_TCP6_ROW, ipaddress.IPv6Address, (4, 0, 1, 5)),
 }
 
 
@@ -91,14 +80,18 @@ def parse_tcp_table(data: bytes, family: int = AF_INET) -> list[TcpRow]:
         msg = "TCP table is shorter than its header"
         raise ValueError(msg)
     (count,) = _TCP_TABLE_HEADER.unpack_from(data)
-    row_size, parse_row = _ROW_PARSERS[family]
-    if len(data) < _TCP_TABLE_HEADER.size + count * row_size:
+    row, address_class, fields = _ROW_FORMATS[family]
+    if len(data) < _TCP_TABLE_HEADER.size + count * row.size:
         msg = f"TCP table is shorter than {count} rows"
         raise ValueError(msg)
-    offsets = range(
-        _TCP_TABLE_HEADER.size, _TCP_TABLE_HEADER.size + count * row_size, row_size
-    )
-    return [parse_row(data[offset : offset + row_size]) for offset in offsets]
+    rows = []
+    for index in range(count):
+        values = row.unpack_from(data, _TCP_TABLE_HEADER.size + index * row.size)
+        state, address, port, pid = (values[field] for field in fields)
+        rows.append(
+            TcpRow(state, str(address_class(address)), int.from_bytes(port, "big"), pid)
+        )
+    return rows
 
 
 @functools.cache
@@ -139,13 +132,18 @@ def tcp_listeners() -> list[TcpRow]:
     [::] без IPV6_V6ONLY занимает порт и для 0.0.0.0.
 
     Returns:
-        Строки таблиц GetExtendedTcpTable: сначала IPv4, затем IPv6
+        Строки таблиц GetExtendedTcpTable: сначала IPv4, затем IPv6;
+        без IPv6, если её таблицу получить не удалось (например, стек
+        IPv6 отключён)
 
     Raises:
-        OSError: Если таблицу получить не удалось
+        OSError: Если не удалось получить таблицу IPv4
 
     """
-    return _tcp_table(AF_INET) + _tcp_table(AF_INET6)
+    rows = _tcp_table(AF_INET)
+    with contextlib.suppress(OSError):
+        rows += _tcp_table(AF_INET6)
+    return rows
 
 
 def _tcp_table(family: int) -> list[TcpRow]:
@@ -183,9 +181,10 @@ def port_owner_pid(port: int, address: str = "127.0.0.1") -> int | None:
 
     Соединение получает слушатель на самом адресе, а без него —
     слушатель на адресе «любой» своего семейства. К адресу IPv4
-    подходит и [::]: режим IPV6_V6ONLY по таблице не узнать, а без него
-    такой слушатель принимает и IPv4. Слушатель на другом адресе с тем
-    же портом соединение не получит.
+    подходят и сокеты IPv6 на этом адресе, отображённом в IPv6
+    (::ffff:127.0.0.1), и на [::]: режим IPV6_V6ONLY по таблице не
+    узнать, а без него такой слушатель принимает и IPv4. Слушатель на
+    другом адресе с тем же портом соединение не получит.
 
     Args:
         port: Номер порта
@@ -199,20 +198,20 @@ def port_owner_pid(port: int, address: str = "127.0.0.1") -> int | None:
 
     """
     target = ipaddress.ip_address(address)
-    wildcards = ("::",)
+    candidates = [target, ipaddress.IPv6Address("::")]
     if isinstance(target, ipaddress.IPv4Address):
-        wildcards = ("0.0.0.0", *wildcards)
-    pids: dict[str, int] = {}
+        candidates[1:1] = [
+            ipaddress.IPv6Address(f"::ffff:{target}"),
+            ipaddress.IPv4Address("0.0.0.0"),
+        ]
+    # Адреса сравниваются как объекты: запись отображённого адреса
+    # в строке зависит от версии Python
+    pids: dict[ipaddress.IPv4Address | ipaddress.IPv6Address, int] = {}
     for row in tcp_listeners():
         if row.local_port == port:
-            pids.setdefault(row.local_address, row.pid)
+            pids.setdefault(ipaddress.ip_address(row.local_address), row.pid)
     return next(
-        (
-            pids[candidate]
-            for candidate in (str(target), *wildcards)
-            if candidate in pids
-        ),
-        None,
+        (pids[candidate] for candidate in candidates if candidate in pids), None
     )
 
 

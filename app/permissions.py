@@ -130,6 +130,7 @@ class Problem(StrEnum):
     OWNER = "владелец не из доверенных"
     RIGHTS = "опасные права"
     REPARSE_POINT = "точка повторной обработки (junction или символическая ссылка)"
+    NETWORK_VOLUME = "папка сборки на сетевом томе, права не проверялись"
     UNREADABLE = "права не удалось проверить"
 
 
@@ -348,13 +349,26 @@ def _check_content(directory: str) -> Iterator[Violation]:
             yield from _check_content(entry.path)
 
 
+# GetDriveType: сетевой диск или UNC-путь
+_DRIVE_REMOTE = 4
+
+
+def _is_remote_volume(folder: Path) -> bool:
+    """Проверить, что папка на сетевом томе (UNC или сетевой диск)."""
+    import win32file
+
+    return win32file.GetDriveType(folder.anchor) == _DRIVE_REMOTE
+
+
 def check_build_folder(folder: Path) -> list[Violation]:
     """Проверить права на папку сборки, её содержимое и предков.
 
     Путь не разрешается: junction в нём — само по себе нарушение, и
     дальше ссылки проверка не идёт: ни права, ни содержимое её цели не
     читаются. Ошибка чтения прав объекта — тоже нарушение, а не
-    исключение, и проверка продолжается.
+    исключение, и проверка продолжается. Папка на сетевом томе не
+    обходится: проверка локальная и обращений к сети не добавляет, а
+    права на сетевую папку задаёт не установщик.
 
     Args:
         folder: Абсолютный путь к папке exe
@@ -364,6 +378,8 @@ def check_build_folder(folder: Path) -> list[Violation]:
         её содержимое
 
     """
+    if _is_remote_volume(folder):
+        return [Violation(str(folder), Problem.NETWORK_VOLUME)]
     violations: list[Violation] = []
     targets = [(parent, ObjectKind.ANCESTOR) for parent in reversed(folder.parents)]
     targets.append((folder, ObjectKind.DIRECTORY))
