@@ -78,10 +78,18 @@ def _service_record(message: str) -> logging.LogRecord:
 
 
 def truncate_event_text(text: str) -> str:
-    """Обрезать текст события до предела ReportEvent с пометкой."""
-    if len(text) <= MAX_EVENT_TEXT:
+    """Обрезать текст события до предела ReportEvent с пометкой.
+
+    Предел считается в единицах UTF-16 (WCHAR), а не в символах
+    Python: символ вне BMP (например, эмодзи) занимает две. Срез не
+    разрывает суррогатную пару: половинка отбрасывается.
+    """
+    data = text.encode("utf-16-le", "surrogatepass")
+    if len(data) <= MAX_EVENT_TEXT * 2:
         return text
-    return text[: MAX_EVENT_TEXT - len(TRUNCATED_NOTE)] + TRUNCATED_NOTE
+    note_units = len(TRUNCATED_NOTE.encode("utf-16-le")) // 2
+    head = data[: (MAX_EVENT_TEXT - note_units) * 2]
+    return head.decode("utf-16-le", "ignore") + TRUNCATED_NOTE
 
 
 class EventLogHandler(logging.Handler):
@@ -210,6 +218,9 @@ class LogFileHandler(TimedRotatingFileHandler):
             path, when="midnight", backupCount=BACKUP_COUNT, encoding="utf-8"
         )
         self._rotation_failed = False
+        # Идёт серия отказов записи в файл: 1004 о ней уже записано
+        self._write_failing = False
+        self._write_failed = False
 
     def emit(self, record: logging.LogRecord) -> None:
         """Записать строку; без открытого файла — ждать новой попытки.
@@ -217,10 +228,34 @@ class LogFileHandler(TimedRotatingFileHandler):
         Если файл не открылся при ротации, FileHandler.emit пытался бы
         открыть его на каждой записи. До следующей попытки ротации
         записи в файл не идут, консоль и журнал событий их получают.
+        Запись о самом отказе файла (file_log=False) сюда не пишется.
         """
+        if getattr(record, "file_log", True) is False:
+            return
         if self.stream is None and time.time() < self.rolloverAt:
             return
+        self._write_failed = False
         super().emit(record)
+        if not self._write_failed:
+            self._write_failing = False
+
+    def handleError(self, record: logging.LogRecord) -> None:  # noqa: ARG002, N802 - метод базового класса
+        """Сообщить об отказе файла журнала одним 1004 на серию отказов.
+
+        Без консоли трассировка handleError в stderr никому не видна,
+        поэтому отказ записи, flush или открытия при ротации уходит в
+        журнал событий (и консоль), но не в сам неисправный файл.
+        """
+        self._write_failed = True
+        if self._write_failing:
+            return
+        self._write_failing = True
+        logger.warning(
+            "Не удалось записать в файл журнала %s: %s",
+            self.baseFilename,
+            sys.exc_info()[1],
+            extra={"event_id": EventId.LOG_FILE_UNAVAILABLE, "file_log": False},
+        )
 
     def getFilesToDelete(self) -> list[str]:  # noqa: N802 - метод базового класса
         """Вернуть архивы старше срока хранения."""
@@ -287,6 +322,9 @@ class LogFileHandler(TimedRotatingFileHandler):
             return
         self._rotation_failed = False
         self.delete_old_archives()
+        # Новый файл не открылся (квота): повтор через час, а не на
+        # каждой записи
+        self.rolloverAt = now + ROTATION_RETRY_SECONDS
         self.stream = self._open()
         self.rolloverAt = self.computeRollover(now)
 

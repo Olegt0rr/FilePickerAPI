@@ -413,6 +413,52 @@ class TestLogFileRotation:
             self.write(handler, message)
         handler._open.assert_called_once_with()  # noqa: SLF001
 
+    def test_new_file_open_failure_postpones_rotation(self, handler, monkeypatch):
+        """Проверить: файл переименован, а новый не открылся (квота) —
+        повтор через час, а не попытка открытия на каждой записи.
+        """
+        open_file = mock.Mock(side_effect=OSError("quota"))
+        monkeypatch.setattr(handler, "_open", open_file)
+        self.make_due(handler)
+
+        with pytest.raises(OSError, match="quota"):
+            handler.doRollover()
+
+        assert handler.rolloverAt > time.time() + 3600 - 5
+        for message in ("a", "b", "c"):
+            self.write(handler, message)
+        open_file.assert_called_once_with()
+
+    def test_write_failure_reported_once(self, handler, caplog):
+        """Проверить: отказ записи в файл — одно 1004 на серию отказов,
+        не в сам файл; после удачной записи новая серия даёт новое 1004.
+        """
+        stream = handler.stream
+        broken = mock.Mock()
+        broken.write.side_effect = OSError(28, "No space left on device")
+        handler.stream = broken
+        self.write(handler, "первая")
+        self.write(handler, "вторая")
+        handler.stream = stream
+        self.write(handler, "после освобождения места")
+        handler.stream = broken
+        self.write(handler, "снова")
+        handler.stream = stream
+
+        reports = [r for r in caplog.records if r.name == "app.logging_setup"]
+        assert len(reports) == 2
+        for report in reports:
+            assert report.levelno == logging.WARNING
+            assert report.event_id == EventId.LOG_FILE_UNAVAILABLE
+            assert report.file_log is False
+            assert "No space left on device" in report.getMessage()
+        # Отчёт об отказе не пишется в сам файл
+        handler.handle(reports[0])
+        handler.flush()
+        text = Path(handler.baseFilename).read_text(encoding="utf-8")
+        assert "после освобождения места" in text
+        assert "Не удалось записать" not in text
+
     def test_missing_current_file_rotates(self, handler, tmp_path):
         """Проверить: удалённый текущий файл ротации не мешает."""
         folder = log_dir(tmp_path)
@@ -590,6 +636,24 @@ class TestEventLogHandler:
     def test_text_at_limit_not_truncated(self):
         text = "x" * 31_839
         assert logging_setup.truncate_event_text(text) == text
+        # 15 000 эмодзи — 30 000 единиц UTF-16, в пределе
+        emoji = "😀" * 15_000
+        assert logging_setup.truncate_event_text(emoji) == emoji
+
+    @pytest.mark.parametrize("prefix", ["", "x"])
+    def test_truncation_counts_utf16_units(self, prefix):
+        """Проверить: предел — в единицах UTF-16, суррогатная пара не
+        разрывается (оба чётных и нечётных положения среза).
+        """
+        text = prefix + "😀" * 20_000
+
+        result = logging_setup.truncate_event_text(text)
+
+        units = len(result.encode("utf-16-le")) // 2
+        assert 31_838 <= units <= 31_839
+        assert result.endswith("\n… (обрезано, полный текст в FilePickerAPI.log)")
+        body = result.removesuffix(logging_setup.TRUNCATED_NOTE)
+        assert body == prefix + "😀" * (len(body) - len(prefix))
 
     def test_report_error_does_not_raise(self, event_logger, caplog, capsys):
         """Проверить: отказ ReportEvent не роняет запись и не печатает
