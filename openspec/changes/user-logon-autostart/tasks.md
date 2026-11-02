@@ -15,11 +15,11 @@
 
 ## 2. Режим запуска и рабочая папка
 
-- [ ] 2.0 Сделать `app/__init__.py` лёгким: перенести создание FastAPI-приложения и CORS в фабрику `create_app()` в `app/api.py`, чтобы импорт пакета и модулей `app.logging_setup`, `app.runner`, `app.permissions`, `app.event_tracking` не читал настройки и `.env`; перевести тесты и `reload_app` на `create_app()`, сохранив проверки `TestFilesDirectoryIsFixed`
-- [ ] 2.1 Переписать `app/__main__.py`: только запуск без аргументов, любые аргументы — сообщение об использовании и код 2; без импорта `app.api` и `app.settings`; переход в папку exe для собранного exe (путь — `win32api.GetModuleFileName(None)`, не `sys.executable`); запуск сервиса из `app/runner.py`
-- [ ] 2.2 В `.github/workflows/build-exe.yml` собрать exe с `--windows-console-mode=attach` (по итогам задачи 1.5)
+- [x] 2.0 Сделать `app/__init__.py` лёгким: перенести создание FastAPI-приложения и CORS в фабрику `create_app()` в `app/api.py`, чтобы импорт пакета и модулей `app.logging_setup`, `app.runner`, `app.permissions`, `app.event_tracking` не читал настройки и `.env`; перевести тесты и `reload_app` на `create_app()`, сохранив проверки `TestFilesDirectoryIsFixed`
+- [x] 2.1 Переписать `app/__main__.py`: только запуск без аргументов, любые аргументы — сообщение об использовании и код 2; без импорта `app.api` и `app.settings`; переход в папку exe для собранного exe (путь — `win32api.GetModuleFileName(None)`, не `sys.executable`); запуск сервиса из `app/runner.py`
+- [x] 2.2 В `.github/workflows/build-exe.yml` собрать exe с `--windows-console-mode=attach` (по итогам задачи 1.5)
 - [ ] 2.3 Тесты: разбор аргументов, переход в папку exe; импорт `app.runner` и `app.logging_setup` при ошибочном `.env` без исключения; отдельный процесс `python -m app` в папке с `FILES_DIRECTORY` в `.env` — код выхода 1 и запись об ошибке в журнале; дополнить `TestFilesDirectoryIsFixed` проверкой, что путь в аргументах (`D:\x`, `--files-directory D:\x`) даёт код 2 и не запускает сервис
-- [ ] 2.4 Тест: `run_test.bat` и `run_production.bat` запускают новую сборку (exe без аргументов работает как раньше)
+- [x] 2.4 Тест: `run_test.bat` и `run_production.bat` запускают новую сборку (exe без аргументов работает как раньше)
 
 ## 3. Журнал и журнал событий
 

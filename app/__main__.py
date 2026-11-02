@@ -1,36 +1,54 @@
-"""Точка входа для запуска приложения File Picker API."""
+"""Точка входа File Picker API: запуск сервиса без аргументов.
 
-import logging
+Модуль не импортирует app.api и app.settings: настройки читаются
+только при создании HTTP-приложения, после настройки журнала.
+"""
+
+import os
+import sys
 from pathlib import Path
 
-import uvicorn
+from app.stdio import ensure_std_streams
 
-from app import app, get_settings
+# Аргументы не принимаются: директория с файлами зашита в сборку, и
+# задать её при запуске нельзя (требование, см. CLAUDE.md)
+USAGE = (
+    "Использование: FilePickerAPI.exe\n"
+    "Сервис запускается без аргументов. Директория с файлами задаётся "
+    "при сборке и при запуске не меняется."
+)
 
-logger = logging.getLogger(__name__)
 
+def chdir_to_exe() -> None:
+    """Перейти в папку собранного exe.
 
-def ensure_files_directory() -> None:
-    """Создать директорию для файлов, если её ещё нет.
-
-    Ошибка создания не останавливает запуск: если сетевая папка
-    недоступна, сервис стартует, а GET /files отвечает ошибкой
-    (404, 403 или 500), пока папка не станет доступна.
+    Explorer запускает программы из Run с рабочей папкой профиля
+    пользователя, а .env читается из рабочей папки. Путь к exe даёт
+    только GetModuleFileName: в сборке Nuitka sys.executable указывает
+    на несуществующий python.exe. `python -m app` работает в текущей
+    папке, как раньше.
     """
-    files_directory = get_settings().files_directory
-    try:
-        Path(files_directory).mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        logger.warning(
-            "Не удалось создать директорию с файлами %s: %s", files_directory, e
-        )
+    if "__compiled__" not in globals():
+        return
+    import win32api
+
+    os.chdir(Path(win32api.GetModuleFileName(None)).parent)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Разобрать аргументы, запустить сервис и вернуть код выхода."""
+    args = sys.argv[1:] if argv is None else argv
+    if args:
+        # Exe без консоли: подсказка уходит в os.devnull, а не падает
+        ensure_std_streams()
+        sys.stderr.write(USAGE + "\n")
+        return 2
+    chdir_to_exe()
+
+    from app.runner import run
+
+    return run()
 
 
 if __name__ == "__main__":
-    # До запуска uvicorn логирование не настроено: без basicConfig
-    # предупреждение ушло бы в stderr без времени и уровня
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-    ensure_files_directory()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    sys.exit(main())
