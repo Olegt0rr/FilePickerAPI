@@ -11,6 +11,9 @@
 # временной папке раннера: созданный проверкой .env в архив не попадает.
 #
 # Используется в build-exe.yml после сборки первого филиала матрицы.
+# Скрипт PowerShell 7 (pwsh, shell: pwsh в workflow), как и sign.ps1:
+# Invoke-RestMethod -NoProxy, кодировка utf8NoBOM и
+# ProcessStartInfo.ArgumentList в Windows PowerShell 5.1 нет.
 
 param([Parameter(Mandatory)][string]$BuildDir)
 
