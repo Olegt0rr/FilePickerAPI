@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Пакет File Picker API для WiX 5.0.2 (.config/dotnet-tools.json),
+     по таблице «Содержимое MSI» в design.md изменения
+     user-logon-autostart. Сборка:
+       wix build installer\FilePickerAPI.wxs -arch x64
+         -ext WixToolset.Util.wixext -d Version=<X.Y.Z>
+         -d Branch=<филиал> -d Dist=<абсолютный путь к папке сборки>
+     Version — X.Y.Z: в build-exe.yml из scripts/msi_version.py,
+     в релизном джобе msi (без Python) — имя тега без «v». Dist — абсолютный
+     путь: с !(bindpath.…) шаблон Files ничего не находит, и WiX
+     только предупреждает (WIX8601). Проверки этого файла —
+     tests/test_installer.py. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <!-- Сборка Nuitka 64-битная. В пакете x86 ProgramFiles64Folder
+       недопустим, а значение Run попало бы в WOW6432Node -->
+  <!-- ~= сравнивает без учёта регистра: написание sys.BUILDARCH
+       в WiX 5.0.2 пробной сборкой не проверено -->
+  <?if $(sys.BUILDARCH) ~= "x64" ?>
+  <?else ?>
+  <?error Пакет собирается только с -arch x64 ?>
+  <?endif ?>
+
+  <!-- Один UpgradeCode для всех филиалов: на машине один продукт.
+       Он же — в Upgrade для поиска той же версии -->
+  <?define UpgradeCode = "4E62ACEB-84AD-4C82-8E7C-799A7D5932C1" ?>
+
+  <!-- Название на кириллице требует кодовой страницы 1251 у пакета
+       и у SummaryInformation, иначе сборка падает с WIX0311 -->
+  <Package Name="File Picker API (филиал $(var.Branch))"
+           Manufacturer="FilePickerAPI"
+           Version="$(var.Version)"
+           UpgradeCode="$(var.UpgradeCode)"
+           Scope="perMachine"
+           Codepage="1251"
+           Compressed="yes">
+    <SummaryInformation Codepage="1251" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Обновление — только установкой новой версии. Та же и более
+         старая версия поверх запрещены (без AllowSameVersionUpgrades
+         и AllowDowngrades): откат и смена филиала той же версии —
+         удаление и установка нужного MSI. При afterInstallInitialize
+         сбой обновления возвращает прежний продукт целиком -->
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="Установлена более новая версия File Picker API: сначала удалите её." />
+
+    <!-- MajorUpgrade не замечает ту же версию, а Windows Installer
+         не заменяет файлы той же версии: в папке оказались бы два
+         продукта или exe другого филиала -->
+    <Upgrade Id="$(var.UpgradeCode)">
+      <UpgradeVersion Minimum="$(var.Version)" Maximum="$(var.Version)"
+                      IncludeMinimum="yes" IncludeMaximum="yes"
+                      OnlyDetect="yes" Property="SAMEVERSIONFOUND" />
+    </Upgrade>
+    <Launch Condition="Installed OR NOT SAMEVERSIONFOUND"
+            Message="Эта версия File Picker API уже установлена: сначала удалите её." />
+
+    <!-- Идентификатор с маленькими буквами — не публичное свойство:
+         папку нельзя задать в командной строке msiexec, сборка всегда
+         там, куда пишут только администраторы -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="InstallDir" Name="FilePickerAPI" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Product" Directory="InstallDir">
+      <!-- Вся папка сборки Nuitka. bat-скрипты нужны только для запуска
+           по-старому из архива, файл сообщений ставится отдельно.
+           Шаблоны исключений пробной сборкой не проверены, а дымовой
+           проверки MSI в CI ещё нет: отсутствие bat-скриптов в пакете
+           должна проверять .github/scripts/msi-smoke.ps1 (задача 6.3) -->
+      <Files Include="$(var.Dist)\**">
+        <Exclude Files="$(var.Dist)\**\*.bat" />
+        <Exclude Files="$(var.Dist)\FilePickerAPI.messages.dll" />
+      </Files>
+
+      <!-- Запуск при входе любого пользователя от его имени: путь
+           в кавычках, без аргументов; удаляется вместе с продуктом -->
+      <Component Id="RunValue">
+        <RegistryValue Root="HKLM"
+                       Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="FilePickerAPI"
+                       Value="&quot;[InstallDir]FilePickerAPI.exe&quot;"
+                       Type="string" KeyPath="yes" />
+      </Component>
+
+      <!-- Файл сообщений и источник событий постоянные: текст прошлых
+           событий читается и после удаления продукта. DLL с ресурсом
+           VERSIONINFO заменяется только более новой версией, поэтому
+           после отката остаётся новейшая таблица -->
+      <Component Id="MessageFile" Permanent="yes">
+        <File Id="MessageDll"
+              Source="$(var.Dist)\FilePickerAPI.messages.dll"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="EventSource" Permanent="yes"
+                 Guid="82C55A39-C543-4374-8E78-21C79823EEE4">
+        <util:EventSource Log="Application" Name="FilePickerAPI"
+                          EventMessageFile="[#MessageDll]"
+                          SupportsErrors="yes" SupportsWarnings="yes"
+                          SupportsInformationals="yes" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="Product" />
+    </Feature>
+  </Package>
+</Wix>

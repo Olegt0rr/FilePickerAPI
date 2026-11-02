@@ -87,10 +87,21 @@ context: |
     отдельную сборку
   - scripts/branches.py — проверка branches.toml, матрица для CI
     (matrix) и запись пути филиала перед сборкой (configure <филиал>)
+  - scripts/msi_version.py — перевод версии сборки (app._version.version
+    или имени тега без «v») в ProductVersion MSI: первые три числа, не
+    больше 255.255.65535
+  - installer/FilePickerAPI.wxs — пакет MSI (WiX): установка в
+    C:\Program Files\FilePickerAPI\, значение Run в HKLM, постоянные
+    источник событий и FilePickerAPI.messages.dll
+  - .config/dotnet-tools.json — WiX, закреплённый точной версией
+    (Dependabot его не обновляет)
   - app/handlers/ — роутеры; бизнес-логика файлов в app/handlers/files.py
   - tests/test_main.py — тесты API и настроек (pytest + fastapi.testclient)
   - tests/test_branches.py — тесты branches.toml, scripts/branches.py и
     источника пути к файлам
+  - tests/test_installer.py — тесты installer/FilePickerAPI.wxs как XML
+    и scripts/msi_version.py; tests/script_loader.py загружает
+    скрипты из scripts/ без импорта приложения
   - tests/test_logging_setup.py — тесты журнала (поддельные модули
     pywin32); tests/conftest.py изолирует журнал каждого теста
 
