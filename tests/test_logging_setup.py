@@ -14,6 +14,7 @@ import pytest
 
 from app import logging_setup
 from app.event_tracking import EventId, is_tracked, mark_tracked
+from tests.platforms import windows_only
 
 # Настоящие функции: conftest подменяет их в каждом тесте
 REAL_LOG_FILE_PATH = logging_setup.log_file_path
@@ -21,8 +22,6 @@ REAL_EVENT_SOURCE_REGISTERED = logging_setup.event_source_registered
 
 MC_FILE = Path(__file__).parent.parent / "app" / "messages" / "FilePickerAPI.mc"
 DAY = 24 * 60 * 60
-
-windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Только Windows")
 
 
 def fake_win32evtlog():

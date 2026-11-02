@@ -80,6 +80,14 @@ context: |
     учтённых исключений
   - app/messages/ — таблица сообщений журнала событий (FilePickerAPI.mc)
     и ресурс версии; CI собирает из них FilePickerAPI.messages.dll
+  - app/permissions.py — проверка прав на папку сборки, её содержимое и
+    предков до корня тома: чистая функция find_violations над ACE,
+    чтение прав через win32security (ленивый импорт), junction и
+    символические ссылки в пути, текст события 1003
+  - app/winapi.py — вызовы WinAPI, которых нет в pywin32, через ctypes с
+    ленивой загрузкой библиотек: PID владельца порта IPv4 и IPv6
+    (GetExtendedTcpTable, разбор таблиц — чистая функция над байтами) и
+    RegisterApplicationRestart
   - app/settings.py — настройки (pydantic-settings, кэш через lru_cache);
     путь к файлам — из app/_build_config.py (генерируется при сборке,
     не хранится в git), без него — ./files
@@ -97,6 +105,11 @@ context: |
     (Dependabot его не обновляет)
   - app/handlers/ — роутеры; бизнес-логика файлов в app/handlers/files.py
   - tests/test_main.py — тесты API и настроек (pytest + fastapi.testclient)
+  - tests/platforms.py — пометки windows_only и linux_only для тестов
+  - tests/test_permissions.py — тесты проверки прав: наборы ACE, чтение
+    с поддельным win32security, на Windows — папки с правами через icacls
+  - tests/test_winapi.py — тесты app/winapi.py: разбор таблицы TCP и
+    подмена ctypes, на Windows — настоящие вызовы
   - tests/test_branches.py — тесты branches.toml, scripts/branches.py и
     источника пути к файлам
   - tests/test_installer.py — тесты installer/FilePickerAPI.wxs как XML
