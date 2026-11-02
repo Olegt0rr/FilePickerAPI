@@ -72,6 +72,14 @@ context: |
   - app/runner.py — запуск сервиса: журнал, create_app() (ошибка
     настроек — код 1), создание директории файлов, Uvicorn на
     0.0.0.0:8000
+  - app/logging_setup.py — журнал: консоль при запуске из неё; на
+    Windows файл %LOCALAPPDATA%\FilePickerAPI\logs\FilePickerAPI.log
+    (ротация в полночь, хранение 30 дней) и журнал событий Application,
+    если источник FilePickerAPI зарегистрирован (буфер стартовых событий)
+  - app/event_tracking.py — коды событий журнала событий и пометка уже
+    учтённых исключений
+  - app/messages/ — таблица сообщений журнала событий (FilePickerAPI.mc)
+    и ресурс версии; CI собирает из них FilePickerAPI.messages.dll
   - app/settings.py — настройки (pydantic-settings, кэш через lru_cache);
     путь к файлам — из app/_build_config.py (генерируется при сборке,
     не хранится в git), без него — ./files
@@ -83,6 +91,8 @@ context: |
   - tests/test_main.py — тесты API и настроек (pytest + fastapi.testclient)
   - tests/test_branches.py — тесты branches.toml, scripts/branches.py и
     источника пути к файлам
+  - tests/test_logging_setup.py — тесты журнала (поддельные модули
+    pywin32); tests/conftest.py изолирует журнал каждого теста
 
   ## Соглашения
   - Комментарии, docstring-и, сообщения коммитов и документация — на русском;

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import uvicorn
 
+from app.logging_setup import send_startup_events, setup_logging
 from app.stdio import ensure_std_streams
 
 logger = logging.getLogger(__name__)
@@ -39,12 +40,7 @@ def ensure_files_directory() -> None:
 
 def run() -> int:
     """Запустить сервис и вернуть код выхода процесса."""
-    ensure_std_streams()
-    # До запуска uvicorn логирование не настроено: без basicConfig
-    # предупреждение ушло бы в stderr без времени и уровня
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    setup_logging(console=ensure_std_streams())
 
     from pydantic import ValidationError
 
@@ -55,7 +51,13 @@ def run() -> int:
     except ValidationError:
         # Например, FILES_DIRECTORY в .env: путь задаётся только сборкой
         logger.exception("Ошибка настроек, сервис не запущен")
+        send_startup_events()
         return 1
     ensure_files_directory()
-    uvicorn.run(app, host=HOST, port=PORT)
+    # Пока нет отслеживания старта HTTP-сервера, буфер стартовых событий
+    # отправляется перед запуском Uvicorn
+    send_startup_events()
+    # log_config=None: Uvicorn пишет через наши обработчики, а не
+    # переписывает их своей настройкой
+    uvicorn.run(app, host=HOST, port=PORT, log_config=None)
     return 0

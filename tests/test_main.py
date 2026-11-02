@@ -2700,20 +2700,30 @@ class TestMainExecution:
 
         Отдельный процесс: в этом модули уже импортированы тестами.
         Один процесс на обе проверки: запуск после импорта — тот же
-        путь, что у `python -m app`.
+        путь, что у `python -m app`. Файл журнала — во временной папке
+        и на любой ОС (ветка Windows), журнала событий нет.
         """
         (tmp_path / ".env").write_text("FILES_DIRECTORY=D:\\x\n", encoding="utf-8")
+        log_file = tmp_path / "logs" / "FilePickerAPI.log"
         code = (
-            "import sys, app, app.__main__, app.runner\n"
+            "import pathlib, sys, app, app.__main__, app.runner\n"
+            "import app.logging_setup as logging_setup\n"
             "loaded = {'app.api', 'app.settings'} & set(sys.modules)\n"
             "assert not loaded, loaded\n"
+            "logging_setup._windows = lambda: True\n"
+            "logging_setup.event_source_registered = lambda: False\n"
+            f"logging_setup.log_file_path = lambda: pathlib.Path({str(log_file)!r})\n"
             "sys.exit(app.__main__.main([]))\n"
         )
         result = run_python("-c", code, cwd=tmp_path)
         assert "AssertionError" not in result.stderr, result.stderr
         assert result.returncode == 1
-        assert "ERROR app.runner: Ошибка настроек, сервис не запущен" in result.stderr
+        error_line = "ERROR app.runner: Ошибка настроек, сервис не запущен"
+        assert error_line in result.stderr
         assert "files_directory" in result.stderr.lower()
+        logged = log_file.read_text(encoding="utf-8")
+        assert error_line in logged
+        assert "files_directory" in logged.lower()
 
 
 class TestRunner:
@@ -2736,7 +2746,8 @@ class TestRunner:
             assert runner.run() == 0
 
         [app], kwargs = uvicorn_run.call_args
-        assert kwargs == {"host": "0.0.0.0", "port": 8000}
+        # log_config=None: Uvicorn пишет через обработчики сервиса
+        assert kwargs == {"host": "0.0.0.0", "port": 8000, "log_config": None}
         assert TestClient(app).get("/openapi.json").status_code == 200
         assert files_dir.is_dir()
 
