@@ -200,6 +200,8 @@ jobs:
           exit 1
         }
         Write-Output "Building version $fullVersion (file version $version)"
+        # Та же версия — у DLL сообщений (следующий шаг)
+        "FILE_VERSION=$version" >> $env:GITHUB_ENV
         # attach: запущенный из cmd или PowerShell exe пишет журнал в эту
         # консоль и останавливается по Ctrl+C, а запущенный при входе,
         # двойным щелчком или run_production.bat работает без окна
@@ -215,6 +217,7 @@ jobs:
           --include-package=app `
           --include-module=app._build_config `
           --include-package=uvicorn `
+          --include-module=win32timezone `
           --product-name=FilePickerAPI `
           --file-description="File Picker API" `
           --file-version=$version `
@@ -224,6 +227,36 @@ jobs:
         New-Item -ItemType Directory -Force dist | Out-Null
         Move-Item build/FilePickerAPI.dist dist/FilePickerAPI
         Copy-Item run_test.bat, run_production.bat dist/FilePickerAPI/
+
+    # Ресурсная DLL с таблицей сообщений журнала событий: на неё указывает
+    # EventMessageFile источника FilePickerAPI, без неё Event Viewer
+    # пишет «Не найдено описание». VERSIONINFO нужен, чтобы Windows
+    # Installer заменял DLL при обновлении по версии. mc, rc и link — из
+    # того же MSVC, что у Nuitka
+    - name: Build event message DLL
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if (-not $vs) {
+          Write-Output "::error::MSVC not found"
+          exit 1
+        }
+        $out = 'build\messages'
+        New-Item -ItemType Directory -Force $out | Out-Null
+        # 2.3.1 -> 2,3,1,0; 0.1 -> 0,1,0,0
+        $fileVersion = (@($env:FILE_VERSION.Split('.')) + @('0', '0', '0') | Select-Object -First 4) -join ','
+        $rc = Get-Content app\messages\FilePickerAPI.version.rc -Raw
+        $rc = $rc.Replace('@FILEVERSION@', $fileVersion).Replace('@VERSION@', $env:FILE_VERSION)
+        Set-Content "$out\version.rc" $rc -Encoding ascii
+        cmd /c "call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && mc -U -h $out -r $out app\messages\FilePickerAPI.mc && rc /nologo /fo $out\FilePickerAPI.res $out\version.rc && link /nologo /DLL /NOENTRY /MACHINE:X64 /OUT:$out\FilePickerAPI.messages.dll $out\FilePickerAPI.res"
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        $dll = Get-Item "$out\FilePickerAPI.messages.dll"
+        if ($dll.VersionInfo.FileVersion -ne $env:FILE_VERSION) {
+          Write-Output "::error::Message DLL version is '$($dll.VersionInfo.FileVersion)', expected '$env:FILE_VERSION'"
+          exit 1
+        }
+        Copy-Item $dll dist/FilePickerAPI/
 
     # Новая сборка работает с прежними bat-скриптами, принимает только
     # запуск без аргументов и читает .env из своей папки. Проверяется
