@@ -160,7 +160,7 @@ jobs:
         import runpy
 
         # Читаем сгенерированный файл через runpy, а не импортом app:
-        # импорт выполнил бы app/__init__.py (FastAPI, настройки, .env).
+        # так проверяется ровно этот файл, без импорта пакета.
         actual = runpy.run_path("app/_build_config.py")["FILES_DIRECTORY"]
         expected = os.environ["EXPECTED_DIRECTORY"]
         print("files_directory =", actual)
@@ -190,8 +190,8 @@ jobs:
         # Версию вычисляет setuptools-scm из git-тега при pip install.
         # Для свойств exe нужны только ведущие числа (не больше трёх):
         # 2.3.1.dev4+g1a2b3c4 -> 2.3.1, 0.1.dev4+g1a2b3c4 (нет тегов) -> 0.1.
-        # Файл читаем через runpy, а не импортом: импорт app._version
-        # выполнил бы app/__init__.py (FastAPI, настройки, чтение .env).
+        # Файл читаем через runpy, а не импортом: так читается ровно
+        # app/_version.py, без импорта пакета.
         $out = python -c "import runpy; from itertools import takewhile; ns = runpy.run_path('app/_version.py'); v = ns['version_tuple']; print(ns['version']); print('.'.join(str(p) for p in takewhile(lambda p: isinstance(p, int), v[:3])))"
         if ($LASTEXITCODE -or @($out).Count -ne 2 -or -not $out[1]) { exit 1 }
         $fullVersion, $version = $out
@@ -200,8 +200,12 @@ jobs:
           exit 1
         }
         Write-Output "Building version $fullVersion (file version $version)"
+        # attach: запущенный из cmd или PowerShell exe пишет журнал в эту
+        # консоль и останавливается по Ctrl+C, а запущенный при входе,
+        # двойным щелчком или run_production.bat работает без окна
         python -m nuitka `
           --mode=standalone `
+          --windows-console-mode=attach `
           --msvc=latest `
           --assume-yes-for-downloads `
           --remove-output `
@@ -220,7 +224,17 @@ jobs:
         New-Item -ItemType Directory -Force dist | Out-Null
         Move-Item build/FilePickerAPI.dist dist/FilePickerAPI
         Copy-Item run_test.bat, run_production.bat dist/FilePickerAPI/
-    
+
+    # Новая сборка работает с прежними bat-скриптами, принимает только
+    # запуск без аргументов и читает .env из своей папки. Проверяется
+    # копия сборки: созданный проверкой .env не должен попасть в архив.
+    # Сборки филиалов отличаются только app._build_config, поэтому
+    # достаточно проверить одну
+    - name: Check startup scripts and arguments
+      if: strategy.job-index == 0
+      shell: pwsh
+      run: ./.github/scripts/startup-smoke.ps1 dist/FilePickerAPI
+
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:

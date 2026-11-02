@@ -17,6 +17,10 @@ dependencies = [
     # точная версия не даёт оставить уязвимую Starlette < 1.0.1 и
     # позволяет Dependabot видеть её advisory
     "starlette==1.9.0",
+    # Windows API для сборки: путь к exe (GetModuleFileName), а дальше
+    # журнал событий, скрытое окно и права на папку (user-logon-autostart).
+    # На других ОС не ставится, там сервис обходится без него
+    "pywin32==312; sys_platform == 'win32'",
 ]
 
 [tool.setuptools]

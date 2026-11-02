@@ -42,13 +42,13 @@ def reload_app(files_directory=None):
         importlib.reload(sys.modules["app.handlers.files"])
     if "app" in sys.modules:
         importlib.reload(sys.modules["app"])
+    # app.api берёт версию из пакета при импорте
+    api = importlib.reload(importlib.import_module("app.api"))
     import app.settings as settings_module
 
     if files_directory is not None:
         settings_module.Settings.files_directory = files_directory
-    from app import app as test_app
-
-    return test_app
+    return api.create_app()
 
 
 def assert_sorted_by_created_at(files: list[dict]) -> None:
@@ -2581,49 +2581,249 @@ class TestFilesDirectoryCache:
         assert calls == [True]
 
 
+MAIN_FILE = Path(__file__).parent.parent / "app" / "__main__.py"
+
+
+def exec_main(argv):
+    """Выполнить app/__main__.py как `python -m app` с аргументами argv.
+
+    Возвращает код выхода из sys.exit.
+    """
+    # Кодировка явно: на Windows по умолчанию берётся кодовая страница
+    # системы (cp1252 в CI), а в файле кириллица
+    code = compile(MAIN_FILE.read_text(encoding="utf-8"), str(MAIN_FILE), "exec")
+    with (
+        mock.patch.object(sys, "argv", ["FilePickerAPI.exe", *argv]),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        exec(code, {"__name__": "__main__"})
+    return exc_info.value.code
+
+
+def run_python(*args, cwd, timeout=60):
+    """Запустить отдельный процесс Python в папке cwd.
+
+    Пакет app берётся из установки (pip install -e), а не из cwd.
+    """
+    return subprocess.run(  # noqa: S603 - аргументы задаются тестом
+        [sys.executable, *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        timeout=timeout,
+        check=False,
+    )
+
+
 class TestMainExecution:
-    """Тесты для блока выполнения main."""
+    """Точка входа: только запуск без аргументов."""
 
-    def test_main_module_directly(self):
-        """Проверить выполнение app/__main__.py с __name__,
-        установленным в '__main__'.
+    def test_no_arguments_runs_service(self):
+        """Проверить: без аргументов запускается сервис, его код —
+        код выхода.
         """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            files_dir = Path(tmpdir) / "main_test_dir"
+        with mock.patch("app.runner.run", return_value=0) as run:
+            assert exec_main([]) == 0
+        run.assert_called_once_with()
 
-            # Перезагружаем модули и патчим files_directory
-            reload_app(files_directory=str(files_dir))
+    @pytest.mark.parametrize(
+        "argv",
+        [["D:\\x"], ["--files-directory", "D:\\x"], ["--help"], [""]],
+    )
+    def test_arguments_give_usage(self, argv, capsys):
+        """Проверить: аргументы — подсказка и код 2 без запуска."""
+        with mock.patch("app.runner.run") as run:
+            assert exec_main(argv) == 2
+        run.assert_not_called()
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err.startswith("Использование: FilePickerAPI.exe")
 
-            with mock.patch("uvicorn.run") as mock_run:
-                # Выполняем файл app/__main__.py напрямую
-                main_file = Path(__file__).parent.parent / "app" / "__main__.py"
-                # Кодировка явно: на Windows по умолчанию берётся
-                # кодовая страница системы (cp1252 в CI), а в файле
-                # кириллица
-                with open(main_file, encoding="utf-8") as f:
-                    code = compile(f.read(), str(main_file), "exec")
+    @pytest.mark.parametrize("closed", [False, True])
+    def test_arguments_without_usable_stderr(self, monkeypatch, closed):
+        """Проверить: exe без консоли (stderr — None или закрыт) даёт
+        код 2, подсказка уходит в os.devnull.
+        """
+        from app.__main__ import main
 
-                # Создаем пространство имен с __name__
-                # как '__main__'
-                namespace = {"__name__": "__main__"}
-                exec(code, namespace)
+        stderr = None
+        if closed:
+            stderr = tempfile.TemporaryFile("w")  # noqa: SIM115
+            stderr.close()
+        monkeypatch.setattr(sys, "stderr", stderr)
+        with mock.patch("app.runner.run") as run:
+            assert main(["D:\\x"]) == 2
+        run.assert_not_called()
+        replaced = sys.stderr
+        assert replaced.name == os.devnull
+        replaced.close()
 
-                # Сервис слушает все интерфейсы на порту 8000
-                mock_run.assert_called_once_with(
-                    namespace["app"], host="0.0.0.0", port=8000
-                )
-                # Проверяем, что директория была создана
-                assert files_dir.exists()
+    def test_compiled_exe_works_from_its_folder(self, monkeypatch, tmp_path):
+        """Проверить: собранный exe переходит в свою папку.
 
-    def test_unreachable_directory_does_not_stop_startup(self, caplog):
+        Путь к exe — из GetModuleFileName, а не из sys.executable.
+        """
+        import app.__main__ as main_module
+
+        exe_dir = tmp_path / "Program Files" / "FilePickerAPI"
+        exe_dir.mkdir(parents=True)
+        win32api = types.ModuleType("win32api")
+        win32api.GetModuleFileName = mock.Mock(
+            return_value=str(exe_dir / "FilePickerAPI.exe")
+        )
+        monkeypatch.setitem(sys.modules, "win32api", win32api)
+        # Nuitka задаёт __compiled__ в каждом скомпилированном модуле
+        monkeypatch.setattr(main_module, "__compiled__", object(), raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        main_module.chdir_to_exe()
+
+        assert Path.cwd() == exe_dir
+        win32api.GetModuleFileName.assert_called_once_with(None)
+
+    def test_python_m_app_keeps_working_directory(self, monkeypatch, tmp_path):
+        """Проверить: `python -m app` работает в текущей папке."""
+        from app.__main__ import chdir_to_exe
+
+        monkeypatch.setitem(sys.modules, "win32api", None)
+        monkeypatch.chdir(tmp_path)
+        chdir_to_exe()
+        assert Path.cwd() == tmp_path
+
+    def test_dotenv_files_directory_stops_process(self, tmp_path):
+        """Проверить отдельным процессом: импорт точки входа и модулей
+        запуска не читает настройки, а запуск с FILES_DIRECTORY в .env —
+        запись об ошибке в журнале и код 1.
+
+        Отдельный процесс: в этом модули уже импортированы тестами.
+        Один процесс на обе проверки: запуск после импорта — тот же
+        путь, что у `python -m app`.
+        """
+        (tmp_path / ".env").write_text("FILES_DIRECTORY=D:\\x\n", encoding="utf-8")
+        code = (
+            "import sys, app, app.__main__, app.runner\n"
+            "loaded = {'app.api', 'app.settings'} & set(sys.modules)\n"
+            "assert not loaded, loaded\n"
+            "sys.exit(app.__main__.main([]))\n"
+        )
+        result = run_python("-c", code, cwd=tmp_path)
+        assert "AssertionError" not in result.stderr, result.stderr
+        assert result.returncode == 1
+        assert "ERROR app.runner: Ошибка настроек, сервис не запущен" in result.stderr
+        assert "files_directory" in result.stderr.lower()
+
+
+class TestRunner:
+    """Запуск сервиса: настройки, директория, Uvicorn."""
+
+    @pytest.fixture
+    def runner(self):
+        import app.runner
+
+        return app.runner
+
+    def test_run_starts_uvicorn(self, runner, tmp_path):
+        """Проверить: директория создаётся, Uvicorn слушает все
+        интерфейсы на порту 8000.
+        """
+        files_dir = tmp_path / "missing" / "files"
+        reload_app(files_directory=str(files_dir))
+
+        with mock.patch.object(runner.uvicorn, "run") as uvicorn_run:
+            assert runner.run() == 0
+
+        [app], kwargs = uvicorn_run.call_args
+        assert kwargs == {"host": "0.0.0.0", "port": 8000}
+        assert TestClient(app).get("/openapi.json").status_code == 200
+        assert files_dir.is_dir()
+
+    def test_settings_error_stops_service(self, runner, monkeypatch, tmp_path, caplog):
+        """Проверить: FILES_DIRECTORY в .env — ошибка в журнале, код 1,
+        Uvicorn не запускается и директория не создаётся.
+        """
+        files_dir = tmp_path / "files"
+        reload_app(files_directory=str(files_dir))
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("FILES_DIRECTORY=D:\\x\n", encoding="utf-8")
+        from app.settings import get_settings
+
+        get_settings.cache_clear()
+        try:
+            with mock.patch.object(runner.uvicorn, "run") as uvicorn_run:
+                assert runner.run() == 1
+        finally:
+            get_settings.cache_clear()
+
+        uvicorn_run.assert_not_called()
+        assert not files_dir.exists()
+        [record] = [r for r in caplog.records if r.name == "app.runner"]
+        assert record.levelno == logging.ERROR
+        assert record.exc_info is not None
+
+    def test_unreachable_directory_does_not_stop_startup(self, runner, caplog):
         """Проверить, что недоступная директория не мешает запуску."""
         reload_app(files_directory=r"\\unreachable\share")
-        from app.__main__ import ensure_files_directory
 
         error = OSError("The network path was not found")
         with mock.patch("pathlib.Path.mkdir", side_effect=error):
-            ensure_files_directory()
+            runner.ensure_files_directory()
         assert "The network path was not found" in caplog.text
+
+
+class TestStdStreams:
+    """Стандартные потоки процесса без консоли."""
+
+    def test_missing_std_streams_replaced(self, monkeypatch):
+        """Проверить: без консоли stdout и stderr заменяются на
+        os.devnull, существующие потоки не трогаются.
+        """
+        from app.stdio import ensure_std_streams
+
+        stderr = sys.stderr
+        monkeypatch.setattr(sys, "stdout", None)
+
+        ensure_std_streams()
+
+        replaced = sys.stdout
+        try:
+            assert replaced.name == os.devnull
+            assert sys.stderr is stderr
+            replaced.write("ignored")
+        finally:
+            replaced.close()
+
+    def test_stream_with_invalid_handle_replaced(self, monkeypatch):
+        """Проверить: поток с недействительным дескриптором заменён."""
+        from app.stdio import ensure_std_streams
+
+        broken = mock.Mock(closed=False)
+        # Такого дескриптора в процессе нет: os.fstat даёт EBADF
+        broken.fileno.return_value = 1_000_000
+        monkeypatch.setattr(sys, "stderr", broken)
+
+        ensure_std_streams()
+
+        replaced = sys.stderr
+        try:
+            assert replaced.name == os.devnull
+        finally:
+            replaced.close()
+
+    def test_stream_without_handle_kept(self, monkeypatch):
+        """Проверить: поток без дескриптора (StringIO) не заменяется."""
+        import io
+
+        from app.stdio import ensure_std_streams
+
+        stream = io.StringIO()
+        monkeypatch.setattr(sys, "stdout", stream)
+
+        ensure_std_streams()
+
+        assert sys.stdout is stream
 
 
 class TestFilesDirectoryIsFixed:
@@ -2705,27 +2905,35 @@ class TestFilesDirectoryIsFixed:
         response = client.get("/files/marker.txt")
         assert response.status_code == 404
 
-    def test_command_line_does_not_override(self, served_dir, monkeypatch):
-        """Проверить: аргументы командной строки не задают директорию.
+    @pytest.mark.parametrize("flag", [[], ["--files-directory"]])
+    def test_command_line_does_not_override(self, served_dir, flag):
+        """Проверить: путь в аргументах — код 2, сервис не запускается.
 
-        При запуске создаётся директория из сборки, а не переданная.
+        Ни переданная директория, ни директория из сборки не создаются.
         """
         served, attacker = served_dir
         other = attacker.parent / "from_argv"
-        monkeypatch.setattr(
-            sys, "argv", ["FilePickerAPI.exe", "--files-directory", str(other)]
-        )
         reload_app()
 
-        main_file = Path(__file__).parent.parent / "app" / "__main__.py"
-        code = compile(main_file.read_text(encoding="utf-8"), str(main_file), "exec")
-        namespace = {"__name__": "__main__"}
-        with mock.patch("uvicorn.run") as mock_run:
-            exec(code, namespace)
+        with mock.patch("uvicorn.run") as uvicorn_run:
+            assert exec_main([*flag, str(other)]) == 2
 
-        mock_run.assert_called_once_with(namespace["app"], host="0.0.0.0", port=8000)
-        assert served.is_dir()
+        uvicorn_run.assert_not_called()
+        assert not served.exists()
         assert not other.exists()
+
+    def test_no_arguments_serves_build_directory(self, served_dir):
+        """Проверить: запуск без аргументов создаёт директорию из
+        сборки, а не из переменной окружения.
+        """
+        served, _ = served_dir
+        reload_app()
+
+        with mock.patch("uvicorn.run") as uvicorn_run:
+            assert exec_main([]) == 0
+
+        uvicorn_run.assert_called_once()
+        assert served.is_dir()
 
     def test_constructor_argument_does_not_override(self, settings_module):
         """Проверить, что путь нельзя передать при создании настроек."""
