@@ -229,19 +229,52 @@ class TestTcpListeners:
 
 
 class TestPortOwnerPid:
-    def test_first_listener(self):
-        rows = [
-            winapi.TcpRow(_LISTEN, "127.0.0.1", 445, 4),
-            winapi.TcpRow(_LISTEN, "0.0.0.0", 8000, 100),
-            winapi.TcpRow(_LISTEN, "127.0.0.1", 8000, 200),
-        ]
+    def owner(self, *listeners, address="127.0.0.1"):
+        """PID слушателя порта 8000 из (адрес, порт, PID)."""
+        rows = [winapi.TcpRow(_LISTEN, *listener) for listener in listeners]
         with mock.patch.object(winapi, "tcp_listeners", return_value=rows):
-            assert winapi.port_owner_pid(8000) == 100
+            return winapi.port_owner_pid(8000, address)
+
+    def test_exact_address_over_wildcard(self):
+        """Проверить: соединение на 127.0.0.1 получает его слушатель."""
+        pid = self.owner(
+            ("192.168.1.10", 8000, 300),
+            ("0.0.0.0", 8000, 100),
+            ("127.0.0.1", 8000, 200),
+            ("127.0.0.1", 445, 4),
+        )
+        assert pid == 200
+
+    def test_ipv4_wildcard(self):
+        pid = self.owner(("192.168.1.10", 8000, 300), ("0.0.0.0", 8000, 100))
+        assert pid == 100
+
+    def test_ipv4_wildcard_over_ipv6(self):
+        pid = self.owner(("::", 8000, 77), ("0.0.0.0", 8000, 100))
+        assert pid == 100
+
+    def test_dual_stack_ipv6_wildcard(self):
+        """Проверить: [::] без IPV6_V6ONLY принимает и IPv4."""
+        assert self.owner(("::", 8000, 77)) == 77
+
+    def test_other_address_only(self):
+        """Проверить: слушатель другого адреса соединение не получит."""
+        pid = self.owner(("192.168.1.10", 8000, 300), ("::1", 8000, 5))
+        assert pid is None
+
+    def test_ipv6_target(self):
+        listeners = [("0.0.0.0", 8000, 100), ("::", 8000, 77), ("::1", 8000, 5)]
+        assert self.owner(*listeners, address="::1") == 5
+        assert self.owner(*listeners[:2], address="::1") == 77
+        assert self.owner(listeners[0], address="::1") is None
 
     def test_nobody_listens(self):
-        rows = [winapi.TcpRow(_LISTEN, "127.0.0.1", 445, 4)]
+        assert self.owner(("127.0.0.1", 445, 4)) is None
+
+    def test_default_address(self):
+        rows = [winapi.TcpRow(_LISTEN, "127.0.0.1", 8000, 200)]
         with mock.patch.object(winapi, "tcp_listeners", return_value=rows):
-            assert winapi.port_owner_pid(8000) is None
+            assert winapi.port_owner_pid(8000) == 200
 
 
 @pytest.fixture
@@ -289,7 +322,7 @@ class TestWindows:
             listener.bind(("::1", 0))
             listener.listen()
             port = listener.getsockname()[1]
-            assert winapi.port_owner_pid(port) == os.getpid()
+            assert winapi.port_owner_pid(port, "::1") == os.getpid()
 
     def test_register_application_restart(self):
         kernel32 = ctypes.WinDLL("kernel32")

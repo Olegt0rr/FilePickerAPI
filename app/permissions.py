@@ -121,7 +121,6 @@ class ObjectSecurity(NamedTuple):
     kind: ObjectKind
     owner: str | None
     dacl: tuple[Ace, ...] | None
-    reparse_point: bool = False
 
 
 class Problem(StrEnum):
@@ -156,8 +155,6 @@ def _right_names(mask: int) -> tuple[str, ...]:
 def _object_violations(
     obj: ObjectSecurity, trusted: frozenset[str]
 ) -> Iterator[Violation]:
-    if obj.reparse_point:
-        yield Violation(obj.path, Problem.REPARSE_POINT)
     if obj.owner not in trusted:
         yield Violation(obj.path, Problem.OWNER, obj.owner)
     if obj.dacl is None:
@@ -284,9 +281,7 @@ def _is_reparse_point(stat_result: os.stat_result) -> bool:
     )
 
 
-def _read_security(
-    path: str, kind: ObjectKind, *, reparse_point: bool
-) -> ObjectSecurity:
+def _read_security(path: str, kind: ObjectKind) -> ObjectSecurity:
     """Прочитать владельца и DACL объекта через win32security."""
     import win32security
 
@@ -315,15 +310,18 @@ def _read_security(
         kind=kind,
         owner=None if owner is None else win32security.ConvertSidToStringSid(owner),
         dacl=dacl,
-        reparse_point=reparse_point,
     )
 
 
 def _check_object(
     path: str, kind: ObjectKind, stat_result: os.stat_result
 ) -> list[Violation]:
+    if _is_reparse_point(stat_result):
+        # GetNamedSecurityInfo перешёл бы по ссылке и прочитал права её
+        # цели, возможно, на сетевом ресурсе
+        return [Violation(path, Problem.REPARSE_POINT)]
     try:
-        obj = _read_security(path, kind, reparse_point=_is_reparse_point(stat_result))
+        obj = _read_security(path, kind)
     except Exception as e:
         return [Violation(path, Problem.UNREADABLE, detail=str(e))]
     return find_violations([obj])
@@ -353,9 +351,10 @@ def _check_content(directory: str) -> Iterator[Violation]:
 def check_build_folder(folder: Path) -> list[Violation]:
     """Проверить права на папку сборки, её содержимое и предков.
 
-    Путь не разрешается: junction в нём — само по себе нарушение.
-    Ошибка чтения прав объекта — тоже нарушение, а не исключение, и
-    проверка продолжается.
+    Путь не разрешается: junction в нём — само по себе нарушение, и
+    дальше ссылки проверка не идёт: ни права, ни содержимое её цели не
+    читаются. Ошибка чтения прав объекта — тоже нарушение, а не
+    исключение, и проверка продолжается.
 
     Args:
         folder: Абсолютный путь к папке exe
@@ -375,6 +374,9 @@ def check_build_folder(folder: Path) -> list[Violation]:
             violations.append(Violation(str(path), Problem.UNREADABLE, detail=str(e)))
             continue
         violations.extend(_check_object(str(path), kind, stat_result))
+        if _is_reparse_point(stat_result):
+            # Дальше путь ведёт к цели ссылки, а не в папку сборки
+            break
         if path == folder:
             violations.extend(_check_content(str(folder)))
     return violations

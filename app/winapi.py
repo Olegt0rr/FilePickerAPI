@@ -178,20 +178,42 @@ def _tcp_table(family: int) -> list[TcpRow]:
     raise OSError(None, msg, None, result)
 
 
-def port_owner_pid(port: int) -> int | None:
-    """Вернуть PID процесса, который слушает порт TCP.
+def port_owner_pid(port: int, address: str = "127.0.0.1") -> int | None:
+    """Вернуть PID процесса, который примет соединение на address:port.
+
+    Соединение получает слушатель на самом адресе, а без него —
+    слушатель на адресе «любой» своего семейства. К адресу IPv4
+    подходит и [::]: режим IPV6_V6ONLY по таблице не узнать, а без него
+    такой слушатель принимает и IPv4. Слушатель на другом адресе с тем
+    же портом соединение не получит.
 
     Args:
         port: Номер порта
+        address: Адрес, к которому подключается клиент
 
     Returns:
-        PID первого слушателя порта или None, если порт никто не слушает
+        PID слушателя или None, если соединение никто не примет
 
     Raises:
         OSError: Если таблицу TCP получить не удалось
 
     """
-    return next((row.pid for row in tcp_listeners() if row.local_port == port), None)
+    target = ipaddress.ip_address(address)
+    wildcards = ("::",)
+    if isinstance(target, ipaddress.IPv4Address):
+        wildcards = ("0.0.0.0", *wildcards)
+    pids: dict[str, int] = {}
+    for row in tcp_listeners():
+        if row.local_port == port:
+            pids.setdefault(row.local_address, row.pid)
+    return next(
+        (
+            pids[candidate]
+            for candidate in (str(target), *wildcards)
+            if candidate in pids
+        ),
+        None,
+    )
 
 
 def register_application_restart() -> None:

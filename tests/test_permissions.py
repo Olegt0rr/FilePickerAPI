@@ -304,10 +304,6 @@ class TestFindViolations:
             ),
         ]
 
-    def test_reparse_point(self):
-        obj = secured("C:\\link", ObjectKind.ANCESTOR)._replace(reparse_point=True)
-        assert find_violations([obj]) == [Violation("C:\\link", Problem.REPARSE_POINT)]
-
     def test_order_of_objects(self):
         objects = [
             secured("C:\\", ObjectKind.ANCESTOR, owner=ALICE),
@@ -534,15 +530,34 @@ class TestCheckBuildFolder:
             Violation(lib, Problem.NULL_DACL),
         }
 
-    def test_link_in_path(self, tmp_path, build_folder):
-        """Проверить: junction (ссылка) в пути к папке — нарушение."""
+    def read_paths(self, win32security):
+        """Записывать пути, права которых читаются."""
+        seen = []
+        real = win32security.GetNamedSecurityInfo
+
+        def record(path, *args):
+            seen.append(path)
+            return real(path, *args)
+
+        win32security.GetNamedSecurityInfo = record
+        return seen
+
+    def test_link_in_path(self, win32security, tmp_path, build_folder):
+        """Проверить: junction (ссылка) в пути к папке — нарушение.
+
+        Дальше ссылки проверка не идёт: права её цели и содержимое не
+        читаются (цель может быть на сетевом ресурсе).
+        """
+        seen = self.read_paths(win32security)
         link = tmp_path / "link"
         make_link(link, build_folder.parent)
         violations = permissions.check_build_folder(link / build_folder.name)
         assert violations == [Violation(str(link), Problem.REPARSE_POINT)]
+        assert seen == [str(p) for p in reversed(link.parents)]
 
-    def test_link_inside_not_followed(self, tmp_path, build_folder):
+    def test_link_inside_not_followed(self, win32security, tmp_path, build_folder):
         """Проверить: ссылка в папке — нарушение, внутрь не заходим."""
+        seen = self.read_paths(win32security)
         outside = tmp_path / "outside"
         outside.mkdir()
         (outside / "secret.txt").write_text("x")
@@ -550,6 +565,8 @@ class TestCheckBuildFolder:
         make_link(link, outside)
         violations = permissions.check_build_folder(build_folder)
         assert violations == [Violation(str(link), Problem.REPARSE_POINT)]
+        assert str(link) not in seen
+        assert not [path for path in seen if path.startswith(str(link))]
 
     def test_reparse_attribute(self):
         """Проверить: признак берётся из атрибутов файла Windows."""
