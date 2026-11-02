@@ -24,6 +24,8 @@ from urllib.parse import quote
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.platforms import linux_only, windows_only
+
 
 def reload_app(files_directory=None):
     """Вспомогательная функция для перезагрузки главного модуля.
@@ -62,12 +64,6 @@ def assert_sorted_by_created_at(files: list[dict]) -> None:
     assert created_times == sorted(created_times, reverse=True)
 
 
-# Проверки, которые имеют смысл только на Windows: на Linux обратный
-# слэш — обычный символ имени, а время создания файла недоступно
-windows_only = pytest.mark.skipif(sys.platform != "win32", reason="Только Windows")
-linux_only = pytest.mark.skipif(
-    not sys.platform.startswith("linux"), reason="Только Linux"
-)
 # На Windows сервис символическим ссылкам не следует (см.
 # TestWindowsSymlinks), поэтому сценарии с переходом по ссылке — для
 # остальных ОС
