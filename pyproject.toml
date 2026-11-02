@@ -57,6 +57,7 @@ addopts = [
     "--verbose",
     "--strict-markers",
     "--cov=app",
+    "--cov=scripts",
     "--cov-report=term-missing",
     "--cov-report=html",
     "--cov-report=xml",

@@ -93,5 +93,6 @@ def main(argv: list[str]) -> None:
         sys.exit(2)
 
 
-if __name__ == "__main__":
+# Тесты вызывают main() напрямую
+if __name__ == "__main__":  # pragma: no cover
     main(sys.argv[1:])

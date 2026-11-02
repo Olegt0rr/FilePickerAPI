@@ -4,7 +4,6 @@
 
 import builtins
 import importlib
-import importlib.util
 import json
 import sys
 import types
@@ -12,23 +11,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.script_loader import load_script
 from tests.test_main import reload_app
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_branches_module():
-    spec = importlib.util.spec_from_file_location(
-        "branches_script", ROOT / "scripts" / "branches.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.fixture
 def branches():
-    return load_branches_module()
+    return load_script("branches")
 
 
 @pytest.fixture
