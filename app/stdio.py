@@ -23,7 +23,7 @@ def _stream_is_unusable(stream: object) -> bool:
     return False
 
 
-def ensure_std_streams() -> None:
+def ensure_std_streams() -> bool:
     """Подставить os.devnull вместо непригодных stdout и stderr.
 
     Exe с --windows-console-mode=attach, запущенный без консоли (при
@@ -31,9 +31,13 @@ def ensure_std_streams() -> None:
     получить sys.stdout и sys.stderr равными None, как pythonw, или
     потоки на недействительном дескрипторе. Тогда журнал Uvicorn падал
     бы на sys.stdout.isatty() или на первой записи.
+
+    Возвращает, был ли stderr пригоден, то есть есть ли консоль.
     """
+    console = not _stream_is_unusable(sys.stderr)
     for name in ("stdout", "stderr"):
         if _stream_is_unusable(getattr(sys, name)):
             # Поток живёт до конца процесса, закрывать его некому
             stream = Path(os.devnull).open("w", encoding="utf-8")  # noqa: SIM115
             setattr(sys, name, stream)
+    return console

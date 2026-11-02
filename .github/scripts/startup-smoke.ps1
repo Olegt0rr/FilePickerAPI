@@ -1,10 +1,13 @@
 # Дымовая проверка собранного exe с прежними bat-скриптами
-# (user-logon-autostart, задачи 2.3 и 2.4):
+# (user-logon-autostart, задачи 2.3, 2.4 и 3.1):
+#   0. в сборке есть FilePickerAPI.messages.dll;
 #   1. exe с аргументами завершается с кодом 2;
 #   2. .env с FILES_DIRECTORY в папке exe не даёт сервису запуститься
 #      (код 1), хотя exe запущен из другой папки: он переходит в свою;
+#      ошибка записана в файл журнала пользователя;
 #   3. run_production.bat запускает exe, дожидается ответа и пишет
-#      строку об успешном запуске в startup.log;
+#      строку об успешном запуске в startup.log; запуск Uvicorn виден
+#      в файле журнала, хотя у exe нет консоли;
 #   4. run_test.bat запускает exe и ждёт его до остановки.
 #
 # Параметр — папка сборки (dist/FilePickerAPI). Проверяется её копия во
@@ -28,6 +31,9 @@ New-Item -ItemType Directory $workDir | Out-Null
 $dir = Join-Path $workDir 'FilePickerAPI'
 Copy-Item -Recurse $BuildDir $dir
 $exe = Join-Path $dir 'FilePickerAPI.exe'
+# Файл журнала: путь, который сервис получает через SHGetKnownFolderPath
+$serviceLog = Join-Path $env:LOCALAPPDATA 'FilePickerAPI\logs\FilePickerAPI.log'
+Remove-Item $serviceLog -ErrorAction SilentlyContinue
 
 function Stop-Exe {
   Get-Process FilePickerAPI -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -71,6 +77,13 @@ function Test-Health {
   }
 }
 
+function Assert-ServiceLog([string]$text, [string]$what) {
+  $content = Get-Content $serviceLog -Raw -Encoding utf8 -ErrorAction SilentlyContinue
+  if (-not $content -or -not $content.Contains($text)) {
+    Fail "${what}: '$text' not found in $serviceLog"
+  }
+}
+
 function Wait-Health([int]$seconds) {
   $deadline = (Get-Date).AddSeconds($seconds)
   while ((Get-Date) -lt $deadline) {
@@ -78,6 +91,11 @@ function Wait-Health([int]$seconds) {
     Start-Sleep -Seconds 1
   }
   return $false
+}
+
+# 0. Таблица сообщений журнала событий входит в сборку
+if (-not (Test-Path (Join-Path $dir 'FilePickerAPI.messages.dll'))) {
+  Fail 'FilePickerAPI.messages.dll is missing from the build'
 }
 
 # 1. Аргументы, в том числе путь, не принимаются
@@ -95,6 +113,7 @@ Set-Content -Path $envFile -Value 'FILES_DIRECTORY=D:\x' -Encoding utf8NoBOM
 $what = 'FilePickerAPI.exe with FILES_DIRECTORY in .env'
 $code = Wait-Exit (Start-Checked $exe @()) 60 $what
 if ($code -ne 1) { Fail "$what exited with $code, expected 1" }
+Assert-ServiceLog 'ERROR app.runner: Ошибка настроек, сервис не запущен' $what
 Remove-Item $envFile
 Write-Output "OK: $what -> 1"
 
@@ -110,6 +129,7 @@ if ($logLines.Count -ne 1 -or $logLines[0] -notlike 'FilePickerAPI started in da
   Fail "$what wrote unexpected startup.log: $($logLines -join ' ')"
 }
 if (-not (Test-Health)) { Fail "$what reported success, but the service does not respond" }
+Assert-ServiceLog 'INFO uvicorn.error: Uvicorn running on http://0.0.0.0:8000' $what
 Stop-Exe
 # Иначе на шаге 4 мог бы ответить этот экземпляр, а не exe из run_test.bat
 if (Test-Health) { Fail "the service still responds after $what instance was stopped" }

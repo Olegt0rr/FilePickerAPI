@@ -20,10 +20,6 @@ from enum import Enum, StrEnum, auto
 from pathlib import Path
 from typing import NamedTuple
 
-# Код события «права на папку сборки нарушены»; с появлением
-# app/event_tracking.py — EventId.BUILD_FOLDER_PERMISSIONS
-BUILD_FOLDER_PERMISSIONS_EVENT_ID = 1003
-
 # SYSTEM, BUILTIN\Administrators и NT SERVICE\TrustedInstaller
 TRUSTED_SIDS = frozenset(
     {
@@ -223,7 +219,7 @@ def format_violations(
     violations: list[Violation],
     account_name: Callable[[str], str] = _lookup_account_name,
 ) -> str:
-    """Составить текст события 1003.
+    """Составить текст события 1003 (EventId.BUILD_FOLDER_PERMISSIONS).
 
     Args:
         violations: Непустой список нарушений

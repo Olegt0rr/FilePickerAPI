@@ -360,9 +360,6 @@ class TestFormatViolations:
         assert len(lines) == 1 + 50 + 1
         assert lines[-1] == "…и ещё нарушений: 3"
 
-    def test_event_id(self):
-        assert permissions.BUILD_FOLDER_PERMISSIONS_EVENT_ID == 1003
-
 
 class FakeDescriptor:
     def __init__(self, owner, aces):
