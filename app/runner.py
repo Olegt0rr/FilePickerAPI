@@ -9,6 +9,7 @@ from pathlib import Path
 
 import uvicorn
 
+from app import event_tracking
 from app.logging_setup import send_startup_events, setup_logging
 from app.stdio import ensure_std_streams
 
@@ -41,6 +42,8 @@ def ensure_files_directory() -> None:
 def run() -> int:
     """Запустить сервис и вернуть код выхода процесса."""
     setup_logging(console=ensure_std_streams())
+    # Напоминания о повторах приходят и без новых запросов
+    event_tracking.start_timer()
 
     from pydantic import ValidationError
 
@@ -57,7 +60,11 @@ def run() -> int:
     # Пока нет отслеживания старта HTTP-сервера, буфер стартовых событий
     # отправляется перед запуском Uvicorn
     send_startup_events()
-    # log_config=None: Uvicorn пишет через наши обработчики, а не
-    # переписывает их своей настройкой
-    uvicorn.run(app, host=HOST, port=PORT, log_config=None)
+    try:
+        # log_config=None: Uvicorn пишет через наши обработчики, а не
+        # переписывает их своей настройкой
+        uvicorn.run(app, host=HOST, port=PORT, log_config=None)
+    finally:
+        # Повторы, накопленные с последнего напоминания, не теряются
+        event_tracking.flush()
     return 0

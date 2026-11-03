@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from app import logging_setup
+from app import event_tracking, logging_setup
 from app.event_tracking import EventId, is_tracked, mark_tracked
 
 # Настоящие функции: conftest подменяет их в каждом тесте
@@ -759,7 +759,9 @@ class TestEventLogHandler:
         handler = logging_setup.EventLogHandler()
         for i in range(105):
             handler.handle(
-                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": f"w{i}"})
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": f"w{i}", "event_id": 2000}
+                )
             )
         handler.send_startup_events()
         handler.close()
@@ -826,6 +828,61 @@ class TestEventLogHandler:
 
         assert [e[0] for e in reported(evtlog)] == [1005]
         evtlog.DeregisterEventSource.assert_called_once()
+
+    @pytest.mark.parametrize("discard", [False, True])
+    def test_lost_first_event_not_a_repeat(self, evtlog, discard):
+        """Проверить: запись, не попавшая в журнал событий из-за лимита
+        или сброса буфера, не считается потом повтором.
+        """
+        handler = logging_setup.EventLogHandler()
+        warning = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        if discard:
+            handler.handle(warning)
+            handler.discard_startup_events()
+        else:
+            for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
+                    )
+                )
+            handler.handle(warning)
+        handler.send_startup_events()
+        evtlog.ReportEvent.reset_mock()
+
+        handler.handle(warning)
+        handler.close()
+
+        assert reported(evtlog) == [(3001, 2, "app.t: w")]
+
+    def test_discard_keeps_repeats_and_overflow(self, evtlog, caplog):
+        """Проверить: после сброса буфера повторы, посчитанные до него,
+        не теряются, а ключ переполнения снова даёт событие с пометкой.
+        """
+        handler = logging_setup.EventLogHandler()
+
+        def warn(msg):
+            handler.handle(
+                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": msg})
+            )
+
+        warn("w")
+        warn("w")
+        for i in range(event_tracking.MAX_KEYS_PER_EVENT):
+            warn(f"вид {i}")
+        handler.discard_startup_events()
+
+        warn("w")
+        warn("ещё вид")
+        event_tracking.flush()
+        handler.close()
+
+        assert reported(evtlog) == [
+            (3001, 2, "app.t: w"),
+            (3001, 2, "app.t: ещё вид" + event_tracking.OVERFLOW_NOTE),
+        ]
+        # Повтор до сброса буфера — в итоговом напоминании
+        assert "Повторялось ещё 1 раз с прошлой записи: app.t: w" in caplog.text
 
 
 class TestWindowsLookups:
