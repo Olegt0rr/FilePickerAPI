@@ -7,7 +7,13 @@
 три, первый записанный выигрывает: остановка (событие 1001, код 0),
 сбой (1002, код 1) и второй экземпляр (1005 или 1006, код 0). Процесс
 завершается через os._exit: зависшее обращение к сетевой папке в
-потоке пула не должно держать его.
+потоке пула не должно держать его. Остановку завершает главный поток;
+обработчик срочного сигнала (закрытие консоли, завершение сеанса) ждёт
+её конца и не возвращается раньше выхода процесса.
+
+У собранного exe на Windows после проверки второго экземпляра сервис
+регистрирует перезапуск после обновления (RegisterApplicationRestart)
+и проверяет права на папку сборки в отдельном потоке (событие 1003).
 
 Модуль не импортирует app.api и app.settings на уровне модуля:
 настройки читаются только в create_app(), после настройки журнала.
@@ -23,6 +29,7 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from enum import Enum
 from pathlib import Path
@@ -55,6 +62,12 @@ RESET_AFTER_SECONDS = 60 * 60
 # Ожидание текущих запросов Uvicorn и рабочего потока при остановке
 GRACEFUL_SHUTDOWN_SECONDS = 10
 STOP_WAIT_SECONDS = 20
+# Срочная остановка: Windows завершит процесс после возврата из
+# обработчика, а закрытие консоли ждёт его не дольше 5 секунд
+URGENT_WAIT_SECONDS = 3
+# Обработчик срочного сигнала ждёт финализацию не дольше этого срока
+# и затем завершает процесс сам
+URGENT_EXIT_SECONDS = 4.5
 # Ожидание потока создания директории при остановке
 DIRECTORY_WAIT_SECONDS = 1
 # Процесс завершается не позже этого срока после исхода, даже если
@@ -88,6 +101,11 @@ def _windows() -> bool:
     return sys.platform == "win32"
 
 
+def _compiled() -> bool:
+    """Запущен собранный exe (Nuitka), а не `python -m app`."""
+    return "__compiled__" in globals()
+
+
 def ensure_files_directory() -> None:
     """Создать директорию для файлов, если её ещё нет.
 
@@ -115,11 +133,54 @@ def exe_path() -> Path:
 
     В сборке sys.executable указывает на несуществующий python.exe.
     """
-    if "__compiled__" not in globals():
+    if not _compiled():
         return Path(sys.executable)
     import win32api
 
     return Path(win32api.GetModuleFileName(None))
+
+
+def register_restart() -> None:
+    """Попросить Restart Manager перезапустить сервис после обновления.
+
+    Только у собранного exe на Windows: пустая командная строка у
+    `python -m app` перезапустила бы интерпретатор без аргументов.
+    Отказ не мешает работе: сервис поднимется при следующем входе.
+    """
+    if not (_windows() and _compiled()):
+        return
+    from app import winapi
+
+    try:
+        winapi.register_application_restart()
+    except OSError as e:
+        logger.warning("Не удалось зарегистрировать перезапуск после обновления: %s", e)
+
+
+def check_permissions() -> None:
+    """Проверить права на папку сборки; нарушения — событие 1003.
+
+    Только у собранного exe: при `python -m app` «папка exe» — папка
+    интерпретатора. Событие идёт через буфер стартовых событий: у
+    второго экземпляра, проигравшего гонку за порт, оно отбрасывается.
+    """
+    from app import permissions
+
+    try:
+        violations = permissions.check_build_folder(exe_path().parent)
+        if not violations:
+            return
+        message = permissions.format_violations(violations)
+    except Exception as e:
+        # Права остались непроверенными: администратор должен это видеть
+        logger.warning(
+            "Не удалось проверить права на папку сборки: %s",
+            event_tracking.describe_error(e),
+            exc_info=e,
+            extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS},
+        )
+        return
+    logger.warning(message, extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS})
 
 
 def _branch() -> str:
@@ -236,24 +297,39 @@ class Service:
         # RLock: request_stop вызывается из обработчика сигнала, который
         # может прервать главный поток внутри того же request_stop
         self.lock = threading.RLock()
+        # Будит финализацию: поток завершился или срок сократился
+        self.changed = threading.Condition(self.lock)
         self.done = threading.Event()
+        # Процесс завершён (только после подменённого _exit)
+        self.finished = threading.Event()
         self.stop_requested = threading.Event()
         self.outcome: Outcome | None = None
         self.stop_reason = ""
         self.stop_error: BaseException | None = None
+        # Срок ожидания потоков при остановке; срочный сигнал его
+        # сокращает
+        self.stop_deadline = float("inf")
         self.server: InstanceServer | None = None
         self.worker: threading.Thread | None = None
+        self.worker_finished = False
         self.directory_thread: threading.Thread | None = None
+        self.directory_finished = False
         # Текст 1000; собирается в рабочем потоке до запуска Uvicorn
         self.start_message = f"Сервис запущен: версия {__version__}, порт {PORT}"
 
-    def request_stop(self, reason: str) -> None:
+    def request_stop(self, reason: str, *, urgent: bool = False) -> None:
         """Запросить остановку; повторный запрос ничего не делает.
 
+        Срочный запрос во время уже идущей остановки сокращает срок
+        ожидания потоков до URGENT_WAIT_SECONDS от своего прихода.
         Вызывается из обработчиков сигналов, поэтому в журнал не
         пишет: причина попадёт в событие 1001.
         """
+        wait = URGENT_WAIT_SECONDS if urgent else STOP_WAIT_SECONDS
         with self.lock:
+            if self.outcome in {None, Outcome.STOP}:
+                self.stop_deadline = min(self.stop_deadline, clock() + wait)
+                self.changed.notify_all()
             if self.outcome is not None:
                 return
             self.outcome = Outcome.STOP
@@ -262,6 +338,46 @@ class Service:
             if self.server is not None:
                 self.server.should_exit = True
         self.done.set()
+
+    def urgent_stop(self, reason: str) -> None:
+        """Срочная остановка; возврат — только после выхода процесса.
+
+        Windows завершит процесс сразу после возврата из обработчика
+        (закрытие консоли, WM_ENDSESSION), поэтому обработчик ждёт, пока
+        главный поток закончит финализацию и вызовет _exit. Если она не
+        закончилась за URGENT_EXIT_SECONDS, процесс завершает сам
+        обработчик. Возвращается, только если _exit подменён (тесты).
+        """
+        self.request_stop(reason, urgent=True)
+        if not self.finished.wait(URGENT_EXIT_SECONDS):
+            # Исход уже записан: этим запросом или раньше
+            _exit(self.outcome.exit_code)
+
+    def _wait_for(self, finished: Callable[[], bool], seconds: float) -> None:
+        """Ждать finished() не дольше seconds и срока остановки.
+
+        Срок остановки проверяется на каждом пробуждении: срочный
+        сигнал может сократить его во время ожидания.
+        """
+        limit = clock() + seconds
+        with self.changed:
+            while not finished():
+                remaining = min(limit, self.stop_deadline) - clock()
+                if remaining <= 0:
+                    return
+                self.changed.wait(remaining)
+
+    def _thread_finished(self, attribute: str) -> None:
+        with self.changed:
+            setattr(self, attribute, True)
+            self.changed.notify_all()
+
+    def _create_directory(self) -> None:
+        """Тело потока создания директории."""
+        try:
+            ensure_files_directory()
+        finally:
+            self._thread_finished("directory_finished")
 
     def claim(self, outcome: Outcome) -> bool:
         """Занять исход; False — исход уже записан (остановка)."""
@@ -324,6 +440,7 @@ class Service:
                         None,
                     )
             self.done.set()
+            self._thread_finished("worker_finished")
 
     def _work(self) -> None:
         result = instance_check.wait_for_port(
@@ -334,6 +451,9 @@ class Service:
         if result.status is Probe.FILE_PICKER:
             self._second_instance(result.version)
             return
+        # После проверки второго экземпляра: тот завершается сразу, и
+        # перезапускать его после обновления незачем
+        register_restart()
 
         from pydantic import ValidationError
 
@@ -350,9 +470,15 @@ class Service:
         # mkdir на недоступной UNC-папке ждёт таймаутов SMB: сервис
         # принимает запросы, не дожидаясь его
         self.directory_thread = threading.Thread(
-            target=ensure_files_directory, name="ensure-files-directory", daemon=True
+            target=self._create_directory, name="ensure-files-directory", daemon=True
         )
         self.directory_thread.start()
+        if _windows() and _compiled():
+            # Обход сотен файлов сборки не задерживает начало приёма
+            # запросов, а результат ждёт в буфере стартовых событий
+            threading.Thread(
+                target=check_permissions, name="check-permissions", daemon=True
+            ).start()
         self._serve_with_retries(app)
 
     def _serve_with_retries(self, app: object) -> None:
@@ -459,19 +585,20 @@ class Service:
         self.done.set()
 
     def finalize(self) -> None:
-        """Обычная остановка: ожидание, напоминания и ровно одно 1001.
+        """Остановка: ожидание, напоминания и ровно одно 1001.
 
-        Рабочий поток ждём не дольше 20 секунд: обращения к SMB нельзя
-        прервать изнутри процесса. Поток создания директории — не больше
-        секунды: он демонический, а короткое ожидание отличает
-        зависший mkdir от только что начатого.
+        Рабочий поток ждём не дольше 20 секунд от запроса остановки
+        (при срочной — 3 секунд): обращения к SMB нельзя прервать
+        изнутри процесса. Поток создания директории — не больше секунды
+        в пределах того же срока: он демонический, а короткое ожидание
+        отличает зависший mkdir от только что начатого.
         """
         if self.worker is not None:
-            self.worker.join(STOP_WAIT_SECONDS)
+            self._wait_for(lambda: self.worker_finished, STOP_WAIT_SECONDS)
         if self.directory_thread is not None:
-            self.directory_thread.join(DIRECTORY_WAIT_SECONDS)
-        hung = (self.worker is not None and self.worker.is_alive()) or (
-            self.directory_thread is not None and self.directory_thread.is_alive()
+            self._wait_for(lambda: self.directory_finished, DIRECTORY_WAIT_SECONDS)
+        hung = (self.worker is not None and not self.worker_finished) or (
+            self.directory_thread is not None and not self.directory_finished
         )
         # Повторы во время мягкой остановки тоже попадают в итог
         event_tracking.flush()
@@ -518,7 +645,7 @@ def run() -> int:
     service = Service(console=console)
     # До опроса порта: он длится до 10 секунд, и остановка должна
     # работать и в это время
-    stop_signals.install(service.request_stop)
+    stop_signals.install(service.request_stop, service.urgent_stop)
     service.worker = threading.Thread(
         target=service.work, name="service-worker", daemon=True
     )
@@ -536,5 +663,8 @@ def run() -> int:
         service.finalize()
     flush_handlers()
     _exit(outcome.exit_code)
+    # Дальше — только при подменённом _exit (тесты): обработчик
+    # срочного сигнала ждёт этого и больше не завершает процесс сам
+    service.finished.set()
     watchdog.cancel()
     return outcome.exit_code

@@ -6,7 +6,9 @@ run() выполняется в процессе теста: выход проц
 порте вместо 8000.
 """
 
+import contextlib
 import ctypes
+import functools
 import json
 import logging
 import os
@@ -804,6 +806,325 @@ class TestStop:
         ]
 
 
+def urgent_in_thread(service_env, reason):
+    """Срочный сигнал из своего потока, как от Windows.
+
+    Возвращает поток и список, где отмечено, сколько выходов процесса
+    было к моменту возврата из обработчика.
+    """
+    exits_on_return = []
+
+    def handler():
+        service_env.urgent(reason)
+        exits_on_return.append(len(service_env.exits))
+
+    thread = threading.Thread(target=handler, daemon=True)
+    thread.start()
+    return thread, exits_on_return
+
+
+class TestUrgentStop:
+    """Срочная остановка: закрытие консоли и завершение сеанса."""
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "закрытие консоли",
+            "обновление или удаление программы",
+            "выход пользователя",
+            "выключение Windows",
+        ],
+    )
+    @pytest.mark.usefixtures("port")
+    def test_reason_and_reminders(self, service_env, evtlog, monkeypatch, reason):
+        """Проверить: накопленные повторы — напоминание, затем 1001 с
+        причиной; обработчик возвращается только после выхода процесса.
+        """
+        handler = {}
+
+        def serve(server, _sockets=None):
+            server.started = True
+            server.service.on_started()
+            for _ in range(6):
+                event_tracking.track(3000, "k", "ошибка доступа к файлу")
+            handler["thread"], handler["exits"] = urgent_in_thread(service_env, reason)
+            wait_for(server.service.stop_requested.is_set)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        assert runner.run() == 0
+        handler["thread"].join(5)
+
+        assert service_env.exits == [0]
+        assert handler["exits"] == [1]
+        assert event_ids(evtlog) == [1000, 3000, 3000, 1001]
+        assert "Повторялось ещё 5 раз" in event_texts(evtlog, 3000)[1]
+        assert event_texts(evtlog, 1001) == [f"app.runner: Сервис остановлен: {reason}"]
+
+    @pytest.mark.usefixtures("port")
+    def test_waits_three_seconds(self, service_env, evtlog, monkeypatch):
+        """Проверить: зависший рабочий поток ждём только срок срочной
+        остановки, а не 20 секунд; пометка в 1001.
+        """
+        assert runner.URGENT_WAIT_SECONDS == 3
+        monkeypatch.setattr(runner, "URGENT_WAIT_SECONDS", 0.3)
+        monkeypatch.setattr(runner, "STOP_WAIT_SECONDS", 60)
+        release = threading.Event()
+        handler = {}
+
+        def serve(server, _sockets=None):
+            server.started = True
+            server.service.on_started()
+            handler["thread"], _ = urgent_in_thread(service_env, "выход пользователя")
+            release.wait()
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        started = time.monotonic()
+        try:
+            assert runner.run() == 0
+        finally:
+            release.set()
+        assert time.monotonic() - started < 10
+        handler["thread"].join(5)
+        assert service_env.exits == [0]
+        [text] = event_texts(evtlog, 1001)
+        assert "Сервис остановлен: выход пользователя" in text
+        assert "не завершилось" in text
+
+    @pytest.mark.usefixtures("port")
+    def test_urgent_during_normal_stop(self, service_env, evtlog, monkeypatch):
+        """Проверить: срочный сигнал во время обычной остановки —
+        одна остановка с прежней причиной, ожидание сокращается.
+        """
+        monkeypatch.setattr(runner, "URGENT_WAIT_SECONDS", 0.3)
+        monkeypatch.setattr(runner, "STOP_WAIT_SECONDS", 60)
+        release = threading.Event()
+        handler = {}
+
+        def serve(server, _sockets=None):
+            start_then_stop(server)
+            # Главный поток уже ждёт рабочий поток в финализации
+            time.sleep(0.2)
+            handler["thread"], handler["exits"] = urgent_in_thread(
+                service_env, "закрытие консоли"
+            )
+            release.wait()
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        started = time.monotonic()
+        try:
+            assert runner.run() == 0
+        finally:
+            release.set()
+        assert time.monotonic() - started < 10
+        handler["thread"].join(5)
+        assert service_env.exits == [0]
+        assert handler["exits"] == [1]
+        [text] = event_texts(evtlog, 1001)
+        assert text.startswith("app.runner: Сервис остановлен: тест.")
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_handler_exits_when_finalization_hangs(self, service_env, monkeypatch):
+        """Проверить: финализация не закончилась в срок — процесс
+        завершает сам обработчик, не возвращаясь раньше.
+        """
+        monkeypatch.setattr(runner, "URGENT_EXIT_SECONDS", 0.2)
+        released = threading.Event()
+        handler = {}
+
+        def finalize(_service):
+            handler["thread"], handler["exits"] = urgent_in_thread(
+                service_env, "выход пользователя"
+            )
+            released.wait(10)
+
+        monkeypatch.setattr(runner.Service, "finalize", finalize)
+        monkeypatch.setattr(
+            runner,
+            "_exit",
+            lambda code: (service_env.exits.append(code), released.set()),
+        )
+        assert runner.run() == 0
+        handler["thread"].join(5)
+        # Первый выход — от обработчика, пока финализация висела
+        assert service_env.exits == [0, 0]
+        assert handler["exits"] == [1]
+
+    def test_after_failure(self, service_env):
+        """Проверить: срочный сигнал после сбоя ничего не останавливает
+        и при зависшем выходе завершает процесс с кодом сбоя.
+        """
+        service = runner.Service(console=True)
+        assert service.claim(runner.Outcome.FAILED)
+        with mock.patch.object(runner, "URGENT_EXIT_SECONDS", 0.01):
+            service.urgent_stop("выход пользователя")
+        assert service_env.exits == [1]
+        assert service.stop_reason == ""
+        assert service.stop_deadline == float("inf")
+        assert not service.stop_requested.is_set()
+
+
+@pytest.fixture
+def compiled_exe(monkeypatch, tmp_path):
+    """Собранный exe на Windows: путь от GetModuleFileName, поддельные
+    регистрация перезапуска и проверка прав.
+    """
+    from app import permissions, winapi
+
+    exe = tmp_path / "FilePickerAPI" / "FilePickerAPI.exe"
+    win32api = types.ModuleType("win32api")
+    win32api.GetModuleFileName = mock.Mock(return_value=str(exe))
+    win32api.GetUserNameEx = mock.Mock(return_value="BRANCH\\operator")
+    monkeypatch.setitem(sys.modules, "win32api", win32api)
+    monkeypatch.setattr(runner, "_windows", lambda: True)
+    monkeypatch.setattr(runner, "__compiled__", object(), raising=False)
+    violation = permissions.Violation(str(exe.parent), permissions.Problem.NULL_DACL)
+    fake = types.SimpleNamespace(
+        exe=exe,
+        violation=violation,
+        restart=mock.Mock(),
+        check=mock.Mock(return_value=[violation]),
+    )
+    monkeypatch.setattr(winapi, "register_application_restart", fake.restart)
+    monkeypatch.setattr(permissions, "check_build_folder", fake.check)
+    monkeypatch.setattr(permissions, "format_violations", lambda v: f"нарушения: {v}")
+    return fake
+
+
+def checks_finished():
+    """Поток проверки прав завершился (или не запускался)."""
+    return not any(t.name == "check-permissions" for t in threading.enumerate())
+
+
+class TestCompiledExe:
+    """Перезапуск после обновления и проверка прав у собранного exe."""
+
+    @pytest.mark.usefixtures("port")
+    def test_restart_and_permissions(self, compiled_exe, evtlog, monkeypatch):
+        """Проверить: перезапуск зарегистрирован, права папки exe
+        проверены, 1003 — из буфера после старта слушателя.
+        """
+
+        def serve(server, _sockets=None):
+            wait_for(checks_finished)
+            assert evtlog.ReportEvent.call_count == 0
+            start_then_stop(server)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        assert runner.run() == 0
+
+        compiled_exe.restart.assert_called_once_with()
+        compiled_exe.check.assert_called_once_with(compiled_exe.exe.parent)
+        assert event_ids(evtlog) == [1003, 1000, 1001]
+        [text] = event_texts(evtlog, 1003)
+        assert "нарушения" in text
+        assert evtlog.ReportEvent.call_args_list[0].args[1] == 2
+
+    @pytest.mark.usefixtures("port")
+    def test_after_start(self, compiled_exe, evtlog, monkeypatch):
+        """Проверить: проверка, закончившаяся после старта, — 1003
+        сразу, после 1000.
+        """
+        release = threading.Event()
+
+        def check(_folder):
+            release.wait(5)
+            return [compiled_exe.violation]
+
+        compiled_exe.check.side_effect = check
+
+        def serve(server, _sockets=None):
+            server.started = True
+            server.service.on_started()
+            release.set()
+            wait_for(checks_finished)
+            server.service.request_stop("тест")
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        assert runner.run() == 0
+        assert event_ids(evtlog) == [1000, 1003, 1001]
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_no_violations(self, compiled_exe, evtlog):
+        compiled_exe.check.return_value = []
+        assert runner.run() == 0
+        wait_for(checks_finished)
+        assert 1003 not in event_ids(evtlog)
+
+    @pytest.mark.usefixtures("port")
+    def test_check_fails(self, compiled_exe, evtlog, monkeypatch):
+        """Проверить: сбой проверки — тоже 1003, права не проверены."""
+        compiled_exe.check.side_effect = RuntimeError("сбой обхода")
+
+        def serve(server, _sockets=None):
+            wait_for(checks_finished)
+            start_then_stop(server)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        assert runner.run() == 0
+        [text] = event_texts(evtlog, 1003)
+        assert "Не удалось проверить права на папку сборки: RuntimeError" in text
+        assert "сбой обхода" in text
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_restart_fails(self, compiled_exe, evtlog, caplog):
+        """Проверить: отказ регистрации — предупреждение, сервис
+        работает.
+        """
+        compiled_exe.restart.side_effect = OSError("HRESULT 0x80070057")
+        assert runner.run() == 0
+        assert "Не удалось зарегистрировать перезапуск после обновления" in caplog.text
+        assert 1000 in event_ids(evtlog)
+
+    @pytest.mark.usefixtures("unreachable_log")
+    def test_second_instance_skips_both(self, compiled_exe, evtlog, port):
+        """Проверить: второй экземпляр не регистрирует перезапуск и не
+        проверяет права.
+        """
+        server = OpenApiServer(port)
+        try:
+            assert runner.run() == 0
+        finally:
+            server.close()
+        compiled_exe.restart.assert_not_called()
+        compiled_exe.check.assert_not_called()
+        assert event_ids(evtlog) == [1005]
+
+    @pytest.mark.usefixtures("unreachable_log")
+    def test_race_for_port_with_violations(
+        self, compiled_exe, service_env, evtlog, port, monkeypatch
+    ):
+        """Проверить: порт занял File Picker API к привязке — только
+        1005, даже при нарушении прав на папку сборки.
+        """
+        real = instance_check.port_in_use
+        calls = []
+
+        def port_in_use(host, number):
+            calls.append(number)
+            return len(calls) > 1 and real(host, number)
+
+        monkeypatch.setattr(instance_check, "port_in_use", port_in_use)
+        server = OpenApiServer(port)
+        try:
+            assert runner.run() == 0
+        finally:
+            server.close()
+        wait_for(checks_finished)
+        compiled_exe.check.assert_called_once()
+        assert service_env.exits == [0]
+        assert event_ids(evtlog) == [1005]
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_source_run_skips_both(self, compiled_exe, monkeypatch):
+        """Проверить: `python -m app` (не собранный exe) — ни
+        перезапуска, ни проверки прав.
+        """
+        monkeypatch.delattr(runner, "__compiled__")
+        assert runner.run() == 0
+        compiled_exe.restart.assert_not_called()
+        compiled_exe.check.assert_not_called()
+
+
 class TestStartupErrors:
     """Перехват записей uvicorn.error до старта слушателя."""
 
@@ -1033,47 +1354,155 @@ class TestInstanceCheck:
         assert "(версия не указана)" in text
 
 
+@pytest.fixture
+def fake_window(monkeypatch):
+    """Поддельные win32api и win32gui для консольного обработчика и
+    скрытого окна; PumpMessages возвращается сразу.
+    """
+    win32api = types.ModuleType("win32api")
+    win32api.SetConsoleCtrlHandler = mock.Mock()
+    win32api.GetModuleHandle = mock.Mock(return_value=77)
+    win32gui = types.ModuleType("win32gui")
+    win32gui.WNDCLASS = types.SimpleNamespace
+    win32gui.RegisterClass = mock.Mock()
+    win32gui.CreateWindow = mock.Mock(return_value=99)
+    win32gui.PumpMessages = mock.Mock()
+    win32gui.DefWindowProc = mock.Mock(return_value=42)
+    monkeypatch.setitem(sys.modules, "win32api", win32api)
+    monkeypatch.setitem(sys.modules, "win32gui", win32gui)
+    monkeypatch.setattr(stop_signals, "_windows", lambda: True)
+    monkeypatch.setattr(stop_signals, "_console_handler", None)
+    return types.SimpleNamespace(win32api=win32api, win32gui=win32gui)
+
+
+def handlers():
+    return stop_signals.StopHandlers(mock.Mock(), mock.Mock())
+
+
 class TestStopSignals:
-    """Обработчики Ctrl+C и сигналов."""
+    """Ctrl+C, закрытие консоли, скрытое окно и сигналы."""
 
     @pytest.mark.parametrize(
-        ("ctrl_type", "reason"),
-        [(0, "Ctrl+C в консоли"), (1, "Ctrl+Break в консоли"), (2, None), (5, None)],
+        ("ctrl_type", "kind", "reason"),
+        [
+            (0, "stop", "Ctrl+C в консоли"),
+            (1, "stop", "Ctrl+Break в консоли"),
+            (2, "urgent_stop", "закрытие консоли"),
+            (5, None, None),
+            (6, None, None),
+        ],
     )
-    def test_console_handler(self, ctrl_type, reason):
-        """Проверить: Ctrl+C и Ctrl+Break — остановка и True, прочие
-        события консоли идут дальше по цепочке.
+    def test_console_handler(self, ctrl_type, kind, reason):
+        """Проверить: Ctrl+C и Ctrl+Break — обычная остановка, закрытие
+        консоли — срочная, обе с True; выход и выключение
+        (CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT) идут дальше по цепочке.
         """
-        stop = mock.Mock()
-        assert stop_signals.console_handler(stop, ctrl_type) is (reason is not None)
-        if reason is None:
-            stop.assert_not_called()
-        else:
-            stop.assert_called_once_with(reason)
+        stops = handlers()
+        assert stop_signals.console_handler(stops, ctrl_type) is (kind is not None)
+        for name in ("stop", "urgent_stop"):
+            called = getattr(stops, name)
+            if name == kind:
+                called.assert_called_once_with(reason)
+            else:
+                called.assert_not_called()
 
-    def test_install_on_windows(self, monkeypatch):
-        win32api = types.ModuleType("win32api")
-        win32api.SetConsoleCtrlHandler = mock.Mock()
-        monkeypatch.setitem(sys.modules, "win32api", win32api)
-        monkeypatch.setattr(stop_signals, "_windows", lambda: True)
-        monkeypatch.setattr(stop_signals, "_console_handler", None)
-        stop = mock.Mock()
+    @pytest.mark.parametrize(
+        ("lparam", "reason"),
+        [
+            (0x1, "обновление или удаление программы"),
+            (0x1 | 0x80000000, "обновление или удаление программы"),
+            (0x80000000, "выход пользователя"),
+            # LPARAM знаковый: старший бит может прийти отрицательным
+            (-0x80000000, "выход пользователя"),
+            (0x40000000, "выключение Windows"),
+            (0, "выключение Windows"),
+        ],
+    )
+    def test_end_session_reason(self, lparam, reason):
+        assert stop_signals.end_session_reason(lparam) == reason
 
-        INSTALL(stop)
+    def test_window_close(self):
+        """Проверить: WM_CLOSE — обычная остановка."""
+        stops = handlers()
+        assert stop_signals.window_procedure(stops, 1, stop_signals.WM_CLOSE, 0, 0) == 0
+        stops.stop.assert_called_once_with("сообщение WM_CLOSE")
+        stops.urgent_stop.assert_not_called()
+
+    def test_cancelled_logoff(self):
+        """Проверить: WM_QUERYENDSESSION — только «можно», затем
+        WM_ENDSESSION с wParam = FALSE (выход отменён) — ничего.
+        """
+        stops = handlers()
+        procedure = functools.partial(stop_signals.window_procedure, stops, 1)
+        assert procedure(stop_signals.WM_QUERYENDSESSION, 0, 0x80000000) == 1
+        assert procedure(stop_signals.WM_ENDSESSION, 0, 0x80000000) == 0
+        stops.stop.assert_not_called()
+        stops.urgent_stop.assert_not_called()
+
+    def test_end_session(self):
+        """Проверить: WM_ENDSESSION с wParam = TRUE — срочная остановка
+        с причиной по lParam.
+        """
+        stops = handlers()
+        result = stop_signals.window_procedure(
+            stops, 1, stop_signals.WM_ENDSESSION, 1, stop_signals.ENDSESSION_CLOSEAPP
+        )
+        assert result == 0
+        stops.urgent_stop.assert_called_once_with("обновление или удаление программы")
+        stops.stop.assert_not_called()
+
+    def test_other_message(self, fake_window):
+        """Проверить: прочие сообщения — DefWindowProc."""
+        stops = handlers()
+        assert stop_signals.window_procedure(stops, 1, 0x0001, 2, 3) == 42
+        fake_window.win32gui.DefWindowProc.assert_called_once_with(1, 0x0001, 2, 3)
+
+    def test_install_on_windows(self, fake_window):
+        """Проверить: консольный обработчик и скрытое окно верхнего
+        уровня класса FilePickerAPI.Instance с циклом сообщений.
+        """
+        win32api, win32gui = fake_window.win32api, fake_window.win32gui
+        stop, urgent_stop = mock.Mock(), mock.Mock()
+
+        INSTALL(stop, urgent_stop)
 
         [(handler, add)] = [c.args for c in win32api.SetConsoleCtrlHandler.mock_calls]
         assert add is True
         assert stop_signals._console_handler is handler  # noqa: SLF001
         assert handler(stop_signals.CTRL_C_EVENT) is True
         stop.assert_called_once_with("Ctrl+C в консоли")
+        assert handler(stop_signals.CTRL_CLOSE_EVENT) is True
+        urgent_stop.assert_called_once_with("закрытие консоли")
 
-    def test_install_on_windows_fails(self, monkeypatch, caplog):
-        win32api = types.ModuleType("win32api")
-        win32api.SetConsoleCtrlHandler = mock.Mock(side_effect=OSError("нет"))
-        monkeypatch.setitem(sys.modules, "win32api", win32api)
-        monkeypatch.setattr(stop_signals, "_windows", lambda: True)
-        monkeypatch.setattr(stop_signals, "_console_handler", None)
-        INSTALL(mock.Mock())
+        [(window_class,)] = [c.args for c in win32gui.RegisterClass.mock_calls]
+        assert window_class.lpszClassName == "FilePickerAPI.Instance"
+        assert window_class.hInstance == 77
+        [(class_name, _title, style, *rest)] = [
+            c.args for c in win32gui.CreateWindow.mock_calls
+        ]
+        assert class_name == "FilePickerAPI.Instance"
+        # Без WS_VISIBLE и без родителя: не HWND_MESSAGE
+        assert style == 0
+        assert rest[4] == 0
+        stop.reset_mock()
+        window_class.lpfnWndProc(99, stop_signals.WM_CLOSE, 0, 0)
+        stop.assert_called_once_with("сообщение WM_CLOSE")
+        wait_for(lambda: win32gui.PumpMessages.called)
+
+    def test_window_fails(self, fake_window, caplog):
+        """Проверить: окно не создалось — предупреждение, установка не
+        ждёт срока и не падает.
+        """
+        fake_window.win32gui.RegisterClass.side_effect = OSError("класс занят")
+        started = time.monotonic()
+        INSTALL(mock.Mock(), mock.Mock())
+        assert time.monotonic() - started < stop_signals.WINDOW_READY_SECONDS
+        assert "Не удалось создать скрытое окно сервиса: класс занят" in caplog.text
+        fake_window.win32gui.PumpMessages.assert_not_called()
+
+    def test_install_on_windows_fails(self, fake_window, caplog):
+        fake_window.win32api.SetConsoleCtrlHandler.side_effect = OSError("нет")
+        INSTALL(mock.Mock(), mock.Mock())
         assert "Не удалось установить обработчик Ctrl+C: нет" in caplog.text
         assert stop_signals._console_handler is None  # noqa: SLF001
 
@@ -1082,7 +1511,7 @@ class TestStopSignals:
         monkeypatch.setattr(stop_signals, "_windows", lambda: False)
         with mock.patch.object(stop_signals.signal, "signal") as set_signal:
             stop = mock.Mock()
-            INSTALL(stop)
+            INSTALL(stop, mock.Mock())
         assert [c.args[0] for c in set_signal.call_args_list] == [
             signal.SIGINT,
             signal.SIGTERM,
@@ -1100,6 +1529,12 @@ class TestStopSignals:
 
         assert stop_signals.CTRL_C_EVENT == win32con.CTRL_C_EVENT
         assert stop_signals.CTRL_BREAK_EVENT == win32con.CTRL_BREAK_EVENT
+        assert stop_signals.CTRL_CLOSE_EVENT == win32con.CTRL_CLOSE_EVENT
+        assert stop_signals.WM_CLOSE == win32con.WM_CLOSE
+        assert stop_signals.WM_QUERYENDSESSION == win32con.WM_QUERYENDSESSION
+        assert stop_signals.WM_ENDSESSION == win32con.WM_ENDSESSION
+        # В win32con константа знаковая, ENDSESSION_CLOSEAPP в нём нет
+        assert stop_signals.ENDSESSION_LOGOFF == win32con.ENDSESSION_LOGOFF & 0xFFFFFFFF
 
 
 def wait_for_service(process, timeout=30):
@@ -1119,6 +1554,29 @@ def wait_for_service(process, timeout=30):
 
     wait_for(ready, timeout)
     return answer
+
+
+def instance_window(pid, timeout=10):
+    """Скрытое окно FilePickerAPI.Instance процесса pid."""
+    import win32gui
+    import win32process
+
+    found = []
+
+    def collect(hwnd, _):
+        if (
+            win32gui.GetClassName(hwnd) == stop_signals.WINDOW_CLASS
+            and win32process.GetWindowThreadProcessId(hwnd)[1] == pid
+        ):
+            found.append(hwnd)
+        return True
+
+    def search():
+        win32gui.EnumWindows(collect, None)
+        return bool(found)
+
+    wait_for(search, timeout)
+    return found[0]
 
 
 def service_code(log_file):
@@ -1225,3 +1683,51 @@ class TestWindowsProcess:
         assert process.returncode == 0, stderr
         log_text = (tmp_path / "logs" / "FilePickerAPI.log").read_text(encoding="utf-8")
         assert "INFO app.runner: Сервис остановлен: Ctrl+Break в консоли" in log_text
+
+    def test_wm_close(self, service_process, tmp_path):
+        """Проверить: WM_CLOSE окну, найденному по классу, — код 0 и
+        1001 в журнале.
+        """
+        import win32con
+        import win32gui
+
+        process = service_process()
+        wait_for_service(process)
+        win32gui.PostMessage(instance_window(process.pid), win32con.WM_CLOSE, 0, 0)
+        _, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stderr
+        log_text = (tmp_path / "logs" / "FilePickerAPI.log").read_text(encoding="utf-8")
+        assert "INFO app.runner: Сервис остановлен: сообщение WM_CLOSE" in log_text
+
+    def test_end_session(self, service_process, tmp_path):
+        """Проверить: отменённый выход — сервис работает; WM_ENDSESSION
+        от Restart Manager — 1001 до возврата из обработчика, код 0.
+        """
+        import pywintypes
+        import win32con
+        import win32gui
+
+        process = service_process()
+        wait_for_service(process)
+        hwnd = instance_window(process.pid)
+        assert win32gui.SendMessage(hwnd, win32con.WM_QUERYENDSESSION, 0, 0) == 1
+        win32gui.SendMessage(hwnd, win32con.WM_ENDSESSION, 0, 0)
+        assert wait_for_service(process)["info"]["title"] == "File Picker API"
+        # Обработчик не возвращается: процесс завершается раньше
+        with contextlib.suppress(pywintypes.error):
+            win32gui.SendMessageTimeout(
+                hwnd,
+                win32con.WM_ENDSESSION,
+                1,
+                stop_signals.ENDSESSION_CLOSEAPP,
+                win32con.SMTO_ABORTIFHUNG,
+                30_000,
+            )
+        _, stderr = process.communicate(timeout=30)
+        assert process.returncode == 0, stderr
+        log_text = (tmp_path / "logs" / "FilePickerAPI.log").read_text(encoding="utf-8")
+        assert (
+            "INFO app.runner: Сервис остановлен: обновление или удаление программы"
+            in log_text
+        )
+        assert log_text.count("Сервис остановлен") == 1
