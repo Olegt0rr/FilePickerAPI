@@ -861,29 +861,33 @@ class TestUrgentStop:
         assert event_texts(evtlog, 1001) == [f"app.runner: Сервис остановлен: {reason}"]
 
     @pytest.mark.usefixtures("port")
-    def test_waits_three_seconds(self, service_env, evtlog, monkeypatch):
-        """Проверить: зависший рабочий поток ждём только срок срочной
-        остановки, а не 20 секунд; пометка в 1001.
+    def test_waits_from_urgent_signal(self, service_env, evtlog, monkeypatch):
+        """Проверить: зависшие рабочий поток и создание директории ждём
+        срок срочной остановки от прихода сигнала — не 20 секунд и не
+        дольше ещё на ожидание директории; пометка в 1001.
         """
         assert runner.URGENT_WAIT_SECONDS == 3
-        monkeypatch.setattr(runner, "URGENT_WAIT_SECONDS", 0.3)
+        monkeypatch.setattr(runner, "URGENT_WAIT_SECONDS", 0.5)
         monkeypatch.setattr(runner, "STOP_WAIT_SECONDS", 60)
+        monkeypatch.setattr(runner, "DIRECTORY_WAIT_SECONDS", 30)
         release = threading.Event()
+        monkeypatch.setattr(runner, "ensure_files_directory", release.wait)
         handler = {}
 
         def serve(server, _sockets=None):
             server.started = True
             server.service.on_started()
+            handler["signal"] = time.monotonic()
             handler["thread"], _ = urgent_in_thread(service_env, "выход пользователя")
             release.wait()
 
         monkeypatch.setattr(runner.InstanceServer, "run", serve)
-        started = time.monotonic()
         try:
             assert runner.run() == 0
+            elapsed = time.monotonic() - handler["signal"]
         finally:
             release.set()
-        assert time.monotonic() - started < 10
+        assert 0.5 <= elapsed < 2
         handler["thread"].join(5)
         assert service_env.exits == [0]
         [text] = event_texts(evtlog, 1001)
@@ -923,11 +927,11 @@ class TestUrgentStop:
         assert text.startswith("app.runner: Сервис остановлен: тест.")
 
     @pytest.mark.usefixtures("port", "fake_serve")
-    def test_handler_exits_when_finalization_hangs(self, service_env, monkeypatch):
-        """Проверить: финализация не закончилась в срок — процесс
-        завершает сам обработчик, не возвращаясь раньше.
+    def test_watchdog_when_finalization_hangs(self, service_env, monkeypatch):
+        """Проверить: финализация зависла — процесс завершает сторож, а
+        обработчик до этого не возвращается.
         """
-        monkeypatch.setattr(runner, "URGENT_EXIT_SECONDS", 0.2)
+        monkeypatch.setattr(runner, "EXIT_DEADLINE_SECONDS", 0.3)
         released = threading.Event()
         handler = {}
 
@@ -945,19 +949,23 @@ class TestUrgentStop:
         )
         assert runner.run() == 0
         handler["thread"].join(5)
-        # Первый выход — от обработчика, пока финализация висела
+        # Первый выход — от сторожа, пока финализация висела
         assert service_env.exits == [0, 0]
-        assert handler["exits"] == [1]
+        assert handler["exits"] == [2]
 
     def test_after_failure(self, service_env):
-        """Проверить: срочный сигнал после сбоя ничего не останавливает
-        и при зависшем выходе завершает процесс с кодом сбоя.
+        """Проверить: срочный сигнал после сбоя ничего не останавливает,
+        а обработчик ждёт выхода процесса.
         """
         service = runner.Service(console=True)
         assert service.claim(runner.Outcome.FAILED)
-        with mock.patch.object(runner, "URGENT_EXIT_SECONDS", 0.01):
-            service.urgent_stop("выход пользователя")
-        assert service_env.exits == [1]
+        thread = threading.Thread(target=service.urgent_stop, args=("выход",))
+        thread.start()
+        thread.join(0.2)
+        assert thread.is_alive()
+        service.finished.set()
+        thread.join(5)
+        assert service_env.exits == []
         assert service.stop_reason == ""
         assert service.stop_deadline == float("inf")
         assert not service.stop_requested.is_set()
@@ -1113,6 +1121,59 @@ class TestCompiledExe:
         compiled_exe.check.assert_called_once()
         assert service_env.exits == [0]
         assert event_ids(evtlog) == [1005]
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_stop_waits_for_check(self, compiled_exe, evtlog):
+        """Проверить: остановка во время обхода папки — 1003 до 1001."""
+        release = threading.Event()
+
+        def check(_folder):
+            release.wait(5)
+            return [compiled_exe.violation]
+
+        compiled_exe.check.side_effect = check
+        timer = threading.Timer(0.3, release.set)
+        timer.start()
+        assert runner.run() == 0
+        assert event_ids(evtlog) == [1000, 1003, 1001]
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_late_check_only_to_file(self, compiled_exe, evtlog, monkeypatch, caplog):
+        """Проверить: проверка, не закончившаяся к 1001, — после него
+        только в файл журнала.
+        """
+        monkeypatch.setattr(runner, "PERMISSIONS_WAIT_SECONDS", 0.1)
+        release = threading.Event()
+
+        def check(_folder):
+            release.wait(5)
+            return [compiled_exe.violation]
+
+        compiled_exe.check.side_effect = check
+        assert runner.run() == 0
+        release.set()
+        wait_for(checks_finished)
+        assert event_ids(evtlog) == [1000, 1001]
+        assert "нарушения" in caplog.text
+
+    @pytest.mark.usefixtures("port")
+    def test_settings_error_with_violations(
+        self, compiled_exe, service_env, evtlog, files_dir, monkeypatch
+    ):
+        """Проверить: ошибка настроек — права всё равно проверены, 1003
+        до 1002.
+        """
+        from app.settings import get_settings
+
+        monkeypatch.chdir(files_dir.parent)
+        get_settings.cache_clear()
+        (files_dir.parent / ".env").write_text(
+            "FILES_DIRECTORY=D:\\x\n", encoding="utf-8"
+        )
+        assert runner.run() == 1
+        compiled_exe.check.assert_called_once()
+        assert service_env.exits == [1]
+        assert event_ids(evtlog) == [1003, 1002]
 
     @pytest.mark.usefixtures("port", "fake_serve")
     def test_source_run_skips_both(self, compiled_exe, monkeypatch):

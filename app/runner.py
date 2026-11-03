@@ -65,11 +65,11 @@ STOP_WAIT_SECONDS = 20
 # Срочная остановка: Windows завершит процесс после возврата из
 # обработчика, а закрытие консоли ждёт его не дольше 5 секунд
 URGENT_WAIT_SECONDS = 3
-# Обработчик срочного сигнала ждёт финализацию не дольше этого срока
-# и затем завершает процесс сам
-URGENT_EXIT_SECONDS = 4.5
 # Ожидание потока создания директории при остановке
 DIRECTORY_WAIT_SECONDS = 1
+# Ожидание проверки прав перед последними событиями (1001, итоговое
+# 1002): обход папки сборки локальный и обычно короче секунды
+PERMISSIONS_WAIT_SECONDS = 5
 # Процесс завершается не позже этого срока после исхода, даже если
 # запись в журнал зависла (спецификация: не позже 30 секунд)
 EXIT_DEADLINE_SECONDS = 28
@@ -104,6 +104,15 @@ def _windows() -> bool:
 def _compiled() -> bool:
     """Запущен собранный exe (Nuitka), а не `python -m app`."""
     return "__compiled__" in globals()
+
+
+def _built_exe_on_windows() -> bool:
+    """Собранный exe на Windows: перезапуск и проверка прав — у него.
+
+    У `python -m app` пустая командная строка перезапустила бы
+    интерпретатор без аргументов, а «папка exe» — папка интерпретатора.
+    """
+    return _windows() and _compiled()
 
 
 def ensure_files_directory() -> None:
@@ -143,11 +152,10 @@ def exe_path() -> Path:
 def register_restart() -> None:
     """Попросить Restart Manager перезапустить сервис после обновления.
 
-    Только у собранного exe на Windows: пустая командная строка у
-    `python -m app` перезапустила бы интерпретатор без аргументов.
-    Отказ не мешает работе: сервис поднимется при следующем входе.
+    Только у собранного exe на Windows. Отказ не мешает работе: сервис
+    поднимется при следующем входе.
     """
-    if not (_windows() and _compiled()):
+    if not _built_exe_on_windows():
         return
     from app import winapi
 
@@ -157,13 +165,16 @@ def register_restart() -> None:
         logger.warning("Не удалось зарегистрировать перезапуск после обновления: %s", e)
 
 
-def check_permissions() -> None:
+def check_permissions(event_log: Callable[[], bool] = lambda: True) -> None:
     """Проверить права на папку сборки; нарушения — событие 1003.
 
-    Только у собранного exe: при `python -m app` «папка exe» — папка
-    интерпретатора. Событие идёт через буфер стартовых событий: у
-    второго экземпляра, проигравшего гонку за порт, оно отбрасывается.
+    Только у собранного exe на Windows. Событие идёт через буфер
+    стартовых событий: у второго экземпляра, проигравшего гонку за
+    порт, оно отбрасывается. event_log() — можно ли ещё писать в журнал
+    событий: после 1001 запись идёт только в файл журнала.
     """
+    if not _built_exe_on_windows():
+        return
     from app import permissions
 
     try:
@@ -177,10 +188,16 @@ def check_permissions() -> None:
             "Не удалось проверить права на папку сборки: %s",
             event_tracking.describe_error(e),
             exc_info=e,
-            extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS},
+            extra={
+                "event_id": EventId.BUILD_FOLDER_PERMISSIONS,
+                "event_log": event_log(),
+            },
         )
         return
-    logger.warning(message, extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS})
+    logger.warning(
+        message,
+        extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS, "event_log": event_log()},
+    )
 
 
 def _branch() -> str:
@@ -300,7 +317,8 @@ class Service:
         # Будит финализацию: поток завершился или срок сократился
         self.changed = threading.Condition(self.lock)
         self.done = threading.Event()
-        # Процесс завершён (только после подменённого _exit)
+        # Процесс завершён: выставляется только после подменённого _exit
+        # (тесты), в работе процесс к этому моменту уже завершён
         self.finished = threading.Event()
         self.stop_requested = threading.Event()
         self.outcome: Outcome | None = None
@@ -314,6 +332,11 @@ class Service:
         self.worker_finished = False
         self.directory_thread: threading.Thread | None = None
         self.directory_finished = False
+        self.permissions_thread: threading.Thread | None = None
+        self.permissions_finished = False
+        # Последние события записаны: поздний результат проверки прав
+        # идёт только в файл журнала, а не после 1001 или 1002
+        self.events_closed = False
         # Текст 1000; собирается в рабочем потоке до запуска Uvicorn
         self.start_message = f"Сервис запущен: версия {__version__}, порт {PORT}"
 
@@ -344,14 +367,13 @@ class Service:
 
         Windows завершит процесс сразу после возврата из обработчика
         (закрытие консоли, WM_ENDSESSION), поэтому обработчик ждёт, пока
-        главный поток закончит финализацию и вызовет _exit. Если она не
-        закончилась за URGENT_EXIT_SECONDS, процесс завершает сам
-        обработчик. Возвращается, только если _exit подменён (тесты).
+        главный поток закончит финализацию и вызовет _exit. Своего срока
+        у обработчика нет: зависшую финализацию завершает сторож в
+        run(), а закрытие консоли Windows и так ждёт не дольше 5 секунд.
+        Возвращается, только если _exit подменён (тесты).
         """
         self.request_stop(reason, urgent=True)
-        if not self.finished.wait(URGENT_EXIT_SECONDS):
-            # Исход уже записан: этим запросом или раньше
-            _exit(self.outcome.exit_code)
+        self.finished.wait()
 
     def _wait_for(self, finished: Callable[[], bool], seconds: float) -> None:
         """Ждать finished() не дольше seconds и срока остановки.
@@ -371,6 +393,23 @@ class Service:
         with self.changed:
             setattr(self, attribute, True)
             self.changed.notify_all()
+
+    def _check_permissions(self) -> None:
+        """Тело потока проверки прав."""
+        try:
+            check_permissions(lambda: not self.events_closed)
+        finally:
+            self._thread_finished("permissions_finished")
+
+    def _close_events(self) -> None:
+        """Дождаться проверки прав и закрыть журнал событий для неё.
+
+        Её 1003 должно попасть в журнал событий до последнего события
+        (1001 или итогового 1002), а не после него.
+        """
+        if self.permissions_thread is not None:
+            self._wait_for(lambda: self.permissions_finished, PERMISSIONS_WAIT_SECONDS)
+        self.events_closed = True
 
     def _create_directory(self) -> None:
         """Тело потока создания директории."""
@@ -454,6 +493,12 @@ class Service:
         # После проверки второго экземпляра: тот завершается сразу, и
         # перезапускать его после обновления незачем
         register_restart()
+        # Обход сотен файлов сборки не задерживает начало приёма
+        # запросов, а результат ждёт в буфере стартовых событий
+        self.permissions_thread = threading.Thread(
+            target=self._check_permissions, name="check-permissions", daemon=True
+        )
+        self.permissions_thread.start()
 
         from pydantic import ValidationError
 
@@ -473,12 +518,6 @@ class Service:
             target=self._create_directory, name="ensure-files-directory", daemon=True
         )
         self.directory_thread.start()
-        if _windows() and _compiled():
-            # Обход сотен файлов сборки не задерживает начало приёма
-            # запросов, а результат ждёт в буфере стартовых событий
-            threading.Thread(
-                target=check_permissions, name="check-permissions", daemon=True
-            ).start()
         self._serve_with_retries(app)
 
     def _serve_with_retries(self, app: object) -> None:
@@ -566,6 +605,7 @@ class Service:
         if not self.claim(Outcome.FAILED):
             self.stop_error = error
             return
+        self._close_events()
         self._report_failure(message, error)
         self.done.set()
 
@@ -600,6 +640,7 @@ class Service:
         hung = (self.worker is not None and not self.worker_finished) or (
             self.directory_thread is not None and not self.directory_finished
         )
+        self._close_events()
         # Повторы во время мягкой остановки тоже попадают в итог
         event_tracking.flush()
         # Остановка до старта слушателя: накопленное — перед 1001
@@ -664,7 +705,7 @@ def run() -> int:
     flush_handlers()
     _exit(outcome.exit_code)
     # Дальше — только при подменённом _exit (тесты): обработчик
-    # срочного сигнала ждёт этого и больше не завершает процесс сам
+    # срочного сигнала ждёт этого, чтобы вернуться
     service.finished.set()
     watchdog.cancel()
     return outcome.exit_code
