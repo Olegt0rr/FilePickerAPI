@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import types
 from logging.handlers import TimedRotatingFileHandler
@@ -885,6 +886,44 @@ class TestEventLogHandler:
         assert reported(evtlog) == []
         # Повтор до сброса буфера — в итоговом напоминании
         assert "Повторялось ещё 1 раз с прошлой записи: app.t: w" in caplog.text
+
+
+class TestFlushHandlers:
+    """Сброс журнала перед os._exit."""
+
+    def test_flushes_handlers(self, monkeypatch):
+        handler = logging.StreamHandler()
+        handler.flush = mock.Mock()
+        monkeypatch.setattr(logging_setup, "_handlers", [handler])
+        logging_setup.flush_handlers()
+        handler.flush.assert_called_once()
+
+    def test_skips_handler_with_held_lock(self, monkeypatch):
+        """Проверить: замок обработчика держит зависший поток — сброс
+        его пропускает, а не ждёт вечно.
+        """
+        held, stuck = logging.StreamHandler(), logging.StreamHandler()
+        held.flush = mock.Mock()
+        stuck.flush = mock.Mock(side_effect=OSError("канал переполнен"))
+        monkeypatch.setattr(logging_setup, "_handlers", [held, stuck])
+        monkeypatch.setattr(logging_setup, "FLUSH_LOCK_SECONDS", 0.1)
+        locked, release = threading.Event(), threading.Event()
+
+        def hold():
+            with held.lock:
+                locked.set()
+                release.wait()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        locked.wait()
+        try:
+            logging_setup.flush_handlers()
+        finally:
+            release.set()
+            thread.join()
+        held.flush.assert_not_called()
+        stuck.flush.assert_called_once()
 
 
 class TestWindowsLookups:

@@ -13,7 +13,6 @@
 настройки читаются только в create_app(), после настройки журнала.
 """
 
-import asyncio
 import errno
 import getpass
 import importlib
@@ -23,6 +22,7 @@ import socket
 import sys
 import threading
 import time
+from contextlib import suppress
 from enum import Enum
 from pathlib import Path
 
@@ -207,9 +207,9 @@ class InstanceServer(uvicorn.Server):
         await super().startup(sockets=sockets)
         if self.started:
             self.errors.active = False
-            # Не в цикле событий: отправка буфера (до 100 ReportEvent)
-            # не задерживает первые запросы
-            await asyncio.to_thread(self.service.on_started)
+            # В цикле событий, до первого запроса: события запросов
+            # (2000, 4000) не опередят 1000. Текст 1000 готов заранее
+            self.service.on_started()
 
 
 class Service:
@@ -235,6 +235,8 @@ class Service:
         self.server: InstanceServer | None = None
         self.worker: threading.Thread | None = None
         self.directory_thread: threading.Thread | None = None
+        # Текст 1000; собирается в рабочем потоке до запуска Uvicorn
+        self.start_message = f"Сервис запущен: версия {__version__}, порт {PORT}"
 
     def request_stop(self, reason: str) -> None:
         """Запросить остановку; повторный запрос ничего не делает.
@@ -278,13 +280,18 @@ class Service:
         if self.stop_requested.is_set():
             return
         send_startup_events()
+        logger.info(self.start_message, extra={"event_id": EventId.SERVICE_STARTED})
+
+    def _prepare_start_message(self) -> None:
+        """Собрать текст 1000 вне цикла событий Uvicorn.
+
+        Ошибка здесь не мешает запуску: 1000 пишется с версией и
+        причиной.
+        """
         try:
-            message = startup_message(console=self.console)
+            self.start_message = startup_message(console=self.console)
         except Exception as e:
-            # Исключение отсюда вышло бы из startup() после привязки, и
-            # Uvicorn оставил бы порт занятым до конца процесса
-            message = f"Сервис запущен: версия {__version__}, порт {PORT} ({e})"
-        logger.info(message, extra={"event_id": EventId.SERVICE_STARTED})
+            self.start_message += f" ({e})"
 
     def work(self) -> None:
         """Тело рабочего потока: ошибка в нём — тоже сбой запуска."""
@@ -294,8 +301,13 @@ class Service:
             self._fail("Непредвиденная ошибка запуска сервиса", e)
         finally:
             # Даже если упала сама запись исхода, главный поток не
-            # должен ждать вечно
-            self.claim(Outcome.FAILED)
+            # должен ждать вечно; выход без исхода — тоже сбой с 1002
+            if self.claim(Outcome.FAILED):
+                with suppress(Exception):
+                    self._report_failure(
+                        "Рабочий поток завершился без исхода, сервис не работает",
+                        None,
+                    )
             self.done.set()
 
     def _work(self) -> None:
@@ -319,6 +331,7 @@ class Service:
             # сборкой, и повторные попытки дали бы тот же результат
             self._fail("Ошибка настроек, сервис не запущен", e)
             return
+        self._prepare_start_message()
         # mkdir на недоступной UNC-папке ждёт таймаутов SMB: сервис
         # принимает запросы, не дожидаясь его
         self.directory_thread = threading.Thread(

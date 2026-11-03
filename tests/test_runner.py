@@ -6,6 +6,7 @@ run() выполняется в процессе теста: выход проц
 порте вместо 8000.
 """
 
+import ctypes
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ from fastapi import FastAPI
 import app
 from app import event_tracking, instance_check, logging_setup, runner, stop_signals
 from app.instance_check import Probe, ProbeResult
-from tests.conftest import start_then_stop
+from tests.conftest import settle_directory, start_then_stop, wait_for
 from tests.platforms import linux_only, windows_only
 from tests.test_main import reload_app, run_python
 
@@ -527,6 +528,16 @@ class TestServerErrors:
         assert runner.run() == 0
         assert event_ids(evtlog) == [1002, 1001]
 
+    def test_worker_returns_without_outcome(self, service_env, evtlog, monkeypatch):
+        """Проверить: рабочий поток вышел без исхода — 1002 о нём и
+        код 1, а не тихий выход.
+        """
+        monkeypatch.setattr(runner.Service, "_work", lambda _self: None)
+        assert runner.run() == 1
+        assert service_env.exits == [1]
+        [text] = event_texts(evtlog, 1002)
+        assert "Рабочий поток завершился без исхода" in text
+
     # Исключение нарочно выходит из рабочего потока
     @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
     def test_failure_while_reporting(self, service_env, monkeypatch):
@@ -754,6 +765,7 @@ class TestStop:
 
         def on_started(service):
             started(service)
+            settle_directory(service)
             service_env.stop("Ctrl+C в консоли")
 
         started = runner.Service.on_started
@@ -1064,16 +1076,21 @@ class TestStopSignals:
 
 def wait_for_service(process, timeout=30):
     """Дождаться ответа сервиса на порту 8000."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    answer = {}
+
+    def ready():
         if process.poll() is not None:
             pytest.fail(f"процесс завершился с кодом {process.returncode}")
         try:
-            return httpx.get("http://127.0.0.1:8000/openapi.json", timeout=1).json()
+            answer.update(
+                httpx.get("http://127.0.0.1:8000/openapi.json", timeout=1).json()
+            )
         except httpx.HTTPError:
-            time.sleep(0.2)
-    pytest.fail("сервис не ответил")
-    return None
+            return False
+        return True
+
+    wait_for(ready, timeout)
+    return answer
 
 
 def service_code(log_file):
@@ -1169,6 +1186,10 @@ class TestWindowsProcess:
 
     def test_ctrl_break(self, service_process, tmp_path):
         """Проверить: CTRL_BREAK_EVENT — код 0 и 1001 в журнале."""
+        # Сигнал доходит только через общую консоль (CI-агент без
+        # консоли, служба, планировщик)
+        if not ctypes.windll.kernel32.GetConsoleCP():
+            pytest.skip("у процесса pytest нет консоли")
         process = service_process(creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         wait_for_service(process)
         process.send_signal(signal.CTRL_BREAK_EVENT)

@@ -38,6 +38,8 @@ EVENT_SOURCE_KEY = (
 MAX_EVENT_TEXT = 31_839
 TRUNCATED_NOTE = "\n… (обрезано, полный текст в FilePickerAPI.log)"
 STARTUP_BUFFER_LIMIT = 100
+# Ожидание замка обработчика при сбросе журнала перед выходом
+FLUSH_LOCK_SECONDS = 1.0
 
 # Обработчики, добавленные setup_logging: повторная настройка их снимает
 _handlers: list[logging.Handler] = []
@@ -468,9 +470,16 @@ def discard_startup_events() -> None:
 def flush_handlers() -> None:
     """Сбросить обработчики журнала перед os._exit.
 
-    Не logging.shutdown(): зависший поток может держать замок
-    обработчика, а закрывать файлы перед os._exit незачем.
+    flush() берёт замок обработчика, а его может держать зависший
+    поток (например, запись в переполненный канал консоли). Поэтому
+    замок ждём не дольше FLUSH_LOCK_SECONDS, и такой обработчик
+    пропускаем: процесс должен завершиться в срок.
     """
     for handler in _handlers:
-        with suppress(Exception):
-            handler.flush()
+        if not handler.lock.acquire(timeout=FLUSH_LOCK_SECONDS):
+            continue
+        try:
+            with suppress(Exception):
+                handler.flush()
+        finally:
+            handler.lock.release()

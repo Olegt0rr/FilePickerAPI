@@ -2,8 +2,9 @@
 
 import errno
 import logging
+import time
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest import mock
 
@@ -37,6 +38,15 @@ def win_error(
     return error
 
 
+def wait_for(condition: Callable[[], object], timeout: float = 10) -> None:
+    """Дождаться истинного condition() или провалить тест по сроку."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail("условие не выполнилось за отведённое время")
+        time.sleep(0.05)
+
+
 @pytest.fixture
 def service_env(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     """runner.run() без выхода процесса и без обработчиков сигналов.
@@ -62,7 +72,18 @@ def start_then_stop(server: object, sockets: object = None) -> None:  # noqa: AR
     """InstanceServer.run без Uvicorn: старт, затем остановка."""
     server.started = True
     server.service.on_started()
+    settle_directory(server.service)
     server.service.request_stop("тест")
+
+
+def settle_directory(service: object, timeout: float = 1) -> None:
+    """Дать потоку создания директории закончить до остановки.
+
+    Иначе быстрый тест иногда застаёт mkdir в работе, и 1001 получает
+    пометку о незавершённом обращении к папке.
+    """
+    if service.directory_thread is not None:
+        service.directory_thread.join(timeout)
 
 
 @pytest.fixture
