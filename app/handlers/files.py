@@ -650,7 +650,6 @@ def list_files() -> FileListResponse:
     files_path = Path(get_settings().files_directory)
     # Замер без дополнительных обращений к ФС: время самого обработчика
     started = event_tracking.clock()
-    event_tracking.begin_access()
     try:
         # Один stat() вместо exists() + is_dir(): меньше обращений к
         # сетевой папке и одинаковое поведение на всех версиях Python
@@ -835,6 +834,10 @@ class TrackedFileResponse(FileResponse):
                 if status is None
                 else f"{status}, ответ оборван"
             )
+            if not event_tracking.is_network_error(e):
+                # Ошибка самого файла (например, его ещё пишут): папка
+                # ответила, как и при ответе 400/403 по атрибутам
+                event_tracking.directory_ok()
             event_tracking.file_error(self._directory, self._file_id, e, reported)
             raise
         else:
@@ -872,7 +875,6 @@ def get_file(
     """
     files_directory = Path(get_settings().files_directory)
     started = event_tracking.clock()
-    event_tracking.begin_access()
     try:
         file_path, file_stat = _find_download(file_id, files_directory)
     except BaseException:

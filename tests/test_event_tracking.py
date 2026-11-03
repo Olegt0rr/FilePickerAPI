@@ -245,6 +245,17 @@ class TestDirectoryState:
         assert "Ошибочных ответов с прошлой записи: 0" in sent[2][1]
 
     @pytest.mark.usefixtures("clock")
+    def test_aborted_200_and_206_one_reason(self, records):
+        """Обрыв обычного и Range-ответа при одной ошибке — одна
+        причина: 2000 одно, без смены на каждое чередование.
+        """
+        error = OSError(errno.EIO, "I/O")
+        for status in ("200, ответ оборван", "206, ответ оборван") * 2:
+            event_tracking.directory_error("/srv", error, status)
+        assert [e for e, _ in events(records)] == [2000]
+        assert len(records()) == 4
+
+    @pytest.mark.usefixtures("clock")
     @pytest.mark.parametrize(
         ("status", "traceback"), [(404, False), (500, True), ("206, оборван", True)]
     )
@@ -343,6 +354,22 @@ class TestAccessOrder:
 
         self.request().run(event_tracking.directory_error, "/srv", error, 500)
         assert [e for e, _ in events(records)] == [2000]
+
+    def test_stale_error_keeps_reason(self, records):
+        """Папка недоступна по ошибке B; ошибка A, начатого раньше, с
+        другой причиной — повтор: нового 2000 нет, счётчик растёт.
+        """
+        first, second = self.request(), self.request()
+        denied = PermissionError(errno.EACCES, "Permission denied", "/srv")
+        missing = FileNotFoundError(errno.ENOENT, "No such file", "/srv")
+        second.run(event_tracking.directory_error, "/srv", denied, 403)
+        first.run(event_tracking.directory_error, "/srv", missing, 404)
+        self.request().run(event_tracking.directory_ok)
+
+        sent = events(records)
+        assert [e for e, _ in sent] == [2000, 2001]
+        assert "Ответ клиенту: 403" in sent[0][1]
+        assert sent[1][1].endswith("ошибочных ответов: 2")
 
     def test_without_begin_access(self, records):
         """Без begin_access — номер момента вызова (как раньше)."""

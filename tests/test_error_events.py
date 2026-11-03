@@ -357,6 +357,27 @@ class TestTrackedFileResponse:
         assert events() == []
         assert event_tracking.is_tracked(error)
 
+    def test_file_body_error_restores(self, files_dir, events):
+        """Несетевая ошибка чтения тела (файл ещё пишут) — папка
+        ответила: 2001, затем 3000.
+        """
+        self.make_unavailable(files_dir)
+        error = win_error(32, PermissionError)
+
+        async def failing_call(_self, _scope, _receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            raise error
+
+        async def send(_message):
+            pass
+
+        with (
+            mock.patch.object(FileResponse, "__call__", failing_call),
+            pytest.raises(PermissionError, match="system message"),
+        ):
+            self.send_file(files_dir, send)
+        assert [e for e, _ in events()] == [2000, 2001, 3000]
+
     def test_whole_body_restores(self, files_dir, events):
         """Тело отправлено целиком — 2001."""
         self.make_unavailable(files_dir)
@@ -447,6 +468,31 @@ class TestExceptionHandlers:
             "Непредвиденная ошибка запроса GET /boom/a: RuntimeError: сбой a"
         )
         assert record.exc_info is not None
+
+    def test_http_error_uses_request_access(self, files_dir, events):
+        """Обработчик HTTPException берёт номер обращения с начала
+        запроса, тот же, что видел обработчик маршрута.
+        """
+        app = reload_app(files_directory=str(files_dir))
+        seen = {}
+
+        @app.get("/dir-os")
+        def dir_os():
+            seen["handler"] = event_tracking._access.get()  # noqa: SLF001
+            raise HTTPException(500) from OSError(errno.EIO, "I/O")
+
+        original = event_tracking.directory_error
+
+        def recording(*args):
+            seen["error"] = event_tracking._access.get()  # noqa: SLF001
+            original(*args)
+
+        with mock.patch.object(event_tracking, "directory_error", recording):
+            response = TestClient(app).get("/dir-os")
+        assert response.status_code == 500
+        assert seen["handler"] is not None
+        assert seen["error"] == seen["handler"]
+        assert [e for e, _ in events()] == [2000]
 
     def test_tracked_exception_skipped(self, app_client, events):
         assert app_client.get("/tracked").status_code == 500

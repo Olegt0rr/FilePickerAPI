@@ -7,11 +7,30 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException
 from starlette.responses import PlainTextResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app import __version__, event_tracking
 from app.event_tracking import EventId, is_tracked
 from app.handlers import files
 from app.settings import get_settings
+
+
+class _AccessOrderMiddleware:
+    """Номер обращения к папке с начала запроса (event_tracking).
+
+    Номер ставится в контексте задачи запроса: его видят и обработчик в
+    пуле потоков (контекст копируется), и обработчики исключений после
+    него. Иначе ошибка, записанная обработчиком исключений, получила бы
+    номер момента записи и считалась бы новее любого успеха.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            event_tracking.begin_access()
+        await self.app(scope, receive, send)
 
 
 def _route(request: Request) -> str:
@@ -94,6 +113,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(_AccessOrderMiddleware)
 
     # Одна ошибка — одно событие в журнале событий (см. event_tracking)
     app.add_exception_handler(Exception, _unhandled_error)
