@@ -13,6 +13,7 @@
 настройки читаются только в create_app(), после настройки журнала.
 """
 
+import asyncio
 import errno
 import getpass
 import importlib
@@ -54,6 +55,11 @@ RESET_AFTER_SECONDS = 60 * 60
 # Ожидание текущих запросов Uvicorn и рабочего потока при остановке
 GRACEFUL_SHUTDOWN_SECONDS = 10
 STOP_WAIT_SECONDS = 20
+# Ожидание потока создания директории при остановке
+DIRECTORY_WAIT_SECONDS = 1
+# Процесс завершается не позже этого срока после исхода, даже если
+# запись в журнал зависла (спецификация: не позже 30 секунд)
+EXIT_DEADLINE_SECONDS = 28
 # Ошибка привязки: asyncio пересоздаёт исключение без winerror, а errno
 # на Windows — 10048 (WSAEADDRINUSE)
 ADDRESS_IN_USE = frozenset({errno.EADDRINUSE, 10048})
@@ -207,9 +213,12 @@ class InstanceServer(uvicorn.Server):
         await super().startup(sockets=sockets)
         if self.started:
             self.errors.active = False
-            # В цикле событий, до первого запроса: события запросов
-            # (2000, 4000) не опередят 1000. Текст 1000 готов заранее
+            # 1000 встаёт в конец буфера синхронно, до первого запроса:
+            # события запросов (2000, 4000) его не опередят. А сама
+            # отправка буфера (до 100 ReportEvent) идёт вне цикла и
+            # первые запросы не задерживает
             self.service.on_started()
+            await asyncio.to_thread(send_startup_events)
 
 
 class Service:
@@ -276,11 +285,17 @@ class Service:
             self.server = None
 
     def on_started(self) -> None:
-        """Слушатель запустился: буфер стартовых событий и 1000."""
+        """Слушатель запустился: 1000 в конец буфера стартовых событий.
+
+        Буфер отправляет InstanceServer.startup вне цикла событий.
+        Запись исхода (outcome) проходит и в полный буфер.
+        """
         if self.stop_requested.is_set():
             return
-        send_startup_events()
-        logger.info(self.start_message, extra={"event_id": EventId.SERVICE_STARTED})
+        logger.info(
+            self.start_message,
+            extra={"event_id": EventId.SERVICE_STARTED, "outcome": True},
+        )
 
     def _prepare_start_message(self) -> None:
         """Собрать текст 1000 вне цикла событий Uvicorn.
@@ -447,11 +462,14 @@ class Service:
         """Обычная остановка: ожидание, напоминания и ровно одно 1001.
 
         Рабочий поток ждём не дольше 20 секунд: обращения к SMB нельзя
-        прервать изнутри процесса. Поток создания директории не ждём —
-        он демонический, достаточно проверить, завершился ли он.
+        прервать изнутри процесса. Поток создания директории — не больше
+        секунды: он демонический, а короткое ожидание отличает
+        зависший mkdir от только что начатого.
         """
         if self.worker is not None:
             self.worker.join(STOP_WAIT_SECONDS)
+        if self.directory_thread is not None:
+            self.directory_thread.join(DIRECTORY_WAIT_SECONDS)
         hung = (self.worker is not None and self.worker.is_alive()) or (
             self.directory_thread is not None and self.directory_thread.is_alive()
         )
@@ -508,8 +526,15 @@ def run() -> int:
     service.done.wait()
 
     outcome = service.outcome
+    # Сторож: запись в журнал может зависнуть на замке обработчика
+    # (поток, застрявший на записи в канал консоли), а процесс должен
+    # завершиться в срок при любом исходе
+    watchdog = threading.Timer(EXIT_DEADLINE_SECONDS, lambda: _exit(outcome.exit_code))
+    watchdog.daemon = True
+    watchdog.start()
     if outcome is Outcome.STOP:
         service.finalize()
     flush_handlers()
     _exit(outcome.exit_code)
+    watchdog.cancel()
     return outcome.exit_code

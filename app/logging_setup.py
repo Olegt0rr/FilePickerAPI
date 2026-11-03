@@ -101,7 +101,8 @@ class EventLogHandler(logging.Handler):
     этого — одна пометка о числе отброшенных) и отправляются
     send_startup_events() или отбрасываются discard_startup_events().
     После отбрасывания (второй экземпляр, процесс завершается) в журнал
-    событий идут только записи исхода (extra={"outcome": True}): поток
+    событий идут только записи исхода (extra={"outcome": True}: 1000,
+    1005, 1006; их не отбрасывает и лимит буфера): поток
     проверки прав или создания директории, закончивший работу до
     выхода, не оставит 1003 или 2004 без пары. Ошибка ReportEvent не
     роняет запрос: о серии отказов пишется одна строка в файл журнала,
@@ -137,7 +138,8 @@ class EventLogHandler(logging.Handler):
         event_id = event_id_for(record)
         if event_id is None:
             return
-        if self._discarded and not getattr(record, "outcome", False):
+        outcome = getattr(record, "outcome", False)
+        if self._discarded and not outcome:
             return
         try:
             message = record.getMessage()
@@ -145,8 +147,13 @@ class EventLogHandler(logging.Handler):
             self.handleError(record)
             return
         # Лимит буфера — до учёта повторов: отброшенная запись не
-        # должна занять ключ, иначе её первое событие не придёт никогда
-        if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
+        # должна занять ключ, иначе её первое событие не придёт никогда.
+        # Запись исхода (1000) лимитом не отбрасывается
+        if (
+            self._buffer is not None
+            and len(self._buffer) >= STARTUP_BUFFER_LIMIT
+            and not outcome
+        ):
             self._dropped += 1
             return
         note = ""

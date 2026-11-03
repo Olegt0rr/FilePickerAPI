@@ -840,6 +840,37 @@ class TestEventLogHandler:
         assert [e[0] for e in reported(evtlog)] == [1005]
         evtlog.DeregisterEventSource.assert_called_once()
 
+    def test_outcome_passes_full_buffer(self, evtlog):
+        """Проверить: запись исхода (1000) встаёт в полный буфер, а не
+        отбрасывается лимитом.
+        """
+        handler = logging_setup.EventLogHandler()
+        for i in range(logging_setup.STARTUP_BUFFER_LIMIT + 5):
+            handler.handle(
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
+                )
+            )
+        handler.handle(
+            logging.makeLogRecord(
+                {
+                    "name": "app.runner",
+                    "levelno": 20,
+                    "msg": "Сервис запущен",
+                    "event_id": 1000,
+                    "outcome": True,
+                }
+            )
+        )
+        handler.send_startup_events()
+        handler.close()
+
+        ids = [e[0] for e in reported(evtlog)]
+        assert ids.count(1000) == 1
+        assert ids.index(1000) == logging_setup.STARTUP_BUFFER_LIMIT
+        # Пометка об отброшенных записях — после буфера
+        assert ids[-1] == 3001
+
     def test_lost_first_event_not_a_repeat(self, evtlog):
         """Проверить: запись, не попавшая в журнал событий из-за лимита
         буфера, не считается потом повтором.

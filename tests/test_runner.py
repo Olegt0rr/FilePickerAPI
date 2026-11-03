@@ -27,7 +27,7 @@ from fastapi import FastAPI
 import app
 from app import event_tracking, instance_check, logging_setup, runner, stop_signals
 from app.instance_check import Probe, ProbeResult
-from tests.conftest import settle_directory, start_then_stop, wait_for
+from tests.conftest import start_then_stop, wait_for
 from tests.platforms import linux_only, windows_only
 from tests.test_main import reload_app, run_python
 
@@ -677,6 +677,35 @@ class TestStop:
         [text] = event_texts(evtlog, 1001)
         assert "Обращение к сетевой папке не завершилось" in text
 
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_directory_just_started(self, evtlog, monkeypatch):
+        """Проверить: mkdir, закончившийся за доли секунды после
+        сигнала, — не зависание, пометки в 1001 нет.
+        """
+        monkeypatch.setattr(runner, "ensure_files_directory", lambda: time.sleep(0.3))
+        assert runner.run() == 0
+        assert event_texts(evtlog, 1001) == ["app.runner: Сервис остановлен: тест"]
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_watchdog_exits_when_logging_hangs(self, monkeypatch):
+        """Проверить: финализация зависла (замок обработчика журнала) —
+        сторож всё равно завершает процесс в срок.
+        """
+        released = threading.Event()
+        exits = []
+
+        def exit_process(code):
+            exits.append(code)
+            released.set()
+
+        monkeypatch.setattr(runner, "_exit", exit_process)
+        monkeypatch.setattr(runner, "EXIT_DEADLINE_SECONDS", 0.2)
+        monkeypatch.setattr(runner.Service, "finalize", lambda _self: released.wait(10))
+        assert runner.run() == 0
+        # Первый выход — от сторожа, пока финализация ещё висела
+        assert exits[0] == 0
+        assert len(exits) == 2
+
     @pytest.mark.usefixtures("port")
     def test_hung_worker(self, service_env, evtlog, monkeypatch):
         """Проверить: рабочий поток не завершился за срок — пометка в
@@ -765,7 +794,6 @@ class TestStop:
 
         def on_started(service):
             started(service)
-            settle_directory(service)
             service_env.stop("Ctrl+C в консоли")
 
         started = runner.Service.on_started

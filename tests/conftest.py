@@ -72,18 +72,7 @@ def start_then_stop(server: object, sockets: object = None) -> None:  # noqa: AR
     """InstanceServer.run без Uvicorn: старт, затем остановка."""
     server.started = True
     server.service.on_started()
-    settle_directory(server.service)
     server.service.request_stop("тест")
-
-
-def settle_directory(service: object, timeout: float = 1) -> None:
-    """Дать потоку создания директории закончить до остановки.
-
-    Иначе быстрый тест иногда застаёт mkdir в работе, и 1001 получает
-    пометку о незавершённом обращении к папке.
-    """
-    if service.directory_thread is not None:
-        service.directory_thread.join(timeout)
 
 
 @pytest.fixture
