@@ -12,7 +12,7 @@ from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from app.event_tracking import EventId, is_tracked
+from app.event_tracking import EventId, admit, is_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,8 @@ EVENT_SOURCE_KEY = (
 MAX_EVENT_TEXT = 31_839
 TRUNCATED_NOTE = "\n… (обрезано, полный текст в FilePickerAPI.log)"
 STARTUP_BUFFER_LIMIT = 100
+# Ожидание замка обработчика при сбросе журнала перед выходом
+FLUSH_LOCK_SECONDS = 1.0
 
 # Обработчики, добавленные setup_logging: повторная настройка их снимает
 _handlers: list[logging.Handler] = []
@@ -98,8 +100,13 @@ class EventLogHandler(logging.Handler):
     До исхода запуска события копятся в буфере (не больше 100, сверх
     этого — одна пометка о числе отброшенных) и отправляются
     send_startup_events() или отбрасываются discard_startup_events().
-    Ошибка ReportEvent не роняет запрос: о серии отказов пишется одна
-    строка в файл журнала, а сами записи в нём уже есть.
+    После отбрасывания (второй экземпляр, процесс завершается) в журнал
+    событий идут только записи исхода (extra={"outcome": True}: 1000,
+    1005, 1006; их не отбрасывает и лимит буфера): поток
+    проверки прав или создания директории, закончивший работу до
+    выхода, не оставит 1003 или 2004 без пары. Ошибка ReportEvent не
+    роняет запрос: о серии отказов пишется одна строка в файл журнала,
+    а сами записи в нём уже есть.
     """
 
     def __init__(self) -> None:
@@ -113,24 +120,54 @@ class EventLogHandler(logging.Handler):
         # ни трассировки с кадрами стека
         self._buffer: list[tuple[int, int, str]] | None = []
         self._dropped = 0
+        # Буфер отброшен: дальше — только записи исхода
+        self._discarded = False
         # Идёт серия отказов ReportEvent: строка о ней уже в журнале
         self._report_failing = False
         # Время и уровень Event Viewer показывает сам
         self.setFormatter(logging.Formatter("%(name)s: %(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Записать событие или отложить его в буфер."""
+        """Записать событие или отложить его в буфер.
+
+        Запись без явного кода идёт через учёт повторов с ключом
+        «логгер + шаблон сообщения»: иначе Uvicorn, который пишет о
+        каждом некорректном HTTP-запросе из сети, давал бы событие на
+        каждое соединение сканера портов.
+        """
         event_id = event_id_for(record)
         if event_id is None:
             return
-        if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
-            self._dropped += 1
+        outcome = getattr(record, "outcome", False)
+        if self._discarded and not outcome:
             return
         try:
-            text = self.format(record)
+            message = record.getMessage()
         except Exception:
             self.handleError(record)
             return
+        # Лимит буфера — до учёта повторов: отброшенная запись не
+        # должна занять ключ, иначе её первое событие не придёт никогда.
+        # Запись исхода (1000) лимитом не отбрасывается
+        if (
+            self._buffer is not None
+            and len(self._buffer) >= STARTUP_BUFFER_LIMIT
+            and not outcome
+        ):
+            self._dropped += 1
+            return
+        note = ""
+        if getattr(record, "event_id", None) is None:
+            note = admit(
+                event_id,
+                (record.name, str(record.msg)),
+                # Ключ — шаблон, а текст напоминания — первая запись
+                f"{record.name}: {message}",
+                record.levelno,
+            )
+            if note is None:
+                return
+        text = self.format(record) + note
         if self._buffer is None:
             self._report(record.levelno, event_id, text)
         else:
@@ -153,9 +190,14 @@ class EventLogHandler(logging.Handler):
                 self._report(levelno, event_id, text)
 
     def discard_startup_events(self) -> None:
-        """Отбросить буфер; дальше события пишутся сразу."""
+        """Отбросить буфер; дальше пишутся только записи исхода.
+
+        Каждая отброшенная запись (и каждый её повтор) уже есть в файле
+        журнала; итоговых напоминаний второй экземпляр не пишет.
+        """
         with self.lock:
             self._buffer = None
+            self._discarded = True
             self._dropped = 0
 
     def _report(self, levelno: int, event_id: int, text: str) -> None:
@@ -430,3 +472,21 @@ def discard_startup_events() -> None:
     for handler in _handlers:
         if isinstance(handler, EventLogHandler):
             handler.discard_startup_events()
+
+
+def flush_handlers() -> None:
+    """Сбросить обработчики журнала перед os._exit.
+
+    flush() берёт замок обработчика, а его может держать зависший
+    поток (например, запись в переполненный канал консоли). Поэтому
+    замок ждём не дольше FLUSH_LOCK_SECONDS, и такой обработчик
+    пропускаем: процесс должен завершиться в срок.
+    """
+    for handler in _handlers:
+        if not handler.lock.acquire(timeout=FLUSH_LOCK_SECONDS):
+            continue
+        try:
+            with suppress(Exception):
+                handler.flush()
+        finally:
+            handler.lock.release()

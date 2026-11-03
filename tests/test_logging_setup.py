@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import types
 from logging.handlers import TimedRotatingFileHandler
@@ -12,7 +13,7 @@ from unittest import mock
 
 import pytest
 
-from app import logging_setup
+from app import event_tracking, logging_setup
 from app.event_tracking import EventId, is_tracked, mark_tracked
 from tests.platforms import windows_only
 
@@ -253,16 +254,21 @@ class TestSetupLogging:
 
     @pytest.mark.usefixtures("on_windows")
     def test_second_instance_discards_startup_events(self, monkeypatch, evtlog):
-        """Проверить: у второго экземпляра буфер отбрасывается, а его
-        событие пишется сразу.
+        """Проверить: у второго экземпляра буфер отбрасывается, поздние
+        записи событий не дают, а запись исхода пишется сразу.
         """
         monkeypatch.setattr(logging_setup, "event_source_registered", lambda: True)
         logging_setup.setup_logging(console=False)
         logging.getLogger("app.test").warning("буферное предупреждение")
 
         logging_setup.discard_startup_events()
+        logging.getLogger("app.test").warning(
+            "поздняя проверка прав",
+            extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS},
+        )
         logging.getLogger("app.test").info(
-            "сервис уже работает", extra={"event_id": EventId.ALREADY_RUNNING}
+            "сервис уже работает",
+            extra={"event_id": EventId.ALREADY_RUNNING, "outcome": True},
         )
 
         assert [e[:2] for e in reported(evtlog)] == [
@@ -551,17 +557,35 @@ class TestLogFileRotation:
 class TestEventLogHandler:
     """Журнал событий с поддельным win32evtlog."""
 
+    CODE_CASES = (
+        # Каждый код — с уровнем, которым его пишет сервис
+        (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
+        (logging.INFO, EventId.SERVICE_STOPPED, 1001, 4),
+        (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
+        (logging.WARNING, EventId.BUILD_FOLDER_PERMISSIONS, 1003, 2),
+        (logging.WARNING, EventId.LOG_FILE_UNAVAILABLE, 1004, 2),
+        (logging.INFO, EventId.ALREADY_RUNNING, 1005, 4),
+        (logging.WARNING, EventId.OTHER_VERSION_RUNNING, 1006, 2),
+        (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
+        (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
+        (logging.WARNING, EventId.DIRECTORY_STILL_UNAVAILABLE, 2002, 2),
+        (logging.WARNING, EventId.DIRECTORY_SLOW, 2003, 2),
+        (logging.WARNING, EventId.DIRECTORY_NOT_CREATED, 2004, 2),
+        (logging.WARNING, EventId.FILE_ACCESS_ERROR, 3000, 2),
+        (logging.WARNING, EventId.OTHER_WARNING, 3001, 2),
+        (logging.ERROR, EventId.UNEXPECTED_ERROR, 4000, 1),
+        # Без кода — по уровню
+        (logging.WARNING, None, 3001, 2),
+        (logging.ERROR, None, 4000, 1),
+        (logging.CRITICAL, None, 4000, 1),
+    )
+
+    def test_every_code_checked(self):
+        """Проверить: в test_code_and_type есть каждый код."""
+        assert {case[1] for case in self.CODE_CASES} - {None} == set(EventId)
+
     @pytest.mark.parametrize(
-        ("level", "event_id", "expected_id", "expected_type"),
-        [
-            (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
-            (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
-            (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
-            (logging.WARNING, None, 3001, 2),
-            (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
-            (logging.ERROR, None, 4000, 1),
-            (logging.CRITICAL, None, 4000, 1),
-        ],
+        ("level", "event_id", "expected_id", "expected_type"), CODE_CASES
     )
     def test_code_and_type(
         self, event_logger, level, event_id, expected_id, expected_type
@@ -758,7 +782,9 @@ class TestEventLogHandler:
         handler = logging_setup.EventLogHandler()
         for i in range(105):
             handler.handle(
-                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": f"w{i}"})
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": f"w{i}", "event_id": 2000}
+                )
             )
         handler.send_startup_events()
         handler.close()
@@ -800,8 +826,8 @@ class TestEventLogHandler:
         assert "Не удалось записать событие 2004 в журнал событий: full" in caplog.text
 
     def test_discard_startup_events(self, evtlog):
-        """Проверить: отброшенный буфер не отправляется, дальше
-        события пишутся сразу.
+        """Проверить: отброшенный буфер не отправляется и после
+        send_startup_events, дальше пишутся только записи исхода.
         """
         handler = logging_setup.EventLogHandler()
         for i in range(105):
@@ -812,11 +838,17 @@ class TestEventLogHandler:
         handler.send_startup_events()
         handler.handle(
             logging.makeLogRecord(
+                {"name": "app.t", "levelno": 30, "msg": "2004", "event_id": 2004}
+            )
+        )
+        handler.handle(
+            logging.makeLogRecord(
                 {
                     "name": "app.t",
                     "levelno": 20,
                     "msg": "уже работает",
                     "event_id": 1005,
+                    "outcome": True,
                 }
             )
         )
@@ -825,6 +857,122 @@ class TestEventLogHandler:
 
         assert [e[0] for e in reported(evtlog)] == [1005]
         evtlog.DeregisterEventSource.assert_called_once()
+
+    def test_outcome_passes_full_buffer(self, evtlog):
+        """Проверить: запись исхода (1000) встаёт в полный буфер, а не
+        отбрасывается лимитом.
+        """
+        handler = logging_setup.EventLogHandler()
+        for i in range(logging_setup.STARTUP_BUFFER_LIMIT + 5):
+            handler.handle(
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
+                )
+            )
+        handler.handle(
+            logging.makeLogRecord(
+                {
+                    "name": "app.runner",
+                    "levelno": 20,
+                    "msg": "Сервис запущен",
+                    "event_id": 1000,
+                    "outcome": True,
+                }
+            )
+        )
+        handler.send_startup_events()
+        handler.close()
+
+        ids = [e[0] for e in reported(evtlog)]
+        assert ids.count(1000) == 1
+        assert ids.index(1000) == logging_setup.STARTUP_BUFFER_LIMIT
+        # Пометка об отброшенных записях — после буфера
+        assert ids[-1] == 3001
+
+    def test_lost_first_event_not_a_repeat(self, evtlog):
+        """Проверить: запись, не попавшая в журнал событий из-за лимита
+        буфера, не считается потом повтором.
+        """
+        handler = logging_setup.EventLogHandler()
+        warning = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
+            handler.handle(
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
+                )
+            )
+        handler.handle(warning)
+        handler.send_startup_events()
+        evtlog.ReportEvent.reset_mock()
+
+        handler.handle(warning)
+        handler.close()
+
+        assert reported(evtlog) == [(3001, 2, "app.t: w")]
+
+    def test_discard_keeps_repeats_and_overflow(self, evtlog, caplog):
+        """Проверить: после сброса буфера журнал событий молчит, а
+        повторы, посчитанные до него, не теряются в файле журнала.
+        """
+        handler = logging_setup.EventLogHandler()
+
+        def warn(msg):
+            handler.handle(
+                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": msg})
+            )
+
+        warn("w")
+        warn("w")
+        for i in range(event_tracking.MAX_KEYS_PER_EVENT):
+            warn(f"вид {i}")
+        handler.discard_startup_events()
+
+        warn("w")
+        warn("ещё вид")
+        event_tracking.flush()
+        handler.close()
+
+        assert reported(evtlog) == []
+        # Повтор до сброса буфера — в итоговом напоминании
+        assert "Повторялось ещё 1 раз с прошлой записи: app.t: w" in caplog.text
+
+
+class TestFlushHandlers:
+    """Сброс журнала перед os._exit."""
+
+    def test_flushes_handlers(self, monkeypatch):
+        handler = logging.StreamHandler()
+        handler.flush = mock.Mock()
+        monkeypatch.setattr(logging_setup, "_handlers", [handler])
+        logging_setup.flush_handlers()
+        handler.flush.assert_called_once()
+
+    def test_skips_handler_with_held_lock(self, monkeypatch):
+        """Проверить: замок обработчика держит зависший поток — сброс
+        его пропускает, а не ждёт вечно.
+        """
+        held, stuck = logging.StreamHandler(), logging.StreamHandler()
+        held.flush = mock.Mock()
+        stuck.flush = mock.Mock(side_effect=OSError("канал переполнен"))
+        monkeypatch.setattr(logging_setup, "_handlers", [held, stuck])
+        monkeypatch.setattr(logging_setup, "FLUSH_LOCK_SECONDS", 0.1)
+        locked, release = threading.Event(), threading.Event()
+
+        def hold():
+            with held.lock:
+                locked.set()
+                release.wait()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        locked.wait()
+        try:
+            logging_setup.flush_handlers()
+        finally:
+            release.set()
+            thread.join()
+        held.flush.assert_not_called()
+        stuck.flush.assert_called_once()
 
 
 class TestWindowsLookups:

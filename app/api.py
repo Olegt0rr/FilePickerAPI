@@ -1,11 +1,91 @@
 """HTTP-приложение File Picker API."""
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import logging
 
-from app import __version__
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.exceptions import HTTPException
+from starlette.responses import PlainTextResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from app import __version__, event_tracking
+from app.event_tracking import EventId, is_tracked
 from app.handlers import files
 from app.settings import get_settings
+
+
+class _AccessOrderMiddleware:
+    """Номер обращения к папке с начала запроса (event_tracking).
+
+    Номер ставится в контексте задачи запроса: его видят и обработчик в
+    пуле потоков (контекст копируется), и обработчики исключений после
+    него. Иначе ошибка, записанная обработчиком исключений, получила бы
+    номер момента записи и считалась бы новее любого успеха.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            event_tracking.begin_access()
+        await self.app(scope, receive, send)
+
+
+def _route(request: Request) -> str:
+    """Маршрут запроса для ключа повторов: шаблон, а не fileId."""
+    route = request.scope.get("route")
+    path = getattr(route, "path_format", request.url.path)
+    return f"{request.method} {path}"
+
+
+async def _unhandled_error(request: Request, exc: Exception) -> Response:
+    """Непредвиденное исключение запроса: событие 4000 и ответ 500.
+
+    Ответ тот же, что у Starlette без обработчика. После него Starlette
+    выбрасывает исключение дальше, и Uvicorn пишет его в uvicorn.error:
+    исключение помечено учтённым, и второго события не будет.
+    """
+    if not is_tracked(exc):
+        route = _route(request)
+        event_tracking.track(
+            EventId.UNEXPECTED_ERROR,
+            (route, type(exc).__name__),
+            f"Непредвиденная ошибка запроса {request.method} "
+            f"{request.url.path}: {event_tracking.describe_error(exc)}",
+            level=logging.ERROR,
+            exc=exc,
+        )
+    return PlainTextResponse("Internal Server Error", status_code=500)
+
+
+async def _http_error(request: Request, exc: HTTPException) -> Response:
+    """Ответ HTTPException без изменений; для 500 и выше — событие.
+
+    Событие пишется по исходной причине (exc.__cause__) с её
+    трассировкой, если обработчики её ещё не учли: ошибка ОС — через
+    учёт директории и файлов (2000 или 3000), прочее — 4000.
+    """
+    cause = exc.__cause__
+    if exc.status_code >= 500 and not is_tracked(cause):  # noqa: PLR2004 - класс 5xx
+        directory = get_settings().files_directory
+        file_id = request.path_params.get("fileId")
+        if isinstance(cause, OSError) and file_id is not None:
+            event_tracking.file_error(directory, file_id, cause, exc.status_code)
+        elif isinstance(cause, OSError):
+            event_tracking.directory_error(directory, cause, exc.status_code)
+        else:
+            route = _route(request)
+            event_tracking.track(
+                EventId.UNEXPECTED_ERROR,
+                (route, type(cause).__name__),
+                f"Ошибка {exc.status_code} запроса {request.method} "
+                f"{request.url.path}: {exc.detail}",
+                level=logging.ERROR,
+                exc=cause,
+            )
+    return await http_exception_handler(request, exc)
 
 
 def create_app() -> FastAPI:
@@ -33,6 +113,11 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(_AccessOrderMiddleware)
+
+    # Одна ошибка — одно событие в журнале событий (см. event_tracking)
+    app.add_exception_handler(Exception, _unhandled_error)
+    app.add_exception_handler(HTTPException, _http_error)
 
     # Подключение обработчиков
     app.include_router(files.router)
