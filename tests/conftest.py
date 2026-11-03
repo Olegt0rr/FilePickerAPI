@@ -2,8 +2,10 @@
 
 import errno
 import logging
+import types
 from collections.abc import Iterator
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -33,6 +35,34 @@ def win_error(
     error = cls(errno.EIO, "system message", filename)
     error.winerror = winerror
     return error
+
+
+@pytest.fixture
+def service_env(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
+    """runner.run() без выхода процесса и без обработчиков сигналов.
+
+    exits — коды, с которыми процесс завершился бы; stop(reason) —
+    функция остановки, которую получили бы обработчики сигналов.
+    """
+    from app import instance_check, runner, stop_signals
+
+    exits: list[int] = []
+    install = mock.Mock()
+    monkeypatch.setattr(runner, "_exit", exits.append)
+    monkeypatch.setattr(stop_signals, "install", install)
+    monkeypatch.setattr(instance_check, "PROBE_INTERVAL", 0.01)
+
+    def stop(reason: str = "тест") -> None:
+        install.call_args.args[0](reason)
+
+    return types.SimpleNamespace(exits=exits, stop=stop, install=install)
+
+
+def start_then_stop(server: object, sockets: object = None) -> None:  # noqa: ARG001 - подпись Server.run
+    """InstanceServer.run без Uvicorn: старт, затем остановка."""
+    server.started = True
+    server.service.on_started()
+    server.service.request_stop("тест")
 
 
 @pytest.fixture

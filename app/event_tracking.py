@@ -105,9 +105,6 @@ class _Entry:
     summary: str
     last_write: float
     count: int = 0
-    # Первое событие ключа отброшено вместе со стартовым буфером:
-    # следующий случай пишется как первый, а счётчик сохраняется
-    unsent: bool = False
 
 
 @dataclass
@@ -164,13 +161,15 @@ def admit(
         keys = _state.keys.setdefault(event_id, {})
         entry = keys.get(reason)
         if entry is not None:
-            return _repeat(entry, "", now)
+            entry.count += 1
+            return None
         if len(keys) < MAX_KEYS_PER_EVENT:
             keys[reason] = _Entry(level, summary, now)
             return ""
         overflow = _state.overflow.get(event_id)
         if overflow is not None:
-            return _repeat(overflow, OVERFLOW_NOTE, now)
+            overflow.count += 1
+            return None
         _state.overflow[event_id] = _Entry(
             level,
             f"ошибки с кодом {event_id} сверх {MAX_KEYS_PER_EVENT} видов "
@@ -178,32 +177,6 @@ def admit(
             now,
         )
     return OVERFLOW_NOTE
-
-
-def _repeat(entry: _Entry, note: str, now: float) -> str | None:
-    """Повтор ключа: счёт, а если первое событие отброшено — оно."""
-    if entry.unsent:
-        entry.unsent = False
-        entry.last_write = now
-        return note
-    entry.count += 1
-    return None
-
-
-def mark_unsent(event_id: int, reason: Hashable | None) -> None:
-    """Отметить, что первое событие ключа так и не записано.
-
-    Следующий случай ключа снова даст событие, а повторы, посчитанные
-    до того, не теряются: они уйдут напоминанием. reason=None — ключ
-    переполнения этого кода.
-    """
-    with _state.lock:
-        if reason is None:
-            entry = _state.overflow.get(event_id)
-        else:
-            entry = _state.keys.get(event_id, {}).get(reason)
-        if entry is not None:
-            entry.unsent = True
 
 
 def _log(
@@ -397,8 +370,6 @@ def _remind_or_close(
         return False
     if entry.count:
         count, entry.count, entry.last_write = entry.count, 0, now
-        # Напоминание записано — отброшенное первое событие уже не нужно
-        entry.unsent = False
         reminders.append(
             (
                 entry.level,

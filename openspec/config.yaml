@@ -69,9 +69,18 @@ context: |
     аргументы — код 2), собранный exe переходит в свою папку
   - app/stdio.py — os.devnull вместо непригодных stdout и stderr у exe
     без консоли
-  - app/runner.py — запуск сервиса: журнал, create_app() (ошибка
-    настроек — код 1), создание директории файлов, Uvicorn на
-    0.0.0.0:8000
+  - app/runner.py — запуск сервиса: главный поток ждёт исхода
+    (остановка — 1001 и код 0, сбой — 1002 и код 1, второй экземпляр —
+    1005/1006 и код 0) и завершает процесс через os._exit; рабочий
+    поток: проверка второго экземпляра, create_app() (ошибка настроек —
+    код 1 без повторов), создание директории в отдельном потоке (2004),
+    подкласс uvicorn.Server на 0.0.0.0:8000 (буфер стартовых событий и
+    1000 по server.started), повторы через 10, 30, 60 с
+  - app/instance_check.py — второй экземпляр: занят ли порт (на Windows
+    по таблице TCP), опрос /openapi.json через http.client без прокси,
+    текст 1005/1006 с PID владельца порта
+  - app/stop_signals.py — сигналы остановки: Ctrl+C через
+    SetConsoleCtrlHandler на Windows, SIGINT и SIGTERM вне Windows
   - app/logging_setup.py — журнал: консоль при запуске из неё; на
     Windows файл %LOCALAPPDATA%\FilePickerAPI\logs\FilePickerAPI.log
     (ротация в полночь, хранение 30 дней) и журнал событий Application,

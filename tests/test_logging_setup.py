@@ -253,16 +253,21 @@ class TestSetupLogging:
 
     @pytest.mark.usefixtures("on_windows")
     def test_second_instance_discards_startup_events(self, monkeypatch, evtlog):
-        """Проверить: у второго экземпляра буфер отбрасывается, а его
-        событие пишется сразу.
+        """Проверить: у второго экземпляра буфер отбрасывается, поздние
+        записи событий не дают, а запись исхода пишется сразу.
         """
         monkeypatch.setattr(logging_setup, "event_source_registered", lambda: True)
         logging_setup.setup_logging(console=False)
         logging.getLogger("app.test").warning("буферное предупреждение")
 
         logging_setup.discard_startup_events()
+        logging.getLogger("app.test").warning(
+            "поздняя проверка прав",
+            extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS},
+        )
         logging.getLogger("app.test").info(
-            "сервис уже работает", extra={"event_id": EventId.ALREADY_RUNNING}
+            "сервис уже работает",
+            extra={"event_id": EventId.ALREADY_RUNNING, "outcome": True},
         )
 
         assert [e[:2] for e in reported(evtlog)] == [
@@ -802,8 +807,8 @@ class TestEventLogHandler:
         assert "Не удалось записать событие 2004 в журнал событий: full" in caplog.text
 
     def test_discard_startup_events(self, evtlog):
-        """Проверить: отброшенный буфер не отправляется, дальше
-        события пишутся сразу.
+        """Проверить: отброшенный буфер не отправляется и после
+        send_startup_events, дальше пишутся только записи исхода.
         """
         handler = logging_setup.EventLogHandler()
         for i in range(105):
@@ -814,11 +819,17 @@ class TestEventLogHandler:
         handler.send_startup_events()
         handler.handle(
             logging.makeLogRecord(
+                {"name": "app.t", "levelno": 30, "msg": "2004", "event_id": 2004}
+            )
+        )
+        handler.handle(
+            logging.makeLogRecord(
                 {
                     "name": "app.t",
                     "levelno": 20,
                     "msg": "уже работает",
                     "event_id": 1005,
+                    "outcome": True,
                 }
             )
         )
@@ -828,24 +839,19 @@ class TestEventLogHandler:
         assert [e[0] for e in reported(evtlog)] == [1005]
         evtlog.DeregisterEventSource.assert_called_once()
 
-    @pytest.mark.parametrize("discard", [False, True])
-    def test_lost_first_event_not_a_repeat(self, evtlog, discard):
+    def test_lost_first_event_not_a_repeat(self, evtlog):
         """Проверить: запись, не попавшая в журнал событий из-за лимита
-        или сброса буфера, не считается потом повтором.
+        буфера, не считается потом повтором.
         """
         handler = logging_setup.EventLogHandler()
         warning = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
-        if discard:
-            handler.handle(warning)
-            handler.discard_startup_events()
-        else:
-            for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
-                handler.handle(
-                    logging.makeLogRecord(
-                        {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
-                    )
+        for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
+            handler.handle(
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
                 )
-            handler.handle(warning)
+            )
+        handler.handle(warning)
         handler.send_startup_events()
         evtlog.ReportEvent.reset_mock()
 
@@ -855,8 +861,8 @@ class TestEventLogHandler:
         assert reported(evtlog) == [(3001, 2, "app.t: w")]
 
     def test_discard_keeps_repeats_and_overflow(self, evtlog, caplog):
-        """Проверить: после сброса буфера повторы, посчитанные до него,
-        не теряются, а ключ переполнения снова даёт событие с пометкой.
+        """Проверить: после сброса буфера журнал событий молчит, а
+        повторы, посчитанные до него, не теряются в файле журнала.
         """
         handler = logging_setup.EventLogHandler()
 
@@ -876,10 +882,7 @@ class TestEventLogHandler:
         event_tracking.flush()
         handler.close()
 
-        assert reported(evtlog) == [
-            (3001, 2, "app.t: w"),
-            (3001, 2, "app.t: ещё вид" + event_tracking.OVERFLOW_NOTE),
-        ]
+        assert reported(evtlog) == []
         # Повтор до сброса буфера — в итоговом напоминании
         assert "Повторялось ещё 1 раз с прошлой записи: app.t: w" in caplog.text
 

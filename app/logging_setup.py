@@ -12,7 +12,7 @@ from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from app.event_tracking import OVERFLOW_NOTE, EventId, admit, is_tracked, mark_unsent
+from app.event_tracking import EventId, admit, is_tracked
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +98,12 @@ class EventLogHandler(logging.Handler):
     До исхода запуска события копятся в буфере (не больше 100, сверх
     этого — одна пометка о числе отброшенных) и отправляются
     send_startup_events() или отбрасываются discard_startup_events().
-    Ошибка ReportEvent не роняет запрос: о серии отказов пишется одна
-    строка в файл журнала, а сами записи в нём уже есть.
+    После отбрасывания (второй экземпляр, процесс завершается) в журнал
+    событий идут только записи исхода (extra={"outcome": True}): поток
+    проверки прав или создания директории, закончивший работу до
+    выхода, не оставит 1003 или 2004 без пары. Ошибка ReportEvent не
+    роняет запрос: о серии отказов пишется одна строка в файл журнала,
+    а сами записи в нём уже есть.
     """
 
     def __init__(self) -> None:
@@ -112,11 +116,9 @@ class EventLogHandler(logging.Handler):
         # Текст форматируется при записи: буфер не держит ни аргументы,
         # ни трассировки с кадрами стека
         self._buffer: list[tuple[int, int, str]] | None = []
-        # Ключи повторов записей в буфере (None — ключ переполнения):
-        # при отбрасывании буфера первое событие придёт при следующем
-        # случае, а посчитанные повторы сохранятся
-        self._buffered_keys: list[tuple[int, tuple[str, str] | None]] = []
         self._dropped = 0
+        # Буфер отброшен: дальше — только записи исхода
+        self._discarded = False
         # Идёт серия отказов ReportEvent: строка о ней уже в журнале
         self._report_failing = False
         # Время и уровень Event Viewer показывает сам
@@ -133,6 +135,8 @@ class EventLogHandler(logging.Handler):
         event_id = event_id_for(record)
         if event_id is None:
             return
+        if self._discarded and not getattr(record, "outcome", False):
+            return
         try:
             message = record.getMessage()
         except Exception:
@@ -144,12 +148,10 @@ class EventLogHandler(logging.Handler):
             self._dropped += 1
             return
         note = ""
-        reason = None
         if getattr(record, "event_id", None) is None:
-            reason = (record.name, str(record.msg))
             note = admit(
                 event_id,
-                reason,
+                (record.name, str(record.msg)),
                 # Ключ — шаблон, а текст напоминания — первая запись
                 f"{record.name}: {message}",
                 record.levelno,
@@ -161,16 +163,11 @@ class EventLogHandler(logging.Handler):
             self._report(record.levelno, event_id, text)
         else:
             self._buffer.append((record.levelno, event_id, text))
-            if reason is not None:
-                # Пометка у первого случая ключа переполнения
-                key = None if note == OVERFLOW_NOTE else reason
-                self._buffered_keys.append((event_id, key))
 
     def send_startup_events(self) -> None:
         """Отправить буфер; дальше события пишутся сразу."""
         with self.lock:
             buffered, self._buffer = self._buffer or [], None
-            self._buffered_keys = []
             if self._dropped:
                 note = _service_record(
                     f"Отброшено записей при запуске: {self._dropped}, "
@@ -184,13 +181,15 @@ class EventLogHandler(logging.Handler):
                 self._report(levelno, event_id, text)
 
     def discard_startup_events(self) -> None:
-        """Отбросить буфер; дальше события пишутся сразу."""
+        """Отбросить буфер; дальше пишутся только записи исхода.
+
+        Повторы, посчитанные по отброшенным записям, не теряются: они
+        уходят итоговыми напоминаниями в файл журнала.
+        """
         with self.lock:
             self._buffer = None
+            self._discarded = True
             self._dropped = 0
-            keys, self._buffered_keys = self._buffered_keys, []
-            for event_id, reason in keys:
-                mark_unsent(event_id, reason)
 
     def _report(self, levelno: int, event_id: int, text: str) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
@@ -464,3 +463,14 @@ def discard_startup_events() -> None:
     for handler in _handlers:
         if isinstance(handler, EventLogHandler):
             handler.discard_startup_events()
+
+
+def flush_handlers() -> None:
+    """Сбросить обработчики журнала перед os._exit.
+
+    Не logging.shutdown(): зависший поток может держать замок
+    обработчика, а закрывать файлы перед os._exit незачем.
+    """
+    for handler in _handlers:
+        with suppress(Exception):
+            handler.flush()
