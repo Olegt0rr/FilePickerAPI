@@ -2,6 +2,7 @@
 
 import errno
 import logging
+import os
 import socket
 import sys
 import threading
@@ -160,6 +161,70 @@ class TestOneErrorOneEvent:
         with mock.patch("os.scandir", scandir):
             assert client.get("/files").status_code == 200
         scandir.assert_called_once_with(files_dir)
+
+    def test_download_stat_calls_not_increased(self, client, files_dir):
+        """Учёт не добавляет обращений к файлу при скачивании: их
+        столько же, сколько у самих проверок обработчика (на Windows —
+        lstat, на других ОС — resolve() и stat). Сколько stat и lstat
+        внутри делает pathlib, зависит от версии Python.
+        """
+        path = files_dir / "a.txt"
+
+        def file_calls(action):
+            stat = mock.Mock(wraps=os.stat)
+            lstat = mock.Mock(wraps=os.lstat)
+            with mock.patch("os.stat", stat), mock.patch("os.lstat", lstat):
+                action()
+            calls = stat.call_args_list + lstat.call_args_list
+            return sum(Path(c.args[0]).name == "a.txt" for c in calls)
+
+        if sys.platform == "win32":
+            expected = file_calls(path.lstat)
+        else:
+            expected = file_calls(lambda: path.resolve().stat())
+        assert expected
+        assert file_calls(lambda: client.get("/files/a.txt")) == expected
+
+    def test_slow_scandir(self, client, clock, events):
+        """Медленный os.scandir — 2003 о списке."""
+        original = os.scandir
+
+        def slow_scandir(path):
+            clock.now += 11
+            return original(path)
+
+        with mock.patch("os.scandir", slow_scandir):
+            assert client.get("/files").status_code == 200
+        [(event_id, record)] = events()
+        assert event_id == 2003
+        assert "GET /files за 11.0 с" in record.getMessage()
+
+    def test_slow_file_stat(self, client, clock, events):
+        """Медленные атрибуты файла (lstat на Windows) — 2003 о
+        скачивании.
+        """
+        # Медленно только первое обращение к файлу: через os.stat или
+        # os.lstat — зависит от ОС и версии Python
+        slowed = []
+
+        def slower(original):
+            def call(path, *args, **kwargs):
+                if Path(path).name == "a.txt" and not slowed:
+                    slowed.append(path)
+                    clock.now += 11
+                return original(path, *args, **kwargs)
+
+            return call
+
+        with (
+            mock.patch("os.stat", slower(os.stat)),
+            mock.patch("os.lstat", slower(os.lstat)),
+        ):
+            assert client.get("/files/a.txt").status_code == 200
+        assert slowed
+        [(event_id, record)] = events()
+        assert event_id == 2003
+        assert record.getMessage().endswith("за 11.0 с, размер файла 9 байт")
 
 
 class TestTrackedFileResponse:
