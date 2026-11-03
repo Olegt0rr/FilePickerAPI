@@ -79,6 +79,9 @@ EVENTS_LOCK_SECONDS = 1
 # Процесс завершается не позже этого срока после исхода, даже если
 # запись в журнал зависла (спецификация: не позже 30 секунд)
 EXIT_DEADLINE_SECONDS = 28
+# Сколько ждать записи 1002 перед повтором: зависшая запись в журнал
+# не должна останавливать повторы
+REPORT_WAIT_SECONDS = 5
 # Ошибка привязки: asyncio пересоздаёт исключение без winerror, а errno
 # на Windows — 10048 (WSAEADDRINUSE)
 ADDRESS_IN_USE = frozenset({errno.EADDRINUSE, 10048})
@@ -316,6 +319,9 @@ class Service:
         self.lock = threading.RLock()
         # Будит финализацию: поток завершился или срок сократился
         self.changed = threading.Condition(self.lock)
+        # decided — исход занят (с этого момента идёт срок сторожа),
+        # done — его события записаны
+        self.decided = threading.Event()
         self.done = threading.Event()
         # Процесс завершён: выставляется только после подменённого _exit
         # (тесты), в работе процесс к этому моменту уже завершён
@@ -327,6 +333,8 @@ class Service:
         # Срок ожидания потоков при остановке; срочный сигнал его
         # сокращает
         self.stop_deadline = float("inf")
+        # Пришёл срочный сигнал: поток директории не ждём
+        self.urgent = False
         self.server: InstanceServer | None = None
         self.worker: threading.Thread | None = None
         self.worker_finished = False
@@ -355,6 +363,7 @@ class Service:
         with self.lock:
             if self.outcome in {None, Outcome.STOP}:
                 self.stop_deadline = min(self.stop_deadline, clock() + wait)
+                self.urgent = self.urgent or urgent
                 self.changed.notify_all()
             if self.outcome is not None:
                 return
@@ -363,6 +372,7 @@ class Service:
             self.stop_requested.set()
             if self.server is not None:
                 self.server.should_exit = True
+        self.decided.set()
         self.done.set()
 
     def urgent_stop(self, reason: str) -> None:
@@ -448,7 +458,8 @@ class Service:
             if self.outcome is not None:
                 return False
             self.outcome = outcome
-            return True
+        self.decided.set()
+        return True
 
     def attach_server(self, server: InstanceServer) -> bool:
         """Запомнить сервер попытки; при запрошенной остановке — нет."""
@@ -592,7 +603,7 @@ class Service:
                 )
                 return
             delay = RETRY_DELAYS[attempt - 1]
-            self._report_failure(
+            self._report_retry(
                 f"HTTP-сервер не работает (попытка {attempt} из {MAX_ATTEMPTS}, "
                 f"следующая через {delay} с): {reason}",
                 error,
@@ -623,6 +634,21 @@ class Service:
             exc_info=None if isinstance(error, SystemExit) else error,
             extra={"event_id": EventId.SERVICE_FAILED},
         )
+
+    def _report_retry(self, message: str, error: BaseException | None) -> None:
+        """1002 перед повтором: запись ждём не дольше срока.
+
+        Исход ещё не занят, и сторож не запущен: запись, зависшая на
+        замке обработчика, иначе остановила бы повторы навсегда.
+        """
+        thread = threading.Thread(
+            target=self._report_failure,
+            args=(message, error),
+            name="report-failure",
+            daemon=True,
+        )
+        thread.start()
+        thread.join(REPORT_WAIT_SECONDS)
 
     def _fail(self, message: str, error: BaseException | None) -> None:
         """Сбой: 1002 и код 1; при остановке — пометка в 1001."""
@@ -655,12 +681,15 @@ class Service:
         (при срочной — 3 секунд): обращения к SMB нельзя прервать
         изнутри процесса. Поток создания директории — не больше секунды
         в пределах того же срока: он демонический, а короткое ожидание
-        отличает зависший mkdir от только что начатого.
+        отличает зависший mkdir от только что начатого. При срочной
+        остановке его не ждём, а только проверяем: у Windows срок 5 с.
         """
         if self.worker is not None:
             self._wait_for(lambda: self.worker_finished, STOP_WAIT_SECONDS)
         if self.directory_thread is not None:
-            self._wait_for(lambda: self.directory_finished, DIRECTORY_WAIT_SECONDS)
+            self._wait_for(
+                lambda: self.directory_finished or self.urgent, DIRECTORY_WAIT_SECONDS
+            )
         hung = (self.worker is not None and not self.worker_finished) or (
             self.directory_thread is not None and not self.directory_finished
         )
@@ -715,15 +744,17 @@ def run() -> int:
         target=service.work, name="service-worker", daemon=True
     )
     service.worker.start()
-    service.done.wait()
+    service.decided.wait()
 
     outcome = service.outcome
     # Сторож: запись в журнал может зависнуть на замке обработчика
     # (поток, застрявший на записи в канал консоли), а процесс должен
-    # завершиться в срок при любом исходе
+    # завершиться в срок при любом исходе. Поэтому срок идёт с момента,
+    # когда исход занят, а не когда записаны его события
     watchdog = threading.Timer(EXIT_DEADLINE_SECONDS, lambda: _exit(outcome.exit_code))
     watchdog.daemon = True
     watchdog.start()
+    service.done.wait()
     if outcome is Outcome.STOP:
         service.finalize()
     flush_handlers()

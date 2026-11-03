@@ -708,6 +708,54 @@ class TestStop:
         assert exits[0] == 0
         assert len(exits) == 2
 
+    def test_watchdog_exits_when_failure_logging_hangs(self, monkeypatch):
+        """Проверить: запись 1002 зависла — сторож завершает процесс
+        с кодом 1, хотя события сбоя так и не записаны.
+        """
+        exited = threading.Event()
+        exits = []
+
+        def exit_process(code):
+            exits.append(code)
+            exited.set()
+
+        monkeypatch.setattr(runner, "_exit", exit_process)
+        monkeypatch.setattr(runner, "EXIT_DEADLINE_SECONDS", 0.2)
+        monkeypatch.setattr(stop_signals, "install", mock.Mock())
+        monkeypatch.setattr(
+            instance_check, "wait_for_port", mock.Mock(side_effect=RuntimeError("x"))
+        )
+        monkeypatch.setattr(
+            runner.Service, "_report_failure", lambda *_: exited.wait(10)
+        )
+        assert runner.run() == 1
+        assert exits == [1, 1]
+
+    @pytest.mark.usefixtures("port", "service_env")
+    def test_hung_retry_report(self, monkeypatch):
+        """Проверить: зависшая запись 1002 перед повтором не мешает
+        следующей попытке.
+        """
+        monkeypatch.setattr(runner, "REPORT_WAIT_SECONDS", 0.1)
+        release = threading.Event()
+        attempts = []
+
+        def serve(server, _sockets=None):
+            attempts.append(server)
+            if len(attempts) == 1:
+                raise SystemExit(1)
+            start_then_stop(server)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        monkeypatch.setattr(
+            runner.Service, "_report_failure", lambda *_: release.wait(10)
+        )
+        try:
+            assert runner.run() == 0
+        finally:
+            release.set()
+        assert len(attempts) == 2
+
     @pytest.mark.usefixtures("port")
     def test_hung_worker(self, service_env, evtlog, monkeypatch):
         """Проверить: рабочий поток не завершился за срок — пометка в
@@ -892,6 +940,31 @@ class TestUrgentStop:
         assert service_env.exits == [0]
         [text] = event_texts(evtlog, 1001)
         assert "Сервис остановлен: выход пользователя" in text
+        assert "не завершилось" in text
+
+    @pytest.mark.usefixtures("port")
+    def test_directory_not_waited(self, service_env, evtlog, monkeypatch):
+        """Проверить: при срочной остановке поток директории не ждём
+        даже секунду — mkdir, идущий в момент проверки, отмечен в 1001.
+        """
+        release = threading.Event()
+        monkeypatch.setattr(runner, "ensure_files_directory", release.wait)
+        handler = {}
+
+        def serve(server, _sockets=None):
+            server.started = True
+            server.service.on_started()
+            handler["thread"], _ = urgent_in_thread(service_env, "закрытие консоли")
+            wait_for(server.service.stop_requested.is_set)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        # Иначе mkdir успел бы закончиться за секунду ожидания
+        threading.Timer(0.5, release.set).start()
+        started = time.monotonic()
+        assert runner.run() == 0
+        assert time.monotonic() - started < 0.5
+        handler["thread"].join(5)
+        [text] = event_texts(evtlog, 1001)
         assert "не завершилось" in text
 
     @pytest.mark.usefixtures("port")
@@ -1407,6 +1480,48 @@ class TestInstanceCheck:
         assert instance_check.probe_openapi("127.0.0.1", 8000) is None
         connection.close.assert_called_once()
 
+    @pytest.mark.parametrize("connect_delay", [0, 0.4])
+    def test_probe_openapi_slow_answer(self, monkeypatch, connect_delay):
+        """Проверить: ответ по байту не держит запрос дольше срока,
+        в том числе когда срок истёк ещё при соединении.
+        """
+        monkeypatch.setattr(instance_check, "REQUEST_TIMEOUT", 0.3)
+        connect = socket.create_connection
+
+        def slow_connect(*args, **kwargs):
+            time.sleep(connect_delay)
+            return connect(*args, **kwargs)
+
+        monkeypatch.setattr(socket, "create_connection", slow_connect)
+        listener = socket.create_server(("127.0.0.1", 0))
+        number = listener.getsockname()[1]
+        stop = threading.Event()
+
+        def trickle():
+            client, _ = listener.accept()
+            with client:
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"x" * 1000:
+                    if stop.wait(0.05):
+                        return
+                    client.sendall(bytes([byte]))
+
+        thread = threading.Thread(target=trickle, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        try:
+            assert instance_check.probe_openapi("127.0.0.1", number) is None
+            assert time.monotonic() - started < 2
+        finally:
+            stop.set()
+            thread.join(5)
+            listener.close()
+
+    def test_abort_closed_socket(self):
+        """Проверить: прерывание уже закрытого сокета — тихо."""
+        sock = mock.Mock()
+        sock.shutdown.side_effect = OSError
+        instance_check._abort(sock)  # noqa: SLF001 - помощник модуля
+
     def test_probe_openapi_nobody(self):
         assert instance_check.probe_openapi("127.0.0.1", free_port()) is None
 
@@ -1437,6 +1552,50 @@ class TestInstanceCheck:
         monkeypatch.setattr(instance_check, "probe_openapi", probe)
         result = instance_check.wait_for_port(threading.Event(), 10, "h", 1)
         assert result == ProbeResult(Probe.FILE_PICKER, "2.0.0")
+
+    def test_wait_for_port_stop_during_request(self, monkeypatch, clock):
+        """Проверить: остановка во время запроса — STOPPED, а не OTHER
+        по истёкшему сроку.
+        """
+        monkeypatch.setattr(instance_check, "clock", clock)
+        monkeypatch.setattr(instance_check, "port_in_use", lambda *_: True)
+        stop = threading.Event()
+
+        def probe(*_):
+            clock.advance(20)
+            stop.set()
+
+        monkeypatch.setattr(instance_check, "probe_openapi", probe)
+        assert instance_check.wait_for_port(stop, 10, "h", 1).status is Probe.STOPPED
+
+    def test_wait_for_port_budget(self, monkeypatch, clock):
+        """Проверить: запрос и пауза получают остаток срока, опрос на
+        3 секунды заканчивается не позже 3 секунд.
+        """
+        monkeypatch.setattr(instance_check, "PROBE_INTERVAL", 0.5)
+        monkeypatch.setattr(instance_check, "clock", clock)
+        monkeypatch.setattr(instance_check, "port_in_use", lambda *_: True)
+        timeouts = []
+
+        def probe(_host, _port, timeout):
+            timeouts.append(timeout)
+            clock.advance(timeout)
+
+        stop = mock.Mock()
+        stop.is_set.return_value = False
+
+        def wait(timeout):
+            timeouts.append(timeout)
+            clock.advance(timeout)
+            return False
+
+        stop.wait.side_effect = wait
+        monkeypatch.setattr(instance_check, "probe_openapi", probe)
+        started = clock.now
+        result = instance_check.wait_for_port(stop, 3, "h", 1)
+        assert result == ProbeResult(Probe.OTHER)
+        assert clock.now - started <= 3
+        assert timeouts == [2, 0.5, 0.5, 0]
 
     def test_wait_for_port_stopped(self, monkeypatch):
         stop = threading.Event()

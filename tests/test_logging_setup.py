@@ -557,17 +557,35 @@ class TestLogFileRotation:
 class TestEventLogHandler:
     """Журнал событий с поддельным win32evtlog."""
 
+    CODE_CASES = (
+        # Каждый код — с уровнем, которым его пишет сервис
+        (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
+        (logging.INFO, EventId.SERVICE_STOPPED, 1001, 4),
+        (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
+        (logging.WARNING, EventId.BUILD_FOLDER_PERMISSIONS, 1003, 2),
+        (logging.WARNING, EventId.LOG_FILE_UNAVAILABLE, 1004, 2),
+        (logging.INFO, EventId.ALREADY_RUNNING, 1005, 4),
+        (logging.WARNING, EventId.OTHER_VERSION_RUNNING, 1006, 2),
+        (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
+        (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
+        (logging.WARNING, EventId.DIRECTORY_STILL_UNAVAILABLE, 2002, 2),
+        (logging.WARNING, EventId.DIRECTORY_SLOW, 2003, 2),
+        (logging.WARNING, EventId.DIRECTORY_NOT_CREATED, 2004, 2),
+        (logging.WARNING, EventId.FILE_ACCESS_ERROR, 3000, 2),
+        (logging.WARNING, EventId.OTHER_WARNING, 3001, 2),
+        (logging.ERROR, EventId.UNEXPECTED_ERROR, 4000, 1),
+        # Без кода — по уровню
+        (logging.WARNING, None, 3001, 2),
+        (logging.ERROR, None, 4000, 1),
+        (logging.CRITICAL, None, 4000, 1),
+    )
+
+    def test_every_code_checked(self):
+        """Проверить: в test_code_and_type есть каждый код."""
+        assert {case[1] for case in self.CODE_CASES} - {None} == set(EventId)
+
     @pytest.mark.parametrize(
-        ("level", "event_id", "expected_id", "expected_type"),
-        [
-            (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
-            (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
-            (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
-            (logging.WARNING, None, 3001, 2),
-            (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
-            (logging.ERROR, None, 4000, 1),
-            (logging.CRITICAL, None, 4000, 1),
-        ],
+        ("level", "event_id", "expected_id", "expected_type"), CODE_CASES
     )
     def test_code_and_type(
         self, event_logger, level, event_id, expected_id, expected_type

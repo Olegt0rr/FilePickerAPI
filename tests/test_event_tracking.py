@@ -1,5 +1,6 @@
 """Тесты учёта ошибок для журнала событий: повторы, лимит, папка."""
 
+import contextvars
 import errno
 import logging
 import sys
@@ -219,7 +220,56 @@ class TestDirectoryState:
         sent = events(records)
         assert [e for e, _ in sent] == [2000, 2000, 2001]
         assert "Ответ клиенту: 403" in sent[1][1]
+        # Повторы прежней причины не теряются при смене
+        assert sent[1][1].endswith(
+            "До смены причины ошибочных ответов с прошлой записи: 1 "
+            "([Errno 2] No such file: '/srv')"
+        )
         assert sent[2][1].endswith("ошибочных ответов: 3")
+
+    def test_reason_change_then_stop(self, clock, records):
+        """100 ответов 404, затем 403 и остановка — повторы 404 в
+        2000 о смене причины.
+        """
+        missing = FileNotFoundError(errno.ENOENT, "No such file", "/srv")
+        denied = PermissionError(errno.EACCES, "Permission denied", "/srv")
+        for _ in range(100):
+            event_tracking.directory_error("/srv", missing, 404)
+        event_tracking.directory_error("/srv", denied, 403)
+        clock.advance(10)
+        event_tracking.flush()
+
+        sent = events(records)
+        assert [e for e, _ in sent] == [2000, 2000, 2002]
+        assert "ошибочных ответов с прошлой записи: 99 " in sent[1][1]
+        assert "Ошибочных ответов с прошлой записи: 0" in sent[2][1]
+
+    @pytest.mark.usefixtures("clock")
+    def test_aborted_200_and_206_one_reason(self, records):
+        """Обрыв обычного и Range-ответа при одной ошибке — одна
+        причина: 2000 одно, без смены на каждое чередование.
+        """
+        error = OSError(errno.EIO, "I/O")
+        for status in ("200, ответ оборван", "206, ответ оборван") * 2:
+            event_tracking.directory_error("/srv", error, status)
+        assert [e for e, _ in events(records)] == [2000]
+        assert len(records()) == 4
+
+    @pytest.mark.usefixtures("clock")
+    @pytest.mark.parametrize(
+        ("status", "traceback"), [(404, False), (500, True), ("206, оборван", True)]
+    )
+    def test_traceback_for_server_error(self, caplog, status, traceback):
+        """Трассировка исходной ошибки — только для ответа 5xx."""
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        error = OSError(errno.EIO, "I/O")
+        event_tracking.directory_error("/srv", error, status)
+        event_tracking.file_error("/srv", "a.txt", error, status)
+        exc_infos = [r.exc_info for r in caplog.records]
+        assert len(exc_infos) == 2
+        for exc_info in exc_infos:
+            assert (exc_info is not None) is traceback
+            assert exc_info is None or exc_info[1] is error
 
     def test_stop_while_unavailable(self, clock, records):
         """Папка недоступна, 300 ошибочных ответов, остановка —
@@ -263,6 +313,70 @@ class TestDirectoryState:
         monkeypatch.setattr(state, "directory_lock", RestoredMeanwhile())
         event_tracking.directory_ok()
         assert [event_id for event_id, _ in events(records)] == [2000]
+
+
+@pytest.mark.usefixtures("clock")
+class TestAccessOrder:
+    """Состояние папки — по началу обращения, а не по записи итога."""
+
+    @staticmethod
+    def request():
+        """Контекст запроса с начатым обращением к папке."""
+        context = contextvars.copy_context()
+        context.run(event_tracking.begin_access)
+        return context
+
+    def test_stale_success_not_restored(self, records):
+        """A прочитал папку и задержался, B позже получил ошибку: успех
+        A не даёт 2001; новое успешное обращение — даёт.
+        """
+        first, second = self.request(), self.request()
+        second.run(
+            event_tracking.directory_error, "/srv", OSError(errno.EIO, "I/O"), 500
+        )
+        first.run(event_tracking.directory_ok)
+        assert [e for e, _ in events(records)] == [2000]
+
+        self.request().run(event_tracking.directory_ok)
+        assert [e for e, _ in events(records)] == [2000, 2001]
+
+    def test_stale_error_not_unavailable(self, records):
+        """A начал раньше и получил ошибку после успеха B: 2000 нет,
+        ошибка — в файле журнала.
+        """
+        first, second = self.request(), self.request()
+        second.run(event_tracking.directory_ok)
+        error = OSError(errno.EIO, "I/O")
+        first.run(event_tracking.directory_error, "/srv", error, 500)
+        assert events(records) == []
+        assert len(records()) == 1
+        assert event_tracking.is_tracked(error)
+
+        self.request().run(event_tracking.directory_error, "/srv", error, 500)
+        assert [e for e, _ in events(records)] == [2000]
+
+    def test_stale_error_keeps_reason(self, records):
+        """Папка недоступна по ошибке B; ошибка A, начатого раньше, с
+        другой причиной — повтор: нового 2000 нет, счётчик растёт.
+        """
+        first, second = self.request(), self.request()
+        denied = PermissionError(errno.EACCES, "Permission denied", "/srv")
+        missing = FileNotFoundError(errno.ENOENT, "No such file", "/srv")
+        second.run(event_tracking.directory_error, "/srv", denied, 403)
+        first.run(event_tracking.directory_error, "/srv", missing, 404)
+        self.request().run(event_tracking.directory_ok)
+
+        sent = events(records)
+        assert [e for e, _ in sent] == [2000, 2001]
+        assert "Ответ клиенту: 403" in sent[0][1]
+        assert sent[1][1].endswith("ошибочных ответов: 2")
+
+    def test_without_begin_access(self, records):
+        """Без begin_access — номер момента вызова (как раньше)."""
+        event_tracking.directory_ok()
+        event_tracking.directory_error("/srv", OSError(errno.EIO, "I/O"), 500)
+        event_tracking.directory_ok()
+        assert [e for e, _ in events(records)] == [2000, 2001]
 
 
 class TestLockOrder:
