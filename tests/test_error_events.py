@@ -1,5 +1,6 @@
 """Тесты «одна ошибка — одно событие» на обработчиках и Uvicorn."""
 
+import asyncio
 import errno
 import logging
 import os
@@ -20,6 +21,7 @@ from starlette.responses import FileResponse
 from uvicorn.protocols.utils import ClientDisconnected
 
 from app import event_tracking, logging_setup
+from app.handlers import files
 from tests.conftest import win_error
 from tests.test_main import fail_stat_for, reload_app
 
@@ -290,6 +292,80 @@ class TestTrackedFileResponse:
         [(event_id, record)] = events()
         assert event_id == 3000
         assert record.getMessage().endswith(f"Ответ клиенту: {status}, ответ оборван")
+
+    @staticmethod
+    def send_file(files_dir, send, *, spec_version="2.4", receive=None):
+        """Отправить a.txt через TrackedFileResponse напрямую (ASGI)."""
+        path = files_dir / "a.txt"
+        response = files.TrackedFileResponse(
+            path=path,
+            stat_result=path.stat(),
+            file_id="a.txt",
+            directory=files_dir,
+            started=event_tracking.clock(),
+        )
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "headers": [],
+            "asgi": {"spec_version": spec_version},
+        }
+
+        async def no_receive():
+            await asyncio.Event().wait()
+
+        asyncio.run(response(scope, receive or no_receive, send))
+
+    @staticmethod
+    def make_unavailable(files_dir):
+        event_tracking.directory_error(files_dir, PermissionError("denied"), 403)
+
+    def test_disconnect_before_body_not_restored(self, files_dir, events):
+        """Клиент отключился после заголовков (ASGI 2.3): Starlette
+        возвращается без исключения, но тело не отправлено — 2001 нет.
+        """
+        self.make_unavailable(files_dir)
+        messages = []
+
+        async def send(message):
+            messages.append(message["type"])
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        self.send_file(files_dir, send, spec_version="2.3", receive=receive)
+        assert "http.response.start" in messages
+        assert [e for e, _ in events()] == [2000]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BrokenPipeError(errno.EPIPE, "Broken pipe"),
+            win_error(64, ConnectionResetError),
+        ],
+    )
+    def test_client_send_error_no_event(self, files_dir, events, error):
+        """Ошибка отправки клиенту — не ошибка файла или папки."""
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise error
+
+        with pytest.raises(type(error), match=str(error.strerror)) as raised:
+            self.send_file(files_dir, send)
+        assert raised.value is error
+        assert events() == []
+        assert event_tracking.is_tracked(error)
+
+    def test_whole_body_restores(self, files_dir, events):
+        """Тело отправлено целиком — 2001."""
+        self.make_unavailable(files_dir)
+
+        async def send(_message):
+            pass
+
+        self.send_file(files_dir, send)
+        assert [e for e, _ in events()] == [2000, 2001]
 
     def test_body_read_error_not_restored(self, client, events):
         """Атрибуты читаются, тело — нет: 2001 нет, повторы не

@@ -15,6 +15,8 @@
 только добавляются, смысл существующих не меняется.
 """
 
+import contextvars
+import itertools
 import logging
 import threading
 import time
@@ -65,6 +67,15 @@ NETWORK_WINERRORS = frozenset(
 
 # Часы учёта; тесты подменяют их вместе с тактом таймера
 clock = time.monotonic
+
+# Номер обращения к папке: растёт с каждым begin_access(). Состояние
+# папки упорядочивается по началу обращения, а не по моменту записи
+# результата: успех обращения, начатого до сбоя, не даёт 2001, а сбой
+# обращения, начатого до успеха, не даёт 2000
+_access_numbers = itertools.count(1)
+_access: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "directory_access", default=None
+)
 
 
 class EventId(IntEnum):
@@ -120,6 +131,8 @@ class _Unavailable:
     since: float
     last_write: float
     errors: int
+    # Номер самого позднего обращения, закончившегося сбоем
+    access: int
     errors_since_write: int = 0
 
 
@@ -141,6 +154,8 @@ class _State:
         # память постоянна при любом потоке новых fileId
         self.overflow: dict[int, _Entry] = {}
         self.directory: _Unavailable | None = None
+        # Номер самого позднего успешного обращения к папке
+        self.last_ok_access = 0
         self.timer: threading.Thread | None = None
         self.timer_stop = threading.Event()
 
@@ -299,22 +314,31 @@ def directory_error(
     идёт с трассировкой исходной ошибки.
     """
     now = clock()
+    access = _current_access()
     reason = (status, _reason(error))
     description = describe_error(error)
     message = (
         f"Папка с файлами {directory} недоступна: {description}. "
         f"Ответ клиенту: {status}"
     )
+    exc = _server_error(error, status)
     # Запись — под той же блокировкой, что и решение: иначе 2001 из
     # параллельного успешного запроса мог бы опередить это 2000
     with _state.directory_lock:
         state = _state.directory
+        if state is None and access < _state.last_ok_access:
+            # Обращение начато до другого, уже успешного: папка
+            # доступна, ошибка — только в файл журнала
+            _log(logging.WARNING, None, message, exc)
+            mark_tracked(error)
+            return
         changed = state is None or state.reason != reason
         if state is None:
             _state.directory = _Unavailable(
-                str(directory), reason, description, now, now, errors=1
+                str(directory), reason, description, now, now, errors=1, access=access
             )
         elif changed:
+            state.access = max(state.access, access)
             if state.errors_since_write:
                 message += (
                     f". До смены причины ошибочных ответов с прошлой записи: "
@@ -326,28 +350,54 @@ def directory_error(
             state.errors += 1
             state.errors_since_write = 0
         else:
+            state.access = max(state.access, access)
             state.errors += 1
             state.errors_since_write += 1
         _log(
             logging.WARNING,
             EventId.DIRECTORY_UNAVAILABLE if changed else None,
             message,
-            _server_error(error, status),
+            exc,
         )
     mark_tracked(error)
 
 
+def begin_access() -> int:
+    """Начать обращение к папке: номер для текущего запроса.
+
+    Обработчик вызывает её до первого обращения к ФС: directory_ok и
+    directory_error в этом контексте берут номер отсюда. Без неё —
+    номер момента вызова.
+    """
+    access = next(_access_numbers)
+    _access.set(access)
+    return access
+
+
+def _current_access() -> int:
+    access = _access.get()
+    return next(_access_numbers) if access is None else access
+
+
 def directory_ok() -> None:
-    """Учесть успешный ответ: после недоступности — событие 2001."""
+    """Учесть успешное обращение: после недоступности — событие 2001.
+
+    Успех обращения, начатого до последнего сбоя, папку доступной не
+    делает: сбой мог случиться уже после него.
+    """
+    access = _current_access()
     # Без блокировки, пока папка доступна: успешные запросы не ждут
-    # записи о чужой ошибке. Гонка с directory_error безвредна: этот
-    # ответ тогда просто считается полученным раньше ошибки
+    # записи о чужой ошибке. Гонка двух присваиваний может занизить
+    # номер — тогда сбой более раннего обращения даст 2000, как и без
+    # номеров
+    _state.last_ok_access = max(_state.last_ok_access, access)
     if _state.directory is None:
         return
     with _state.directory_lock:
-        state, _state.directory = _state.directory, None
-        if state is None:
+        state = _state.directory
+        if state is None or access < state.access:
             return
+        _state.directory = None
         _log(
             logging.INFO,
             EventId.DIRECTORY_RESTORED,
@@ -514,3 +564,4 @@ def reset() -> None:
     old = _state
     old.timer_stop.set()
     _state = _State()
+    _access.set(None)

@@ -1,5 +1,6 @@
 """Тесты учёта ошибок для журнала событий: повторы, лимит, папка."""
 
+import contextvars
 import errno
 import logging
 import sys
@@ -301,6 +302,54 @@ class TestDirectoryState:
         monkeypatch.setattr(state, "directory_lock", RestoredMeanwhile())
         event_tracking.directory_ok()
         assert [event_id for event_id, _ in events(records)] == [2000]
+
+
+@pytest.mark.usefixtures("clock")
+class TestAccessOrder:
+    """Состояние папки — по началу обращения, а не по записи итога."""
+
+    @staticmethod
+    def request():
+        """Контекст запроса с начатым обращением к папке."""
+        context = contextvars.copy_context()
+        context.run(event_tracking.begin_access)
+        return context
+
+    def test_stale_success_not_restored(self, records):
+        """A прочитал папку и задержался, B позже получил ошибку: успех
+        A не даёт 2001; новое успешное обращение — даёт.
+        """
+        first, second = self.request(), self.request()
+        second.run(
+            event_tracking.directory_error, "/srv", OSError(errno.EIO, "I/O"), 500
+        )
+        first.run(event_tracking.directory_ok)
+        assert [e for e, _ in events(records)] == [2000]
+
+        self.request().run(event_tracking.directory_ok)
+        assert [e for e, _ in events(records)] == [2000, 2001]
+
+    def test_stale_error_not_unavailable(self, records):
+        """A начал раньше и получил ошибку после успеха B: 2000 нет,
+        ошибка — в файле журнала.
+        """
+        first, second = self.request(), self.request()
+        second.run(event_tracking.directory_ok)
+        error = OSError(errno.EIO, "I/O")
+        first.run(event_tracking.directory_error, "/srv", error, 500)
+        assert events(records) == []
+        assert len(records()) == 1
+        assert event_tracking.is_tracked(error)
+
+        self.request().run(event_tracking.directory_error, "/srv", error, 500)
+        assert [e for e, _ in events(records)] == [2000]
+
+    def test_without_begin_access(self, records):
+        """Без begin_access — номер момента вызова (как раньше)."""
+        event_tracking.directory_ok()
+        event_tracking.directory_error("/srv", OSError(errno.EIO, "I/O"), 500)
+        event_tracking.directory_ok()
+        assert [e for e, _ in events(records)] == [2000, 2001]
 
 
 class TestLockOrder:
