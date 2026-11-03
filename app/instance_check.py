@@ -84,28 +84,33 @@ def port_in_use(host: str, port: int) -> bool:
     return _connects(host, port)
 
 
-def _abort(connection: http.client.HTTPConnection) -> None:
+def _abort(sock: socket.socket) -> None:
     """Прервать чтение ответа из другого потока."""
-    sock = connection.sock
-    if sock is not None:
-        with suppress(OSError):
-            sock.shutdown(socket.SHUT_RDWR)
+    with suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
 
 
-def probe_openapi(host: str, port: int) -> str | None:
+def probe_openapi(host: str, port: int, timeout: float | None = None) -> str | None:
     """Запросить /openapi.json и вернуть версию File Picker API.
 
     http.client прокси не использует: ни переменные окружения, ни
     системные настройки. None — ответил не File Picker API или никто.
-    Весь запрос ограничен REQUEST_TIMEOUT: таймаут сокета действует на
-    каждую операцию, и слушатель, отдающий ответ по байту, держал бы
-    опрос сколько угодно.
+    Весь запрос, вместе с соединением, ограничен timeout (по умолчанию
+    REQUEST_TIMEOUT): таймаут сокета действует на каждую операцию, и
+    слушатель, отдающий ответ по байту, держал бы опрос сколько угодно.
+    Поэтому после соединения остаток срока отсчитывает таймер, который
+    закрывает сокет.
     """
-    connection = http.client.HTTPConnection(host, port, timeout=REQUEST_TIMEOUT)
-    timer = threading.Timer(REQUEST_TIMEOUT, _abort, (connection,))
-    timer.daemon = True
-    timer.start()
+    if timeout is None:
+        timeout = REQUEST_TIMEOUT
+    deadline = clock() + timeout
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    timer = None
     try:
+        connection.connect()
+        timer = threading.Timer(max(deadline - clock(), 0), _abort, (connection.sock,))
+        timer.daemon = True
+        timer.start()
         connection.request("GET", "/openapi.json")
         response = connection.getresponse()
         if response.status != HTTP_OK:
@@ -114,7 +119,8 @@ def probe_openapi(host: str, port: int) -> str | None:
     except (OSError, http.client.HTTPException, ValueError):
         return None
     finally:
-        timer.cancel()
+        if timer is not None:
+            timer.cancel()
         connection.close()
     info = data.get("info") if isinstance(data, dict) else None
     if not isinstance(info, dict) or info.get("title") != TITLE:
@@ -130,6 +136,8 @@ def wait_for_port(
     Опрос заканчивается, как только порт свободен или ответил File
     Picker API, прерывается остановкой, а через seconds без ответа
     File Picker API считается, что порт держит другая программа.
+    Запрос и пауза получают не больше остатка срока, поэтому опрос
+    превышает seconds не больше чем на проверку занятости порта.
     """
     deadline = clock() + seconds
     while True:
@@ -137,15 +145,16 @@ def wait_for_port(
             return ProbeResult(Probe.STOPPED)
         if not port_in_use(host, port):
             return ProbeResult(Probe.FREE)
-        version = probe_openapi(host, port)
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return ProbeResult(Probe.OTHER)
+        version = probe_openapi(host, port, min(REQUEST_TIMEOUT, remaining))
         # Остановка во время запроса важнее его ответа и срока
         if stop.is_set():
             return ProbeResult(Probe.STOPPED)
         if version is not None:
             return ProbeResult(Probe.FILE_PICKER, version)
-        if clock() >= deadline:
-            return ProbeResult(Probe.OTHER)
-        if stop.wait(PROBE_INTERVAL):
+        if stop.wait(min(PROBE_INTERVAL, max(deadline - clock(), 0))):
             return ProbeResult(Probe.STOPPED)
 
 

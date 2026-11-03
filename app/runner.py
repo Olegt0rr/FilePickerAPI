@@ -60,6 +60,9 @@ DIRECTORY_WAIT_SECONDS = 1
 # Процесс завершается не позже этого срока после исхода, даже если
 # запись в журнал зависла (спецификация: не позже 30 секунд)
 EXIT_DEADLINE_SECONDS = 28
+# Сколько ждать записи 1002 перед повтором: зависшая запись в журнал
+# не должна останавливать повторы
+REPORT_WAIT_SECONDS = 5
 # Ошибка привязки: asyncio пересоздаёт исключение без winerror, а errno
 # на Windows — 10048 (WSAEADDRINUSE)
 ADDRESS_IN_USE = frozenset({errno.EADDRINUSE, 10048})
@@ -408,7 +411,7 @@ class Service:
                 )
                 return
             delay = RETRY_DELAYS[attempt - 1]
-            self._report_failure(
+            self._report_retry(
                 f"HTTP-сервер не работает (попытка {attempt} из {MAX_ATTEMPTS}, "
                 f"следующая через {delay} с): {reason}",
                 error,
@@ -439,6 +442,21 @@ class Service:
             exc_info=None if isinstance(error, SystemExit) else error,
             extra={"event_id": EventId.SERVICE_FAILED},
         )
+
+    def _report_retry(self, message: str, error: BaseException | None) -> None:
+        """1002 перед повтором: запись ждём не дольше срока.
+
+        Исход ещё не занят, и сторож не запущен: запись, зависшая на
+        замке обработчика, иначе остановила бы повторы навсегда.
+        """
+        thread = threading.Thread(
+            target=self._report_failure,
+            args=(message, error),
+            name="report-failure",
+            daemon=True,
+        )
+        thread.start()
+        thread.join(REPORT_WAIT_SECONDS)
 
     def _fail(self, message: str, error: BaseException | None) -> None:
         """Сбой: 1002 и код 1; при остановке — пометка в 1001."""
