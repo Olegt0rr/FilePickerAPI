@@ -196,6 +196,37 @@ class TestStart:
             time.sleep(0.01)
         assert files_dir.is_dir()
 
+    @pytest.mark.usefixtures("files_dir")
+    def test_listens_on_all_interfaces_port_8000(self, fake_serve, monkeypatch):
+        """Проверить: без подмен Uvicorn слушает 0.0.0.0:8000 —
+        фронтенд с другой машины достучится до сервиса.
+        """
+        monkeypatch.setattr(instance_check, "port_in_use", lambda *_: False)
+        assert runner.run() == 0
+        [(server, _)] = [c.args for c in fake_serve.call_args_list]
+        assert (server.config.host, server.config.port) == ("0.0.0.0", 8000)
+
+    @pytest.mark.usefixtures("port")
+    def test_startup_message_error(self, evtlog, monkeypatch):
+        """Проверить с настоящим Uvicorn: ошибка текста 1000 не роняет
+        запуск — 1000 с версией и причиной, сервис работает.
+        """
+
+        def on_started(service):
+            started(service)
+            service.request_stop("тест")
+
+        started = runner.Service.on_started
+        monkeypatch.setattr(runner.Service, "on_started", on_started)
+        monkeypatch.setattr(
+            runner, "startup_message", mock.Mock(side_effect=OSError("нет exe"))
+        )
+        assert runner.run() == 0
+        assert event_ids(evtlog) == [1000, 1001]
+        [text] = event_texts(evtlog, 1000)
+        assert f"версия {app.__version__}" in text
+        assert "нет exe" in text
+
     @pytest.mark.usefixtures("port", "fake_serve", "unreachable_log")
     def test_buffer_sent_on_start(self, evtlog):
         """Проверить: 1004 до старта приходит после него, перед 1000."""
@@ -485,9 +516,37 @@ class TestServerErrors:
         """Проверить: остановка прерывает паузу между попытками."""
         monkeypatch.setattr(runner, "RETRY_DELAYS", (60, 60, 60))
         monkeypatch.setattr(runner.InstanceServer, "run", lambda *_: None)
-        threading.Timer(0.3, service_env.stop).start()
+        report = runner.Service._report_failure  # noqa: SLF001 - обёртка
+
+        def report_then_stop(service, *args):
+            report(service, *args)
+            # Сигнал приходит уже во время паузы, после записи 1002
+            threading.Timer(0.2, service_env.stop).start()
+
+        monkeypatch.setattr(runner.Service, "_report_failure", report_then_stop)
         assert runner.run() == 0
         assert event_ids(evtlog) == [1002, 1001]
+
+    # Исключение нарочно выходит из рабочего потока
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+    def test_failure_while_reporting(self, service_env, monkeypatch):
+        """Проверить: сбой при записи исхода не оставляет главный поток
+        ждать вечно — код 1.
+        """
+        monkeypatch.setattr(
+            instance_check, "wait_for_port", mock.Mock(side_effect=RuntimeError("x"))
+        )
+        monkeypatch.setattr(
+            runner.Service,
+            "_report_failure",
+            mock.Mock(side_effect=RuntimeError("журнал")),
+        )
+        assert runner.run() == 1
+        assert service_env.exits == [1]
+        # Предупреждение о потоке — в этом тесте, а не в следующем
+        for thread in threading.enumerate():
+            if thread.name == "service-worker":
+                thread.join(5)
 
     @pytest.mark.usefixtures("port")
     def test_settings_error(self, service_env, evtlog, files_dir, monkeypatch):

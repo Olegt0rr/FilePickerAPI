@@ -13,6 +13,7 @@
 настройки читаются только в create_app(), после настройки журнала.
 """
 
+import asyncio
 import errno
 import getpass
 import importlib
@@ -206,7 +207,9 @@ class InstanceServer(uvicorn.Server):
         await super().startup(sockets=sockets)
         if self.started:
             self.errors.active = False
-            self.service.on_started()
+            # Не в цикле событий: отправка буфера (до 100 ReportEvent)
+            # не задерживает первые запросы
+            await asyncio.to_thread(self.service.on_started)
 
 
 class Service:
@@ -221,7 +224,9 @@ class Service:
     def __init__(self, *, console: bool) -> None:
         """Создать состояние до запуска потоков."""
         self.console = console
-        self.lock = threading.Lock()
+        # RLock: request_stop вызывается из обработчика сигнала, который
+        # может прервать главный поток внутри того же request_stop
+        self.lock = threading.RLock()
         self.done = threading.Event()
         self.stop_requested = threading.Event()
         self.outcome: Outcome | None = None
@@ -273,10 +278,13 @@ class Service:
         if self.stop_requested.is_set():
             return
         send_startup_events()
-        logger.info(
-            startup_message(console=self.console),
-            extra={"event_id": EventId.SERVICE_STARTED},
-        )
+        try:
+            message = startup_message(console=self.console)
+        except Exception as e:
+            # Исключение отсюда вышло бы из startup() после привязки, и
+            # Uvicorn оставил бы порт занятым до конца процесса
+            message = f"Сервис запущен: версия {__version__}, порт {PORT} ({e})"
+        logger.info(message, extra={"event_id": EventId.SERVICE_STARTED})
 
     def work(self) -> None:
         """Тело рабочего потока: ошибка в нём — тоже сбой запуска."""
@@ -284,6 +292,11 @@ class Service:
             self._work()
         except BaseException as e:
             self._fail("Непредвиденная ошибка запуска сервиса", e)
+        finally:
+            # Даже если упала сама запись исхода, главный поток не
+            # должен ждать вечно
+            self.claim(Outcome.FAILED)
+            self.done.set()
 
     def _work(self) -> None:
         result = instance_check.wait_for_port(
