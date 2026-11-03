@@ -236,6 +236,9 @@ class Service:
         # RLock: request_stop вызывается из обработчика сигнала, который
         # может прервать главный поток внутри того же request_stop
         self.lock = threading.RLock()
+        # decided — исход занят (с этого момента идёт срок сторожа),
+        # done — его события записаны
+        self.decided = threading.Event()
         self.done = threading.Event()
         self.stop_requested = threading.Event()
         self.outcome: Outcome | None = None
@@ -261,6 +264,7 @@ class Service:
             self.stop_requested.set()
             if self.server is not None:
                 self.server.should_exit = True
+        self.decided.set()
         self.done.set()
 
     def claim(self, outcome: Outcome) -> bool:
@@ -269,7 +273,8 @@ class Service:
             if self.outcome is not None:
                 return False
             self.outcome = outcome
-            return True
+        self.decided.set()
+        return True
 
     def attach_server(self, server: InstanceServer) -> bool:
         """Запомнить сервер попытки; при запрошенной остановке — нет."""
@@ -523,15 +528,17 @@ def run() -> int:
         target=service.work, name="service-worker", daemon=True
     )
     service.worker.start()
-    service.done.wait()
+    service.decided.wait()
 
     outcome = service.outcome
     # Сторож: запись в журнал может зависнуть на замке обработчика
     # (поток, застрявший на записи в канал консоли), а процесс должен
-    # завершиться в срок при любом исходе
+    # завершиться в срок при любом исходе. Поэтому срок идёт с момента,
+    # когда исход занят, а не когда записаны его события
     watchdog = threading.Timer(EXIT_DEADLINE_SECONDS, lambda: _exit(outcome.exit_code))
     watchdog.daemon = True
     watchdog.start()
+    service.done.wait()
     if outcome is Outcome.STOP:
         service.finalize()
     flush_handlers()

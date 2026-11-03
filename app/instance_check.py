@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+from contextlib import suppress
 from enum import Enum
 from typing import NamedTuple
 
@@ -83,13 +84,27 @@ def port_in_use(host: str, port: int) -> bool:
     return _connects(host, port)
 
 
+def _abort(connection: http.client.HTTPConnection) -> None:
+    """Прервать чтение ответа из другого потока."""
+    sock = connection.sock
+    if sock is not None:
+        with suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+
+
 def probe_openapi(host: str, port: int) -> str | None:
     """Запросить /openapi.json и вернуть версию File Picker API.
 
     http.client прокси не использует: ни переменные окружения, ни
     системные настройки. None — ответил не File Picker API или никто.
+    Весь запрос ограничен REQUEST_TIMEOUT: таймаут сокета действует на
+    каждую операцию, и слушатель, отдающий ответ по байту, держал бы
+    опрос сколько угодно.
     """
     connection = http.client.HTTPConnection(host, port, timeout=REQUEST_TIMEOUT)
+    timer = threading.Timer(REQUEST_TIMEOUT, _abort, (connection,))
+    timer.daemon = True
+    timer.start()
     try:
         connection.request("GET", "/openapi.json")
         response = connection.getresponse()
@@ -99,6 +114,7 @@ def probe_openapi(host: str, port: int) -> str | None:
     except (OSError, http.client.HTTPException, ValueError):
         return None
     finally:
+        timer.cancel()
         connection.close()
     info = data.get("info") if isinstance(data, dict) else None
     if not isinstance(info, dict) or info.get("title") != TITLE:
@@ -122,6 +138,9 @@ def wait_for_port(
         if not port_in_use(host, port):
             return ProbeResult(Probe.FREE)
         version = probe_openapi(host, port)
+        # Остановка во время запроса важнее его ответа и срока
+        if stop.is_set():
+            return ProbeResult(Probe.STOPPED)
         if version is not None:
             return ProbeResult(Probe.FILE_PICKER, version)
         if clock() >= deadline:

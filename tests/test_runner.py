@@ -706,6 +706,29 @@ class TestStop:
         assert exits[0] == 0
         assert len(exits) == 2
 
+    def test_watchdog_exits_when_failure_logging_hangs(self, monkeypatch):
+        """Проверить: запись 1002 зависла — сторож завершает процесс
+        с кодом 1, хотя события сбоя так и не записаны.
+        """
+        exited = threading.Event()
+        exits = []
+
+        def exit_process(code):
+            exits.append(code)
+            exited.set()
+
+        monkeypatch.setattr(runner, "_exit", exit_process)
+        monkeypatch.setattr(runner, "EXIT_DEADLINE_SECONDS", 0.2)
+        monkeypatch.setattr(stop_signals, "install", mock.Mock())
+        monkeypatch.setattr(
+            instance_check, "wait_for_port", mock.Mock(side_effect=RuntimeError("x"))
+        )
+        monkeypatch.setattr(
+            runner.Service, "_report_failure", lambda *_: exited.wait(10)
+        )
+        assert runner.run() == 1
+        assert exits == [1, 1]
+
     @pytest.mark.usefixtures("port")
     def test_hung_worker(self, service_env, evtlog, monkeypatch):
         """Проверить: рабочий поток не завершился за срок — пометка в
@@ -957,6 +980,39 @@ class TestInstanceCheck:
         assert instance_check.probe_openapi("127.0.0.1", 8000) is None
         connection.close.assert_called_once()
 
+    def test_probe_openapi_slow_answer(self, monkeypatch):
+        """Проверить: ответ по байту не держит запрос дольше срока."""
+        monkeypatch.setattr(instance_check, "REQUEST_TIMEOUT", 0.3)
+        listener = socket.create_server(("127.0.0.1", 0))
+        number = listener.getsockname()[1]
+        stop = threading.Event()
+
+        def trickle():
+            client, _ = listener.accept()
+            with client:
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"x" * 1000:
+                    if stop.wait(0.05):
+                        return
+                    client.sendall(bytes([byte]))
+
+        thread = threading.Thread(target=trickle, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        try:
+            assert instance_check.probe_openapi("127.0.0.1", number) is None
+            assert time.monotonic() - started < 2
+        finally:
+            stop.set()
+            thread.join(5)
+            listener.close()
+
+    @pytest.mark.parametrize("sock", [None, mock.Mock()])
+    def test_abort(self, sock):
+        """Проверить: прерывание без сокета или закрытого — тихо."""
+        if sock is not None:
+            sock.shutdown.side_effect = OSError
+        instance_check._abort(mock.Mock(sock=sock))  # noqa: SLF001 - помощник модуля
+
     def test_probe_openapi_nobody(self):
         assert instance_check.probe_openapi("127.0.0.1", free_port()) is None
 
@@ -987,6 +1043,21 @@ class TestInstanceCheck:
         monkeypatch.setattr(instance_check, "probe_openapi", probe)
         result = instance_check.wait_for_port(threading.Event(), 10, "h", 1)
         assert result == ProbeResult(Probe.FILE_PICKER, "2.0.0")
+
+    def test_wait_for_port_stop_during_request(self, monkeypatch, clock):
+        """Проверить: остановка во время запроса — STOPPED, а не OTHER
+        по истёкшему сроку.
+        """
+        monkeypatch.setattr(instance_check, "clock", clock)
+        monkeypatch.setattr(instance_check, "port_in_use", lambda *_: True)
+        stop = threading.Event()
+
+        def probe(*_):
+            clock.advance(20)
+            stop.set()
+
+        monkeypatch.setattr(instance_check, "probe_openapi", probe)
+        assert instance_check.wait_for_port(stop, 10, "h", 1).status is Probe.STOPPED
 
     def test_wait_for_port_stopped(self, monkeypatch):
         stop = threading.Event()
