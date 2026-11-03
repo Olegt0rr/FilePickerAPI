@@ -1029,7 +1029,8 @@ class TestUrgentStop:
         # Первый выход — от обработчика, пока финализация висела
         assert service_env.exits == [0, 0]
         assert handler["exits"] == [1]
-        assert 0.3 <= handler["elapsed"] < 2
+        # Допуск на шаг часов Windows (около 15 мс)
+        assert 0.25 <= handler["elapsed"] < 2
 
     @pytest.mark.usefixtures("port", "fake_serve")
     def test_handler_exits_during_window_creation(
@@ -1063,7 +1064,8 @@ class TestUrgentStop:
         finally:
             release.set()
             main.join(10)
-        assert 0.3 <= elapsed < 2
+        # Допуск на шаг часов Windows (около 15 мс)
+        assert 0.25 <= elapsed < 2
         # Затем главный поток доходит до остановки сам
         assert result == {"code": 0}
 
