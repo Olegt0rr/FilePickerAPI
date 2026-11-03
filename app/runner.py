@@ -65,11 +65,17 @@ STOP_WAIT_SECONDS = 20
 # Срочная остановка: Windows завершит процесс после возврата из
 # обработчика, а закрытие консоли ждёт его не дольше 5 секунд
 URGENT_WAIT_SECONDS = 3
+# Срок срочной остановки от прихода сигнала на любом этапе, включая
+# создание скрытого окна и уже идущую обычную остановку: если процесс
+# к этому сроку не завершился, обработчик завершает его сам
+URGENT_EXIT_SECONDS = 4.5
 # Ожидание потока создания директории при остановке
 DIRECTORY_WAIT_SECONDS = 1
 # Ожидание проверки прав перед последними событиями (1001, итоговое
 # 1002): обход папки сборки локальный и обычно короче секунды
 PERMISSIONS_WAIT_SECONDS = 5
+# Ожидание записи 1003, начатой до закрытия журнала событий для неё
+EVENTS_LOCK_SECONDS = 1
 # Процесс завершается не позже этого срока после исхода, даже если
 # запись в журнал зависла (спецификация: не позже 30 секунд)
 EXIT_DEADLINE_SECONDS = 28
@@ -165,39 +171,33 @@ def register_restart() -> None:
         logger.warning("Не удалось зарегистрировать перезапуск после обновления: %s", e)
 
 
-def check_permissions(event_log: Callable[[], bool] = lambda: True) -> None:
-    """Проверить права на папку сборки; нарушения — событие 1003.
+def check_permissions() -> tuple[str, BaseException | None] | None:
+    """Проверить права на папку сборки.
 
-    Только у собранного exe на Windows. Событие идёт через буфер
-    стартовых событий: у второго экземпляра, проигравшего гонку за
-    порт, оно отбрасывается. event_log() — можно ли ещё писать в журнал
-    событий: после 1001 запись идёт только в файл журнала.
+    Только у собранного exe на Windows; пишет в журнал вызывающий
+    (Service), согласуя запись 1003 с последними событиями процесса.
+
+    Returns:
+        Текст события 1003 и ошибку самой проверки (её трассировка
+        тоже нужна в событии) или None, если нарушений нет
+
     """
     if not _built_exe_on_windows():
-        return
+        return None
     from app import permissions
 
     try:
         violations = permissions.check_build_folder(exe_path().parent)
         if not violations:
-            return
-        message = permissions.format_violations(violations)
+            return None
+        return permissions.format_violations(violations), None
     except Exception as e:
         # Права остались непроверенными: администратор должен это видеть
-        logger.warning(
-            "Не удалось проверить права на папку сборки: %s",
-            event_tracking.describe_error(e),
-            exc_info=e,
-            extra={
-                "event_id": EventId.BUILD_FOLDER_PERMISSIONS,
-                "event_log": event_log(),
-            },
+        message = (
+            f"Не удалось проверить права на папку сборки: "
+            f"{event_tracking.describe_error(e)}"
         )
-        return
-    logger.warning(
-        message,
-        extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS, "event_log": event_log()},
-    )
+        return message, e
 
 
 def _branch() -> str:
@@ -335,8 +335,11 @@ class Service:
         self.permissions_thread: threading.Thread | None = None
         self.permissions_finished = False
         # Последние события записаны: поздний результат проверки прав
-        # идёт только в файл журнала, а не после 1001 или 1002
+        # идёт только в файл журнала, а не после 1001 или 1002. Флаг
+        # проверяется и запись 1003 делается под events_lock, и закрытие
+        # ждёт уже начатую запись
         self.events_closed = False
+        self.events_lock = threading.Lock()
         # Текст 1000; собирается в рабочем потоке до запуска Uvicorn
         self.start_message = f"Сервис запущен: версия {__version__}, порт {PORT}"
 
@@ -367,13 +370,17 @@ class Service:
 
         Windows завершит процесс сразу после возврата из обработчика
         (закрытие консоли, WM_ENDSESSION), поэтому обработчик ждёт, пока
-        главный поток закончит финализацию и вызовет _exit. Своего срока
-        у обработчика нет: зависшую финализацию завершает сторож в
-        run(), а закрытие консоли Windows и так ждёт не дольше 5 секунд.
-        Возвращается, только если _exit подменён (тесты).
+        главный поток закончит финализацию и вызовет _exit. Если процесс
+        не завершился за URGENT_EXIT_SECONDS от сигнала (зависла запись
+        в журнал, главный поток ещё создаёт скрытое окно, шла обычная
+        остановка с долгим ожиданием), его завершает сам обработчик:
+        закрытие консоли Windows ждёт не дольше 5 секунд. Возвращается,
+        только если _exit подменён (тесты).
         """
         self.request_stop(reason, urgent=True)
-        self.finished.wait()
+        if not self.finished.wait(URGENT_EXIT_SECONDS):
+            # Исход уже записан: этим запросом или раньше
+            _exit(self.outcome.exit_code)
 
     def _wait_for(self, finished: Callable[[], bool], seconds: float) -> None:
         """Ждать finished() не дольше seconds и срока остановки.
@@ -395,9 +402,20 @@ class Service:
             self.changed.notify_all()
 
     def _check_permissions(self) -> None:
-        """Тело потока проверки прав."""
+        """Тело потока проверки прав: 1003 до последних событий."""
         try:
-            check_permissions(lambda: not self.events_closed)
+            result = check_permissions()
+            if result is not None:
+                message, error = result
+                with self.events_lock:
+                    logger.warning(
+                        message,
+                        exc_info=error,
+                        extra={
+                            "event_id": EventId.BUILD_FOLDER_PERMISSIONS,
+                            "event_log": not self.events_closed,
+                        },
+                    )
         finally:
             self._thread_finished("permissions_finished")
 
@@ -405,11 +423,17 @@ class Service:
         """Дождаться проверки прав и закрыть журнал событий для неё.
 
         Её 1003 должно попасть в журнал событий до последнего события
-        (1001 или итогового 1002), а не после него.
+        (1001 или итогового 1002), а не после него: запись, начатая до
+        закрытия, заканчивается раньше, поздняя идёт только в файл.
         """
         if self.permissions_thread is not None:
             self._wait_for(lambda: self.permissions_finished, PERMISSIONS_WAIT_SECONDS)
+        # Без замка (запись в журнал зависла) флаг всё равно ставится:
+        # процесс должен завершиться в срок
+        locked = self.events_lock.acquire(timeout=EVENTS_LOCK_SECONDS)
         self.events_closed = True
+        if locked:
+            self.events_lock.release()
 
     def _create_directory(self) -> None:
         """Тело потока создания директории."""

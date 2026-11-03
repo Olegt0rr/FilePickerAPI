@@ -927,45 +927,82 @@ class TestUrgentStop:
         assert text.startswith("app.runner: Сервис остановлен: тест.")
 
     @pytest.mark.usefixtures("port", "fake_serve")
-    def test_watchdog_when_finalization_hangs(self, service_env, monkeypatch):
-        """Проверить: финализация зависла — процесс завершает сторож, а
-        обработчик до этого не возвращается.
+    def test_handler_exits_when_finalization_hangs(self, service_env, monkeypatch):
+        """Проверить: срочный сигнал во время зависшей обычной остановки
+        — процесс завершает сам обработчик в срок от сигнала, не
+        возвращаясь раньше.
         """
-        monkeypatch.setattr(runner, "EXIT_DEADLINE_SECONDS", 0.3)
+        assert runner.URGENT_EXIT_SECONDS == 4.5
+        monkeypatch.setattr(runner, "URGENT_EXIT_SECONDS", 0.3)
         released = threading.Event()
         handler = {}
 
         def finalize(_service):
+            handler["signal"] = time.monotonic()
             handler["thread"], handler["exits"] = urgent_in_thread(
                 service_env, "выход пользователя"
             )
             released.wait(10)
+            handler["elapsed"] = time.monotonic() - handler["signal"]
+
+        def exit_process(code):
+            service_env.exits.append(code)
+            released.set()
 
         monkeypatch.setattr(runner.Service, "finalize", finalize)
-        monkeypatch.setattr(
-            runner,
-            "_exit",
-            lambda code: (service_env.exits.append(code), released.set()),
-        )
+        monkeypatch.setattr(runner, "_exit", exit_process)
         assert runner.run() == 0
         handler["thread"].join(5)
-        # Первый выход — от сторожа, пока финализация висела
+        # Первый выход — от обработчика, пока финализация висела
         assert service_env.exits == [0, 0]
-        assert handler["exits"] == [2]
+        assert handler["exits"] == [1]
+        assert 0.3 <= handler["elapsed"] < 2
+
+    @pytest.mark.usefixtures("port", "fake_serve")
+    def test_handler_exits_during_window_creation(
+        self, service_env, fake_window, monkeypatch
+    ):
+        """Проверить: закрытие консоли, пока главный поток ещё создаёт
+        скрытое окно (рабочего потока и сторожа нет), — выход в срок.
+        """
+        monkeypatch.setattr(runner, "URGENT_EXIT_SECONDS", 0.3)
+        monkeypatch.setattr(stop_signals, "install", INSTALL)
+        creating = threading.Event()
+        release = threading.Event()
+
+        def create_window(*_args):
+            creating.set()
+            release.wait(10)
+
+        fake_window.win32gui.CreateWindow.side_effect = create_window
+        result = {}
+        main = threading.Thread(target=lambda: result.update(code=runner.run()))
+        main.start()
+        try:
+            wait_for(creating.is_set)
+            [(handler, _add)] = [
+                c.args for c in fake_window.win32api.SetConsoleCtrlHandler.mock_calls
+            ]
+            started = time.monotonic()
+            assert handler(stop_signals.CTRL_CLOSE_EVENT) is True
+            elapsed = time.monotonic() - started
+            assert service_env.exits == [0]
+        finally:
+            release.set()
+            main.join(10)
+        assert 0.3 <= elapsed < 2
+        # Затем главный поток доходит до остановки сам
+        assert result == {"code": 0}
 
     def test_after_failure(self, service_env):
-        """Проверить: срочный сигнал после сбоя ничего не останавливает,
-        а обработчик ждёт выхода процесса.
+        """Проверить: срочный сигнал после сбоя ничего не останавливает
+        и при зависшем выходе завершает процесс с кодом сбоя.
         """
         service = runner.Service(console=True)
         assert service.claim(runner.Outcome.FAILED)
-        thread = threading.Thread(target=service.urgent_stop, args=("выход",))
-        thread.start()
-        thread.join(0.2)
-        assert thread.is_alive()
-        service.finished.set()
-        thread.join(5)
-        assert service_env.exits == []
+        with mock.patch.object(runner, "URGENT_EXIT_SECONDS", 0.01):
+            service.urgent_stop("выход пользователя")
+        assert service_env.exits == [1]
         assert service.stop_reason == ""
         assert service.stop_deadline == float("inf")
         assert not service.stop_requested.is_set()
@@ -1134,6 +1171,37 @@ class TestCompiledExe:
         compiled_exe.check.side_effect = check
         timer = threading.Timer(0.3, release.set)
         timer.start()
+        assert runner.run() == 0
+        assert event_ids(evtlog) == [1000, 1003, 1001]
+
+    @pytest.mark.usefixtures("port", "compiled_exe")
+    def test_write_in_progress_before_close(self, evtlog, monkeypatch):
+        """Проверить: запись 1003, начатая до закрытия (флаг уже
+        проверен), заканчивается раньше 1001, даже если срок ожидания
+        проверки истёк.
+        """
+        monkeypatch.setattr(runner, "PERMISSIONS_WAIT_SECONDS", 0.01)
+        go = threading.Event()
+        entered = threading.Event()
+        warning = runner.logger.warning
+
+        def slow_warning(msg, *args, **kwargs):
+            if kwargs.get("extra", {}).get("event_id") == 1003:
+                entered.set()
+                go.wait(5)
+                time.sleep(0.3)
+            warning(msg, *args, **kwargs)
+
+        monkeypatch.setattr(runner.logger, "warning", slow_warning)
+
+        def serve(server, _sockets=None):
+            server.started = True
+            server.service.on_started()
+            go.set()
+            wait_for(entered.is_set)
+            server.service.request_stop("тест")
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
         assert runner.run() == 0
         assert event_ids(evtlog) == [1000, 1003, 1001]
 
