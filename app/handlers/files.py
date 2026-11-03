@@ -793,14 +793,12 @@ class TrackedFileResponse(FileResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Отправить файл с замером и учётом ошибок чтения."""
-        partial = False
+        status: int | None = None
 
         async def tracked_send(message: Message) -> None:
-            # 206 — отправлена часть файла (Range), и его размер в
-            # событии сбил бы с толку
-            nonlocal partial
+            nonlocal status
             if message["type"] == "http.response.start":
-                partial = message["status"] == HTTPStatus.PARTIAL_CONTENT
+                status = message["status"]
             await send(message)
 
         try:
@@ -812,11 +810,24 @@ class TrackedFileResponse(FileResponse):
             event_tracking.mark_tracked(e)
             raise
         except OSError as e:
-            event_tracking.file_error(
-                self._directory, self._file_id, e, "200, ответ оборван"
+            # Заголовки уже ушли — ответ оборван с их кодом (200 или
+            # 206), иначе Starlette ответит 500
+            reported: int | str = (
+                HTTPStatus.INTERNAL_SERVER_ERROR.value
+                if status is None
+                else f"{status}, ответ оборван"
             )
+            event_tracking.file_error(self._directory, self._file_id, e, reported)
             raise
+        else:
+            # Тело отправлено целиком — папка доступна. Не раньше: при
+            # стабильном сбое чтения 2001 по атрибутам файла давало бы
+            # пару 2001/2000 на каждый запрос
+            event_tracking.directory_ok()
         finally:
+            # 206 — отправлена часть файла (Range), и его размер в
+            # событии сбил бы с толку
+            partial = status == HTTPStatus.PARTIAL_CONTENT
             size = None if partial else self.stat_result.st_size
             event_tracking.check_slow(DOWNLOAD_ROUTE, self._started, size=size)
 
@@ -929,16 +940,17 @@ def _find_download(file_id: str, files_directory: Path) -> tuple[Path, os.stat_r
         file_path = _resolve_in_directory(candidate, files_directory, file_id)
         with _file_errors(file_id, files_directory):
             file_stat = file_path.stat()
-    # Атрибуты файла получены — папка доступна, даже если дальше
-    # ответ 400 или 403
-    event_tracking.directory_ok()
-
+    # Атрибуты файла получены — для ответа 400 или 403 папка доступна.
+    # Скачивание подтверждает это само, отправив тело целиком: так
+    # делает TrackedFileResponse
     if not S_ISREG(file_stat.st_mode):
+        event_tracking.directory_ok()
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
 
     # Проверяем, что файл доступен для загрузки
     if not check_file_availability(file_path, file_stat.st_size):
+        event_tracking.directory_ok()
         msg = "File is not available for download"
         raise HTTPException(status_code=403, detail=msg)
 

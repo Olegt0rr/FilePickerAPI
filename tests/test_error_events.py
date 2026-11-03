@@ -199,9 +199,47 @@ class TestTrackedFileResponse:
         ):
             client.get("/files/a.txt")
         assert raised.value is error
-        assert [e for e, _ in events()] == [event_id]
+        [(sent_id, record)] = events()
+        assert sent_id == event_id
         assert event_tracking.is_tracked(error)
-        assert "200, ответ оборван" in events()[0][1].getMessage()
+        # Заголовки не отправлены — клиент получит 500
+        assert record.getMessage().endswith("Ответ клиенту: 500")
+        assert record.exc_info[1] is error
+
+    @pytest.mark.parametrize(
+        ("headers", "status"), [({}, 200), ({"Range": "bytes=0-3"}, 206)]
+    )
+    def test_body_error_after_headers(self, client, events, headers, status):
+        """Ошибка после заголовков — ответ оборван с их кодом."""
+        error = OSError(errno.EIO, "read failed")
+
+        async def failing_call(_self, _scope, _receive, send):
+            await send({"type": "http.response.start", "status": status, "headers": []})
+            raise error
+
+        with (
+            mock.patch.object(FileResponse, "__call__", failing_call),
+            pytest.raises(OSError, match="read failed"),
+        ):
+            client.get("/files/a.txt", headers=headers)
+        [(event_id, record)] = events()
+        assert event_id == 3000
+        assert record.getMessage().endswith(f"Ответ клиенту: {status}, ответ оборван")
+
+    def test_body_read_error_not_restored(self, client, events):
+        """Атрибуты читаются, тело — нет: 2001 нет, повторы не
+        пишутся; 2001 — после скачивания целиком.
+        """
+        with mock.patch("os.scandir", side_effect=PermissionError("denied")):
+            assert client.get("/files").status_code == 403
+        error = win_error(64)
+        with mock.patch.object(FileResponse, "__call__", side_effect=error):
+            for _ in range(3):
+                with pytest.raises(OSError, match=str(error.strerror)):
+                    client.get("/files/a.txt")
+        assert [e for e, _ in events()] == [2000, 2000]
+        assert client.get("/files/a.txt").status_code == 200
+        assert [e for e, _ in events()] == [2000, 2000, 2001]
 
     def test_client_disconnect_no_event(self, client, events):
         """Клиент оборвал скачивание — это не ошибка папки или файла."""

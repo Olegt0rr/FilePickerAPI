@@ -277,6 +277,16 @@ def _reason(error: BaseException) -> Hashable:
     )
 
 
+def _server_error(error: BaseException, status: int | str) -> BaseException | None:
+    """Исключение для трассировки в журнале: только при ответе 5xx.
+
+    Строковый статус — оборванный ответ, это тоже сбой сервера.
+    """
+    if isinstance(status, str) or status >= 500:  # noqa: PLR2004 - класс 5xx
+        return error
+    return None
+
+
 def directory_error(
     directory: str | Path, error: BaseException, status: int | str
 ) -> None:
@@ -284,11 +294,17 @@ def directory_error(
 
     В файл журнала пишется каждый ошибочный ответ, в журнал событий —
     только переход в «недоступна» и смена причины; дальше — 2002 по
-    такту таймера и 2001 при восстановлении.
+    такту таймера и 2001 при восстановлении. При смене причины в 2000
+    указаны повторы прежней с прошлой записи. Для ответа 5xx запись
+    идёт с трассировкой исходной ошибки.
     """
     now = clock()
     reason = (status, _reason(error))
     description = describe_error(error)
+    message = (
+        f"Папка с файлами {directory} недоступна: {description}. "
+        f"Ответ клиенту: {status}"
+    )
     # Запись — под той же блокировкой, что и решение: иначе 2001 из
     # параллельного успешного запроса мог бы опередить это 2000
     with _state.directory_lock:
@@ -299,6 +315,11 @@ def directory_error(
                 str(directory), reason, description, now, now, errors=1
             )
         elif changed:
+            if state.errors_since_write:
+                message += (
+                    f". До смены причины ошибочных ответов с прошлой записи: "
+                    f"{state.errors_since_write} ({state.description})"
+                )
             state.reason = reason
             state.description = description
             state.last_write = now
@@ -310,8 +331,8 @@ def directory_error(
         _log(
             logging.WARNING,
             EventId.DIRECTORY_UNAVAILABLE if changed else None,
-            f"Папка с файлами {directory} недоступна: {description}. "
-            f"Ответ клиенту: {status}",
+            message,
+            _server_error(error, status),
         )
     mark_tracked(error)
 
@@ -342,7 +363,8 @@ def file_error(
     """Учесть ошибку доступа к скачиваемому файлу.
 
     Сетевой код Windows — недоступность директории (2000), прочие
-    ошибки — 3000 с ключом «код ошибки + fileId».
+    ошибки — 3000 с ключом «код ошибки + fileId». Для ответа 5xx запись
+    идёт с трассировкой исходной ошибки.
     """
     if is_network_error(error):
         directory_error(directory, error, status)
@@ -352,6 +374,7 @@ def file_error(
         (_reason(error), file_id),
         f"Ошибка доступа к файлу {file_id!r} в папке {directory}: "
         f"{describe_error(error)}. Ответ клиенту: {status}",
+        exc=_server_error(error, status),
     )
     mark_tracked(error)
 

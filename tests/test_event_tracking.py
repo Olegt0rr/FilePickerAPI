@@ -219,7 +219,45 @@ class TestDirectoryState:
         sent = events(records)
         assert [e for e, _ in sent] == [2000, 2000, 2001]
         assert "Ответ клиенту: 403" in sent[1][1]
+        # Повторы прежней причины не теряются при смене
+        assert sent[1][1].endswith(
+            "До смены причины ошибочных ответов с прошлой записи: 1 "
+            "([Errno 2] No such file: '/srv')"
+        )
         assert sent[2][1].endswith("ошибочных ответов: 3")
+
+    def test_reason_change_then_stop(self, clock, records):
+        """100 ответов 404, затем 403 и остановка — повторы 404 в
+        2000 о смене причины.
+        """
+        missing = FileNotFoundError(errno.ENOENT, "No such file", "/srv")
+        denied = PermissionError(errno.EACCES, "Permission denied", "/srv")
+        for _ in range(100):
+            event_tracking.directory_error("/srv", missing, 404)
+        event_tracking.directory_error("/srv", denied, 403)
+        clock.advance(10)
+        event_tracking.flush()
+
+        sent = events(records)
+        assert [e for e, _ in sent] == [2000, 2000, 2002]
+        assert "ошибочных ответов с прошлой записи: 99 " in sent[1][1]
+        assert "Ошибочных ответов с прошлой записи: 0" in sent[2][1]
+
+    @pytest.mark.usefixtures("clock")
+    @pytest.mark.parametrize(
+        ("status", "traceback"), [(404, False), (500, True), ("206, оборван", True)]
+    )
+    def test_traceback_for_server_error(self, caplog, status, traceback):
+        """Трассировка исходной ошибки — только для ответа 5xx."""
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        error = OSError(errno.EIO, "I/O")
+        event_tracking.directory_error("/srv", error, status)
+        event_tracking.file_error("/srv", "a.txt", error, status)
+        exc_infos = [r.exc_info for r in caplog.records]
+        assert len(exc_infos) == 2
+        for exc_info in exc_infos:
+            assert (exc_info is not None) is traceback
+            assert exc_info is None or exc_info[1] is error
 
     def test_stop_while_unavailable(self, clock, records):
         """Папка недоступна, 300 ошибочных ответов, остановка —
