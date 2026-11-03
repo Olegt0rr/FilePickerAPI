@@ -73,9 +73,14 @@ clock = time.monotonic
 # результата: успех обращения, начатого до сбоя, не даёт 2001, а сбой
 # обращения, начатого до успеха, не даёт 2000
 _access_numbers = itertools.count(1)
+# Номера и last_ok_access — под своей блокировкой: без GIL next() и
+# «прочитать max, записать» не атомарны. Под ней ничего не логируется
+_access_lock = threading.Lock()
 _access: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "directory_access", default=None
 )
+# Причина недоступности для оборванного ответа (вместо кода ответа)
+ABORTED_KEY = "ответ оборван"
 
 
 class EventId(IntEnum):
@@ -288,7 +293,11 @@ def directory_error(
     """
     now = clock()
     access = _current_access()
-    reason = (status, _reason(error))
+    # Оборванный ответ — одна причина, с каким бы кодом ни ушли
+    # заголовки: иначе чередование 200 и 206 (докачка по Range) давало
+    # бы 2000 на каждое переключение
+    status_key = ABORTED_KEY if isinstance(status, str) else status
+    reason = (status_key, _reason(error))
     description = describe_error(error)
     message = (
         f"Папка с файлами {directory} недоступна: {description}. "
@@ -305,27 +314,30 @@ def directory_error(
             _log(logging.WARNING, None, message, exc)
             mark_tracked(error)
             return
-        changed = state is None or state.reason != reason
         if state is None:
+            changed = True
             _state.directory = _Unavailable(
                 str(directory), reason, description, now, now, errors=1, access=access
             )
-        elif changed:
-            state.access = max(state.access, access)
-            if state.errors_since_write:
-                message += (
-                    f". До смены причины ошибочных ответов с прошлой записи: "
-                    f"{state.errors_since_write} ({state.description})"
-                )
-            state.reason = reason
-            state.description = description
-            state.last_write = now
-            state.errors += 1
-            state.errors_since_write = 0
         else:
+            # Ошибка обращения, начатого раньше последнего сбоя, —
+            # повтор: причину она не меняет, иначе более старая
+            # вытеснила бы новую
+            changed = state.reason != reason and access >= state.access
             state.access = max(state.access, access)
             state.errors += 1
-            state.errors_since_write += 1
+            if changed:
+                if state.errors_since_write:
+                    message += (
+                        f". До смены причины ошибочных ответов с прошлой записи: "
+                        f"{state.errors_since_write} ({state.description})"
+                    )
+                state.reason = reason
+                state.description = description
+                state.last_write = now
+                state.errors_since_write = 0
+            else:
+                state.errors_since_write += 1
         _log(
             logging.WARNING,
             EventId.DIRECTORY_UNAVAILABLE if changed else None,
@@ -338,18 +350,22 @@ def directory_error(
 def begin_access() -> int:
     """Начать обращение к папке: номер для текущего запроса.
 
-    Обработчик вызывает её до первого обращения к ФС: directory_ok и
-    directory_error в этом контексте берут номер отсюда. Без неё —
-    номер момента вызова.
+    Вызывается в начале запроса (middleware в app.api) и перед чтением
+    тела файла: directory_ok и directory_error в этом контексте берут
+    номер отсюда. Без неё — номер момента вызова.
     """
-    access = next(_access_numbers)
+    with _access_lock:
+        access = next(_access_numbers)
     _access.set(access)
     return access
 
 
 def _current_access() -> int:
     access = _access.get()
-    return next(_access_numbers) if access is None else access
+    if access is not None:
+        return access
+    with _access_lock:
+        return next(_access_numbers)
 
 
 def directory_ok() -> None:
@@ -359,11 +375,10 @@ def directory_ok() -> None:
     делает: сбой мог случиться уже после него.
     """
     access = _current_access()
-    # Без блокировки, пока папка доступна: успешные запросы не ждут
-    # записи о чужой ошибке. Гонка двух присваиваний может занизить
-    # номер — тогда сбой более раннего обращения даст 2000, как и без
-    # номеров
-    _state.last_ok_access = max(_state.last_ok_access, access)
+    # Под короткой блокировкой номеров, а не directory_lock: успешные
+    # запросы не ждут записи о чужой ошибке
+    with _access_lock:
+        _state.last_ok_access = max(_state.last_ok_access, access)
     if _state.directory is None:
         return
     with _state.directory_lock:
