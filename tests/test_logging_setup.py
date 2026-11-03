@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from app import logging_setup
+from app import event_tracking, logging_setup
 from app.event_tracking import EventId, is_tracked, mark_tracked
 from tests.platforms import windows_only
 
@@ -551,17 +551,35 @@ class TestLogFileRotation:
 class TestEventLogHandler:
     """Журнал событий с поддельным win32evtlog."""
 
+    CODE_CASES = (
+        # Каждый код — с уровнем, которым его пишет сервис
+        (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
+        (logging.INFO, EventId.SERVICE_STOPPED, 1001, 4),
+        (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
+        (logging.WARNING, EventId.BUILD_FOLDER_PERMISSIONS, 1003, 2),
+        (logging.WARNING, EventId.LOG_FILE_UNAVAILABLE, 1004, 2),
+        (logging.INFO, EventId.ALREADY_RUNNING, 1005, 4),
+        (logging.WARNING, EventId.OTHER_VERSION_RUNNING, 1006, 2),
+        (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
+        (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
+        (logging.WARNING, EventId.DIRECTORY_STILL_UNAVAILABLE, 2002, 2),
+        (logging.WARNING, EventId.DIRECTORY_SLOW, 2003, 2),
+        (logging.WARNING, EventId.DIRECTORY_NOT_CREATED, 2004, 2),
+        (logging.WARNING, EventId.FILE_ACCESS_ERROR, 3000, 2),
+        (logging.WARNING, EventId.OTHER_WARNING, 3001, 2),
+        (logging.ERROR, EventId.UNEXPECTED_ERROR, 4000, 1),
+        # Без кода — по уровню
+        (logging.WARNING, None, 3001, 2),
+        (logging.ERROR, None, 4000, 1),
+        (logging.CRITICAL, None, 4000, 1),
+    )
+
+    def test_every_code_checked(self):
+        """Проверить: в test_code_and_type есть каждый код."""
+        assert {case[1] for case in self.CODE_CASES} - {None} == set(EventId)
+
     @pytest.mark.parametrize(
-        ("level", "event_id", "expected_id", "expected_type"),
-        [
-            (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
-            (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
-            (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
-            (logging.WARNING, None, 3001, 2),
-            (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
-            (logging.ERROR, None, 4000, 1),
-            (logging.CRITICAL, None, 4000, 1),
-        ],
+        ("level", "event_id", "expected_id", "expected_type"), CODE_CASES
     )
     def test_code_and_type(
         self, event_logger, level, event_id, expected_id, expected_type
@@ -758,7 +776,9 @@ class TestEventLogHandler:
         handler = logging_setup.EventLogHandler()
         for i in range(105):
             handler.handle(
-                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": f"w{i}"})
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": f"w{i}", "event_id": 2000}
+                )
             )
         handler.send_startup_events()
         handler.close()
@@ -825,6 +845,61 @@ class TestEventLogHandler:
 
         assert [e[0] for e in reported(evtlog)] == [1005]
         evtlog.DeregisterEventSource.assert_called_once()
+
+    @pytest.mark.parametrize("discard", [False, True])
+    def test_lost_first_event_not_a_repeat(self, evtlog, discard):
+        """Проверить: запись, не попавшая в журнал событий из-за лимита
+        или сброса буфера, не считается потом повтором.
+        """
+        handler = logging_setup.EventLogHandler()
+        warning = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        if discard:
+            handler.handle(warning)
+            handler.discard_startup_events()
+        else:
+            for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
+                    )
+                )
+            handler.handle(warning)
+        handler.send_startup_events()
+        evtlog.ReportEvent.reset_mock()
+
+        handler.handle(warning)
+        handler.close()
+
+        assert reported(evtlog) == [(3001, 2, "app.t: w")]
+
+    def test_discard_keeps_repeats_and_overflow(self, evtlog, caplog):
+        """Проверить: после сброса буфера повторы, посчитанные до него,
+        не теряются, а ключ переполнения снова даёт событие с пометкой.
+        """
+        handler = logging_setup.EventLogHandler()
+
+        def warn(msg):
+            handler.handle(
+                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": msg})
+            )
+
+        warn("w")
+        warn("w")
+        for i in range(event_tracking.MAX_KEYS_PER_EVENT):
+            warn(f"вид {i}")
+        handler.discard_startup_events()
+
+        warn("w")
+        warn("ещё вид")
+        event_tracking.flush()
+        handler.close()
+
+        assert reported(evtlog) == [
+            (3001, 2, "app.t: w"),
+            (3001, 2, "app.t: ещё вид" + event_tracking.OVERFLOW_NOTE),
+        ]
+        # Повтор до сброса буфера — в итоговом напоминании
+        assert "Повторялось ещё 1 раз с прошлой записи: app.t: w" in caplog.text
 
 
 class TestWindowsLookups:

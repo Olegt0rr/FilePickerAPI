@@ -12,7 +12,7 @@ from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from app.event_tracking import EventId, is_tracked
+from app.event_tracking import OVERFLOW_NOTE, EventId, admit, is_tracked, mark_unsent
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,10 @@ class EventLogHandler(logging.Handler):
         # Текст форматируется при записи: буфер не держит ни аргументы,
         # ни трассировки с кадрами стека
         self._buffer: list[tuple[int, int, str]] | None = []
+        # Ключи повторов записей в буфере (None — ключ переполнения):
+        # при отбрасывании буфера первое событие придёт при следующем
+        # случае, а посчитанные повторы сохранятся
+        self._buffered_keys: list[tuple[int, tuple[str, str] | None]] = []
         self._dropped = 0
         # Идёт серия отказов ReportEvent: строка о ней уже в журнале
         self._report_failing = False
@@ -119,27 +123,54 @@ class EventLogHandler(logging.Handler):
         self.setFormatter(logging.Formatter("%(name)s: %(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Записать событие или отложить его в буфер."""
+        """Записать событие или отложить его в буфер.
+
+        Запись без явного кода идёт через учёт повторов с ключом
+        «логгер + шаблон сообщения»: иначе Uvicorn, который пишет о
+        каждом некорректном HTTP-запросе из сети, давал бы событие на
+        каждое соединение сканера портов.
+        """
         event_id = event_id_for(record)
         if event_id is None:
             return
-        if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
-            self._dropped += 1
-            return
         try:
-            text = self.format(record)
+            message = record.getMessage()
         except Exception:
             self.handleError(record)
             return
+        # Лимит буфера — до учёта повторов: отброшенная запись не
+        # должна занять ключ, иначе её первое событие не придёт никогда
+        if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
+            self._dropped += 1
+            return
+        note = ""
+        reason = None
+        if getattr(record, "event_id", None) is None:
+            reason = (record.name, str(record.msg))
+            note = admit(
+                event_id,
+                reason,
+                # Ключ — шаблон, а текст напоминания — первая запись
+                f"{record.name}: {message}",
+                record.levelno,
+            )
+            if note is None:
+                return
+        text = self.format(record) + note
         if self._buffer is None:
             self._report(record.levelno, event_id, text)
         else:
             self._buffer.append((record.levelno, event_id, text))
+            if reason is not None:
+                # Пометка у первого случая ключа переполнения
+                key = None if note == OVERFLOW_NOTE else reason
+                self._buffered_keys.append((event_id, key))
 
     def send_startup_events(self) -> None:
         """Отправить буфер; дальше события пишутся сразу."""
         with self.lock:
             buffered, self._buffer = self._buffer or [], None
+            self._buffered_keys = []
             if self._dropped:
                 note = _service_record(
                     f"Отброшено записей при запуске: {self._dropped}, "
@@ -157,6 +188,9 @@ class EventLogHandler(logging.Handler):
         with self.lock:
             self._buffer = None
             self._dropped = 0
+            keys, self._buffered_keys = self._buffered_keys, []
+            for event_id, reason in keys:
+                mark_unsent(event_id, reason)
 
     def _report(self, levelno: int, event_id: int, text: str) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
