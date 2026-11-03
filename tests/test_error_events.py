@@ -1,7 +1,9 @@
 """Тесты «одна ошибка — одно событие» на обработчиках и Uvicorn."""
 
+import asyncio
 import errno
 import logging
+import os
 import socket
 import sys
 import threading
@@ -18,6 +20,7 @@ from starlette.responses import FileResponse
 from uvicorn.protocols.utils import ClientDisconnected
 
 from app import event_tracking, logging_setup
+from app.handlers import files
 from tests.conftest import wait_for, win_error
 from tests.test_main import fail_stat_for, reload_app
 
@@ -160,6 +163,70 @@ class TestOneErrorOneEvent:
             assert client.get("/files").status_code == 200
         scandir.assert_called_once_with(files_dir)
 
+    def test_download_stat_calls_not_increased(self, client, files_dir):
+        """Учёт не добавляет обращений к файлу при скачивании: их
+        столько же, сколько у самих проверок обработчика (на Windows —
+        lstat, на других ОС — resolve() и stat). Сколько stat и lstat
+        внутри делает pathlib, зависит от версии Python.
+        """
+        path = files_dir / "a.txt"
+
+        def file_calls(action):
+            stat = mock.Mock(wraps=os.stat)
+            lstat = mock.Mock(wraps=os.lstat)
+            with mock.patch("os.stat", stat), mock.patch("os.lstat", lstat):
+                action()
+            calls = stat.call_args_list + lstat.call_args_list
+            return sum(Path(c.args[0]).name == "a.txt" for c in calls)
+
+        if sys.platform == "win32":
+            expected = file_calls(path.lstat)
+        else:
+            expected = file_calls(lambda: path.resolve().stat())
+        assert expected
+        assert file_calls(lambda: client.get("/files/a.txt")) == expected
+
+    def test_slow_scandir(self, client, clock, events):
+        """Медленный os.scandir — 2003 о списке."""
+        original = os.scandir
+
+        def slow_scandir(path):
+            clock.now += 11
+            return original(path)
+
+        with mock.patch("os.scandir", slow_scandir):
+            assert client.get("/files").status_code == 200
+        [(event_id, record)] = events()
+        assert event_id == 2003
+        assert "GET /files за 11.0 с" in record.getMessage()
+
+    def test_slow_file_stat(self, client, clock, events):
+        """Медленные атрибуты файла (lstat на Windows) — 2003 о
+        скачивании.
+        """
+        # Медленно только первое обращение к файлу: через os.stat или
+        # os.lstat — зависит от ОС и версии Python
+        slowed = []
+
+        def slower(original):
+            def call(path, *args, **kwargs):
+                if Path(path).name == "a.txt" and not slowed:
+                    slowed.append(path)
+                    clock.now += 11
+                return original(path, *args, **kwargs)
+
+            return call
+
+        with (
+            mock.patch("os.stat", slower(os.stat)),
+            mock.patch("os.lstat", slower(os.lstat)),
+        ):
+            assert client.get("/files/a.txt").status_code == 200
+        assert slowed
+        [(event_id, record)] = events()
+        assert event_id == 2003
+        assert record.getMessage().endswith("за 11.0 с, размер файла 9 байт")
+
 
 class TestTrackedFileResponse:
     """Чтение тела скачиваемого файла."""
@@ -198,9 +265,121 @@ class TestTrackedFileResponse:
         ):
             client.get("/files/a.txt")
         assert raised.value is error
-        assert [e for e, _ in events()] == [event_id]
+        [(sent_id, record)] = events()
+        assert sent_id == event_id
         assert event_tracking.is_tracked(error)
-        assert "200, ответ оборван" in events()[0][1].getMessage()
+        # Заголовки не отправлены — клиент получит 500
+        assert record.getMessage().endswith("Ответ клиенту: 500")
+        assert record.exc_info[1] is error
+
+    @pytest.mark.parametrize(
+        ("headers", "status"), [({}, 200), ({"Range": "bytes=0-3"}, 206)]
+    )
+    def test_body_error_after_headers(self, client, events, headers, status):
+        """Ошибка после заголовков — ответ оборван с их кодом."""
+        error = OSError(errno.EIO, "read failed")
+
+        async def failing_call(_self, _scope, _receive, send):
+            await send({"type": "http.response.start", "status": status, "headers": []})
+            raise error
+
+        with (
+            mock.patch.object(FileResponse, "__call__", failing_call),
+            pytest.raises(OSError, match="read failed"),
+        ):
+            client.get("/files/a.txt", headers=headers)
+        [(event_id, record)] = events()
+        assert event_id == 3000
+        assert record.getMessage().endswith(f"Ответ клиенту: {status}, ответ оборван")
+
+    @staticmethod
+    def send_file(files_dir, send, *, spec_version="2.4", receive=None):
+        """Отправить a.txt через TrackedFileResponse напрямую (ASGI)."""
+        path = files_dir / "a.txt"
+        response = files.TrackedFileResponse(
+            path=path,
+            stat_result=path.stat(),
+            file_id="a.txt",
+            directory=files_dir,
+            started=event_tracking.clock(),
+        )
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "headers": [],
+            "asgi": {"spec_version": spec_version},
+        }
+
+        async def no_receive():
+            await asyncio.Event().wait()
+
+        asyncio.run(response(scope, receive or no_receive, send))
+
+    @staticmethod
+    def make_unavailable(files_dir):
+        event_tracking.directory_error(files_dir, PermissionError("denied"), 403)
+
+    def test_disconnect_before_body_not_restored(self, files_dir, events):
+        """Клиент отключился после заголовков (ASGI 2.3): Starlette
+        возвращается без исключения, но тело не отправлено — 2001 нет.
+        """
+        self.make_unavailable(files_dir)
+        messages = []
+
+        async def send(message):
+            messages.append(message["type"])
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        self.send_file(files_dir, send, spec_version="2.3", receive=receive)
+        assert "http.response.start" in messages
+        assert [e for e, _ in events()] == [2000]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            BrokenPipeError(errno.EPIPE, "Broken pipe"),
+            win_error(64, ConnectionResetError),
+        ],
+    )
+    def test_client_send_error_no_event(self, files_dir, events, error):
+        """Ошибка отправки клиенту — не ошибка файла или папки."""
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise error
+
+        with pytest.raises(type(error), match=str(error.strerror)) as raised:
+            self.send_file(files_dir, send)
+        assert raised.value is error
+        assert events() == []
+        assert event_tracking.is_tracked(error)
+
+    def test_whole_body_restores(self, files_dir, events):
+        """Тело отправлено целиком — 2001."""
+        self.make_unavailable(files_dir)
+
+        async def send(_message):
+            pass
+
+        self.send_file(files_dir, send)
+        assert [e for e, _ in events()] == [2000, 2001]
+
+    def test_body_read_error_not_restored(self, client, events):
+        """Атрибуты читаются, тело — нет: 2001 нет, повторы не
+        пишутся; 2001 — после скачивания целиком.
+        """
+        with mock.patch("os.scandir", side_effect=PermissionError("denied")):
+            assert client.get("/files").status_code == 403
+        error = win_error(64)
+        with mock.patch.object(FileResponse, "__call__", side_effect=error):
+            for _ in range(3):
+                with pytest.raises(OSError, match=str(error.strerror)):
+                    client.get("/files/a.txt")
+        assert [e for e, _ in events()] == [2000, 2000]
+        assert client.get("/files/a.txt").status_code == 200
+        assert [e for e, _ in events()] == [2000, 2000, 2001]
 
     def test_client_disconnect_no_event(self, client, events):
         """Клиент оборвал скачивание — это не ошибка папки или файла."""

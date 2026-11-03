@@ -11,12 +11,12 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi==0.162.0",
     "uvicorn[standard]==0.54.0",
-    "pydantic==2.14.1",
-    "pydantic-settings==2.16.1",
+    "pydantic==2.14.2",
+    "pydantic-settings==2.16.2",
     # Транзитивная зависимость FastAPI (он допускает starlette>=0.46):
     # точная версия не даёт оставить уязвимую Starlette < 1.0.1 и
     # позволяет Dependabot видеть её advisory
-    "starlette==1.9.0",
+    "starlette==1.10.0",
     # Windows API для сборки: путь к exe (GetModuleFileName), а дальше
     # журнал событий, скрытое окно и права на папку (user-logon-autostart).
     # На других ОС не ставится, там сервис обходится без него
@@ -34,13 +34,13 @@ fallback_version = "0.0.0"
 
 [project.optional-dependencies]
 dev = [
-    "pytest==9.1.1",
+    "pytest==9.2.0",
     "httpx==0.28.1",
     "pytest-cov==7.1.0",
     "ruff>=0.14.9",
 ]
 build = [
-    "nuitka==4.3.1",
+    "nuitka==4.3.3",
 ]
 # Проверка зависимостей на известные уязвимости (.github/workflows/audit.yml).
 # Здесь, а не в workflow, чтобы версию обновлял Dependabot.

@@ -650,6 +650,7 @@ def list_files() -> FileListResponse:
     files_path = Path(get_settings().files_directory)
     # Замер без дополнительных обращений к ФС: время самого обработчика
     started = event_tracking.clock()
+    event_tracking.begin_access()
     try:
         # Один stat() вместо exists() + is_dir(): меньше обращений к
         # сетевой папке и одинаковое поведение на всех версиях Python
@@ -793,30 +794,59 @@ class TrackedFileResponse(FileResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Отправить файл с замером и учётом ошибок чтения."""
-        partial = False
+        # Тело читается уже после обработчика: своё обращение к папке
+        event_tracking.begin_access()
+        status: int | None = None
+        sent = False
+        client_error: OSError | None = None
 
         async def tracked_send(message: Message) -> None:
-            # 206 — отправлена часть файла (Range), и его размер в
-            # событии сбил бы с толку
-            nonlocal partial
+            nonlocal status, sent, client_error
+            try:
+                await send(message)
+            except OSError as e:
+                # Ошибка отправки клиенту, а не чтения файла
+                client_error = e
+                raise
             if message["type"] == "http.response.start":
-                partial = message["status"] == HTTPStatus.PARTIAL_CONTENT
-            await send(message)
+                status = message["status"]
+            # Тело отправлено целиком: последний кусок или pathsend.
+            # Клиент мог отключиться раньше (http.disconnect), и тогда
+            # Starlette возвращается без исключения, не дочитав файл
+            sent = message["type"] == "http.response.pathsend" or (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            )
 
         try:
             await super().__call__(scope, receive, tracked_send)
-        except ClientDisconnected as e:
-            # Клиент закрыл соединение: с папкой всё в порядке. Пометка
-            # «учтено» убирает событие и у обработчика Exception, и у
-            # записи uvicorn.error об этом исключении (в файле она есть)
-            event_tracking.mark_tracked(e)
-            raise
         except OSError as e:
-            event_tracking.file_error(
-                self._directory, self._file_id, e, "200, ответ оборван"
+            if isinstance(e, ClientDisconnected) or e is client_error:
+                # Клиент закрыл соединение: с папкой всё в порядке.
+                # Пометка «учтено» убирает событие и у обработчика
+                # Exception, и у записи uvicorn.error об этом исключении
+                # (в файле она есть)
+                event_tracking.mark_tracked(e)
+                raise
+            # Заголовки уже ушли — ответ оборван с их кодом (200 или
+            # 206), иначе Starlette ответит 500
+            reported: int | str = (
+                HTTPStatus.INTERNAL_SERVER_ERROR.value
+                if status is None
+                else f"{status}, ответ оборван"
             )
+            event_tracking.file_error(self._directory, self._file_id, e, reported)
             raise
+        else:
+            # Тело отправлено целиком — папка доступна. Не раньше: при
+            # стабильном сбое чтения 2001 по атрибутам файла давало бы
+            # пару 2001/2000 на каждый запрос
+            if sent:
+                event_tracking.directory_ok()
         finally:
+            # 206 — отправлена часть файла (Range), и его размер в
+            # событии сбил бы с толку
+            partial = status == HTTPStatus.PARTIAL_CONTENT
             size = None if partial else self.stat_result.st_size
             event_tracking.check_slow(DOWNLOAD_ROUTE, self._started, size=size)
 
@@ -842,6 +872,7 @@ def get_file(
     """
     files_directory = Path(get_settings().files_directory)
     started = event_tracking.clock()
+    event_tracking.begin_access()
     try:
         file_path, file_stat = _find_download(file_id, files_directory)
     except BaseException:
@@ -929,16 +960,17 @@ def _find_download(file_id: str, files_directory: Path) -> tuple[Path, os.stat_r
         file_path = _resolve_in_directory(candidate, files_directory, file_id)
         with _file_errors(file_id, files_directory):
             file_stat = file_path.stat()
-    # Атрибуты файла получены — папка доступна, даже если дальше
-    # ответ 400 или 403
-    event_tracking.directory_ok()
-
+    # Атрибуты файла получены — для ответа 400 или 403 папка доступна.
+    # Скачивание подтверждает это само, отправив тело целиком: так
+    # делает TrackedFileResponse
     if not S_ISREG(file_stat.st_mode):
+        event_tracking.directory_ok()
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
 
     # Проверяем, что файл доступен для загрузки
     if not check_file_availability(file_path, file_stat.st_size):
+        event_tracking.directory_ok()
         msg = "File is not available for download"
         raise HTTPException(status_code=403, detail=msg)
 
