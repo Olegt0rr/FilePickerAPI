@@ -14,6 +14,7 @@ from pathlib import Path
 
 from app.event_tracking import (
     UNSENT_ATTRIBUTE,
+    UNSENT_RETRY_SECONDS,
     EventId,
     OnUnsent,
     admit,
@@ -146,11 +147,15 @@ class EventLogHandler(logging.Handler):
             return
         # Лимит буфера — до учёта повторов: отброшенная запись не
         # должна занять ключ, иначе её первое событие не придёт никогда
+        on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
         if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
             self._dropped += 1
+            # Повторы этой записи учтены ещё в event_tracking (track,
+            # 2000): без пометки её событие не пришло бы никогда
+            if on_unsent is not None:
+                on_unsent(0)
             return
         note = ""
-        on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
         if getattr(record, "event_id", None) is None:
             reason = (record.name, str(record.msg))
             note = admit(
@@ -169,7 +174,7 @@ class EventLogHandler(logging.Handler):
             # Ключ уже занят: без пометки следующий случай считался бы
             # повтором уже записанного события
             if on_unsent is not None:
-                on_unsent()
+                on_unsent(UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
         if self._buffer is None:
@@ -200,7 +205,7 @@ class EventLogHandler(logging.Handler):
             self._dropped = 0
             for *_, on_unsent in buffered:
                 if on_unsent is not None:
-                    on_unsent()
+                    on_unsent(0)
 
     def _report(
         self, levelno: int, event_id: int, text: str, on_unsent: OnUnsent | None
@@ -232,7 +237,7 @@ class EventLogHandler(logging.Handler):
             )
         except Exception as e:
             if on_unsent is not None:
-                on_unsent()
+                on_unsent(UNSENT_RETRY_SECONDS)
             if not self._report_failing:
                 self._report_failing = True
                 logger.warning(

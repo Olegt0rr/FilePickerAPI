@@ -718,9 +718,9 @@ class TestEventLogHandler:
         handle_error.assert_called_once()
         evtlog.ReportEvent.assert_not_called()
 
-    def test_formatter_error_uses_handle_error(self, event_logger):
+    def test_formatter_error_uses_handle_error(self, event_logger, clock):
         """Проверить: сбой форматтера не выходит из handle(), а ключ
-        повторов не занят — такой же случай потом даёт событие.
+        повторов не занят — такой же случай через минуту даёт событие.
         """
         test_logger, evtlog = event_logger
         handler = test_logger.handlers[0]
@@ -732,22 +732,29 @@ class TestEventLogHandler:
 
         handle_error.assert_called_once()
         evtlog.ReportEvent.assert_not_called()
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
         test_logger.warning("отказ %s", 2)
         assert [e[2] for e in reported(evtlog)] == ["app.test_event_log: отказ 2"]
 
-    def test_report_error_resends_same_key(self, event_logger):
-        """Проверить: первое событие ключа не записалось — следующий
-        случай того же ключа снова даёт событие.
+    def test_report_error_resends_same_key(self, event_logger, clock):
+        """Проверить: первое событие ключа не записалось — случай в
+        течение минуты считается повтором без вызова ReportEvent, а
+        случай после неё снова даёт событие.
         """
         test_logger, evtlog = event_logger
         evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
 
-        for _ in range(3):
-            test_logger.warning("отказ %s", "сети")
+        test_logger.warning("отказ %s", "сети")
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS - 1)
+        test_logger.warning("отказ %s", "сети")
+        assert evtlog.ReportEvent.call_count == 1
+        clock.advance(1)
+        test_logger.warning("отказ %s", "сети")
+        test_logger.warning("отказ %s", "сети")
 
         assert evtlog.ReportEvent.call_count == 2
 
-    def test_report_error_resends_tracked_key(self, event_logger):
+    def test_report_error_resends_tracked_key(self, event_logger, clock):
         """Проверить: то же для ключа из event_tracking.track."""
         test_logger, evtlog = event_logger
         handler = test_logger.handlers[0]
@@ -755,7 +762,9 @@ class TestEventLogHandler:
         tracking_logger.addHandler(handler)
         evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
         try:
-            for _ in range(3):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+            clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+            for _ in range(2):
                 event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
         finally:
             tracking_logger.removeHandler(handler)
@@ -772,17 +781,75 @@ class TestEventLogHandler:
         yield evtlog
         tracking_logger.removeHandler(handler)
 
-    @pytest.mark.usefixtures("clock")
-    def test_report_error_resends_directory_unavailable(self, tracking_handler):
-        """Проверить: 2000 не записалось — следующий ошибочный ответ
-        пишет его снова, дальше — повторы без событий.
+    def test_report_error_resends_directory_unavailable(self, tracking_handler, clock):
+        """Проверить: 2000 не записалось — ошибочный ответ через минуту
+        пишет его снова с числом ответов, дальше — повторы без событий.
         """
         evtlog = tracking_handler
         evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
-        for _ in range(3):
+        for _ in range(2):
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        for _ in range(2):
             event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
 
-        assert [e[0] for e in reported(evtlog)] == [2000, 2000]
+        sent = reported(evtlog)
+        assert [e[0] for e in sent] == [2000, 2000]
+        assert "Ошибочных ответов с прошлой записи: 1 ([Errno 5] I/O)" in sent[1][2]
+
+    @pytest.mark.usefixtures("clock")
+    def test_restored_after_unsent_names_reason(self, tracking_handler, caplog):
+        """Проверить: 2000 так и не записалось — в 2001 есть причина."""
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [OSError("full"), None]
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_ok()
+
+        event_id, _, text = reported(evtlog)[-1]
+        assert event_id == 2001
+        assert text.endswith("Причина недоступности: [Errno 5] I/O")
+
+    def test_failed_reminder_keeps_unsent(self, tracking_handler, clock):
+        """Проверить: первое событие и напоминание не записались —
+        следующий случай пишется как первый, а не считается повтором.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = OSError("full")
+        for _ in range(2):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        clock.advance(60 * 60)
+        event_tracking.tick()
+        evtlog.ReportEvent.side_effect = None
+        evtlog.ReportEvent.reset_mock()
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+
+        assert [e[2] for e in reported(evtlog)] == ["app.event_tracking: отказ"]
+
+    @pytest.mark.usefixtures("clock")
+    def test_dropped_over_limit_resends(self, evtlog):
+        """Проверить: 2000, отброшенное сверх лимита буфера, пишется
+        при следующем ошибочном ответе.
+        """
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2004}
+                    )
+                )
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            handler.send_startup_events()
+            evtlog.ReportEvent.reset_mock()
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert [e[0] for e in reported(evtlog)] == [2000]
 
     def test_report_error_keeps_reminder_count(self, tracking_handler, clock):
         """Проверить: напоминание и 2002 не записались — их числа уходят
@@ -820,9 +887,9 @@ class TestEventLogHandler:
             "app.event_tracking: Повторялось ещё 3 раз с прошлой записи: отказ"
         )
 
-    def test_buffered_report_error_resends_key(self, evtlog):
+    def test_buffered_report_error_resends_key(self, evtlog, clock):
         """Проверить: событие из буфера не записалось при отправке —
-        следующий такой же случай снова даёт событие.
+        такой же случай через минуту снова даёт событие.
         """
         handler = logging_setup.EventLogHandler()
         test_logger = logging.getLogger("app.test_buffer")
@@ -831,6 +898,7 @@ class TestEventLogHandler:
             test_logger.warning("отказ")
             evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
             handler.send_startup_events()
+            clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
             test_logger.warning("отказ")
             test_logger.warning("отказ")
         finally:
