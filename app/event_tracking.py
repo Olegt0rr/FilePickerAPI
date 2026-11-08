@@ -79,8 +79,9 @@ _access_lock = threading.Lock()
 _access: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "directory_access", default=None
 )
-# Причина недоступности для оборванного ответа (вместо кода ответа)
-ABORTED_KEY = "ответ оборван"
+# Сколько flush ждёт идущий такт таймера: напоминание, которое такт
+# уже снял со счётчика, должно успеть записаться до 1001
+TIMER_JOIN_SECONDS = 1.0
 
 
 class EventId(IntEnum):
@@ -148,7 +149,8 @@ class _State:
     EventLogHandler вызывает admit под своей блокировкой, и запись под
     lock дала бы взаимную блокировку. Состояние директории меняется
     под directory_lock, и запись о нём идёт под ним же: так 2001 не
-    опередит 2000. EventLogHandler directory_lock не берёт.
+    опередит 2000. EventLogHandler directory_lock не берёт. Сбой
+    публикуется в directory ещё и под блокировкой номеров обращений.
     """
 
     def __init__(self) -> None:
@@ -210,6 +212,11 @@ def _repeat(entry: _Entry, note: str, now: float) -> str | None:
     return None
 
 
+def unsent_key(reason: Hashable, note: str) -> Hashable | None:
+    """Ключ для mark_unsent по пометке, которую вернул admit."""
+    return None if note == OVERFLOW_NOTE else reason
+
+
 def mark_unsent(event_id: int, reason: Hashable | None) -> None:
     """Отметить, что первое событие ключа так и не записано.
 
@@ -231,9 +238,17 @@ def _log(
     event_id: int | None,
     message: str,
     exc: BaseException | None = None,
+    *,
+    key: tuple[int, Hashable | None] | None = None,
 ) -> None:
-    """Записать строку; без кода — только в файл журнала."""
+    """Записать строку; без кода — только в файл журнала.
+
+    key — аргументы mark_unsent для ключа повторов этого события: если
+    событие не запишется, EventLogHandler отметит ключ неотправленным.
+    """
     extra = {"event_log": False} if event_id is None else {"event_id": event_id}
+    if event_id is not None and key is not None:
+        extra["event_key"] = key
     logger.log(level, "%s", message, exc_info=exc, extra=extra)
 
 
@@ -254,7 +269,8 @@ def track(
     if note is None:
         _log(level, None, message, exc)
     else:
-        _log(level, event_id, message + note, exc)
+        key = (event_id, unsent_key(reason, note))
+        _log(level, event_id, message + note, exc, key=key)
     if exc is not None:
         mark_tracked(exc)
 
@@ -320,11 +336,11 @@ def directory_error(
     """
     now = clock()
     access = _current_access()
-    # Оборванный ответ — одна причина, с каким бы кодом ни ушли
-    # заголовки: иначе чередование 200 и 206 (докачка по Range) давало
-    # бы 2000 на каждое переключение
-    status_key = ABORTED_KEY if isinstance(status, str) else status
-    reason = (status_key, _reason(error))
+    # Причина — код ошибки ОС, а код ответа только в тексте: иначе
+    # чередование ошибки списка (500) и обрыва скачивания, а также 200 и
+    # 206 (докачка по Range) при одной ошибке давало бы 2000 на каждое
+    # переключение
+    reason = _reason(error)
     description = describe_error(error)
     message = (
         f"Папка с файлами {directory} недоступна: {description}. "
@@ -334,8 +350,24 @@ def directory_error(
     # Запись — под той же блокировкой, что и решение: иначе 2001 из
     # параллельного успешного запроса мог бы опередить это 2000
     with _state.directory_lock:
-        state = _state.directory
-        if state is None and access < _state.last_ok_access:
+        # Проверка last_ok_access и публикация сбоя — под той же
+        # блокировкой номеров, под которой directory_ok обновляет
+        # last_ok_access и смотрит на состояние: иначе успех, пришедший
+        # между ними, не увидел бы сбоя, и папка осталась бы недоступной
+        with _access_lock:
+            state = _state.directory
+            stale = state is None and access < _state.last_ok_access
+            if state is None and not stale:
+                _state.directory = _Unavailable(
+                    str(directory),
+                    reason,
+                    description,
+                    now,
+                    now,
+                    errors=1,
+                    access=access,
+                )
+        if stale:
             # Обращение начато до другого, уже успешного: папка
             # доступна, ошибка — только в файл журнала
             _log(logging.WARNING, None, message, exc)
@@ -343,9 +375,6 @@ def directory_error(
             return
         if state is None:
             changed = True
-            _state.directory = _Unavailable(
-                str(directory), reason, description, now, now, errors=1, access=access
-            )
         else:
             # Ошибка обращения, начатого раньше последнего сбоя, —
             # повтор: причину она не меняет, иначе более старая
@@ -402,11 +431,14 @@ def directory_ok() -> None:
     делает: сбой мог случиться уже после него.
     """
     access = _current_access()
-    # Под короткой блокировкой номеров, а не directory_lock: успешные
-    # запросы не ждут записи о чужой ошибке
+    # Под короткой блокировкой номеров, а не directory_lock: пока папка
+    # доступна, успешные запросы не ждут записи о чужой ошибке. Сбой,
+    # опубликованный до этого, виден здесь; опубликованный после — уже
+    # видит новый last_ok_access
     with _access_lock:
         _state.last_ok_access = max(_state.last_ok_access, access)
-    if _state.directory is None:
+        unavailable = _state.directory is not None
+    if not unavailable:
         return
     with _state.directory_lock:
         state = _state.directory
@@ -547,7 +579,14 @@ def flush() -> None:
     """Итог при остановке: ненулевые счётчики и недоступная папка.
 
     Вызывается перед событием остановки (1001) или ошибки (1002).
+    Сначала останавливает таймер и ждёт идущий такт: он мог снять
+    счётчик и ещё не записать напоминание, а демонический поток при
+    выходе процесса прерывается.
     """
+    _state.timer_stop.set()
+    timer = _state.timer
+    if timer is not None and timer is not threading.current_thread():
+        timer.join(TIMER_JOIN_SECONDS)
     _remind(final=True)
 
 

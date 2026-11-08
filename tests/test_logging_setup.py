@@ -718,6 +718,69 @@ class TestEventLogHandler:
         handle_error.assert_called_once()
         evtlog.ReportEvent.assert_not_called()
 
+    def test_formatter_error_uses_handle_error(self, event_logger):
+        """Проверить: сбой форматтера не выходит из handle(), а ключ
+        повторов не занят — такой же случай потом даёт событие.
+        """
+        test_logger, evtlog = event_logger
+        handler = test_logger.handlers[0]
+        with (
+            mock.patch.object(handler, "handleError") as handle_error,
+            mock.patch.object(handler, "format", side_effect=ValueError("формат")),
+        ):
+            test_logger.warning("отказ %s", 1)
+
+        handle_error.assert_called_once()
+        evtlog.ReportEvent.assert_not_called()
+        test_logger.warning("отказ %s", 2)
+        assert [e[2] for e in reported(evtlog)] == ["app.test_event_log: отказ 2"]
+
+    def test_report_error_resends_same_key(self, event_logger):
+        """Проверить: первое событие ключа не записалось — следующий
+        случай того же ключа снова даёт событие.
+        """
+        test_logger, evtlog = event_logger
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+
+        for _ in range(3):
+            test_logger.warning("отказ %s", "сети")
+
+        assert evtlog.ReportEvent.call_count == 2
+
+    def test_report_error_resends_tracked_key(self, event_logger):
+        """Проверить: то же для ключа из event_tracking.track."""
+        test_logger, evtlog = event_logger
+        handler = test_logger.handlers[0]
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+        try:
+            for _ in range(3):
+                event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        finally:
+            tracking_logger.removeHandler(handler)
+
+        assert evtlog.ReportEvent.call_count == 2
+
+    def test_buffered_report_error_resends_key(self, evtlog):
+        """Проверить: событие из буфера не записалось при отправке —
+        следующий такой же случай снова даёт событие.
+        """
+        handler = logging_setup.EventLogHandler()
+        test_logger = logging.getLogger("app.test_buffer")
+        test_logger.addHandler(handler)
+        try:
+            test_logger.warning("отказ")
+            evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+            handler.send_startup_events()
+            test_logger.warning("отказ")
+            test_logger.warning("отказ")
+        finally:
+            test_logger.removeHandler(handler)
+            handler.close()
+
+        assert evtlog.ReportEvent.call_count == 2
+
     def test_startup_buffer_keeps_text_of_the_moment(self, evtlog):
         """Проверить: текст события — на момент записи, а не отправки
         буфера, и запись не держит исключение до отправки.
