@@ -762,6 +762,64 @@ class TestEventLogHandler:
 
         assert evtlog.ReportEvent.call_count == 2
 
+    @pytest.fixture
+    def tracking_handler(self, event_logger):
+        """EventLogHandler на логгере учёта ошибок."""
+        test_logger, evtlog = event_logger
+        handler = test_logger.handlers[0]
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        yield evtlog
+        tracking_logger.removeHandler(handler)
+
+    @pytest.mark.usefixtures("clock")
+    def test_report_error_resends_directory_unavailable(self, tracking_handler):
+        """Проверить: 2000 не записалось — следующий ошибочный ответ
+        пишет его снова, дальше — повторы без событий.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+        for _ in range(3):
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2000]
+
+    def test_report_error_keeps_reminder_count(self, tracking_handler, clock):
+        """Проверить: напоминание и 2002 не записались — их числа уходят
+        следующим напоминанием, а не теряются.
+        """
+        evtlog = tracking_handler
+        for _ in range(3):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        clock.advance(60 * 60)
+        evtlog.ReportEvent.side_effect = OSError("full")
+        event_tracking.tick()
+        evtlog.ReportEvent.side_effect = None
+        event_tracking.flush()
+
+        texts = [e[2] for e in reported(evtlog)]
+        assert (
+            "app.event_tracking: Повторялось ещё 2 раз с прошлой записи: отказ" in texts
+        )
+        assert texts[-1].endswith("Ошибочных ответов с прошлой записи: 2")
+
+    @pytest.mark.usefixtures("clock")
+    def test_persistent_report_error_counts_repeats(self, tracking_handler):
+        """Проверить: пока журнал событий отказывает, случаи считаются
+        и уходят напоминанием, когда он снова работает.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = OSError("full")
+        for _ in range(3):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        evtlog.ReportEvent.side_effect = None
+        event_tracking.flush()
+
+        assert [e[2] for e in reported(evtlog)][-1] == (
+            "app.event_tracking: Повторялось ещё 3 раз с прошлой записи: отказ"
+        )
+
     def test_buffered_report_error_resends_key(self, evtlog):
         """Проверить: событие из буфера не записалось при отправке —
         следующий такой же случай снова даёт событие.
@@ -961,8 +1019,9 @@ class TestEventLogHandler:
             (3001, 2, "app.t: w"),
             (3001, 2, "app.t: ещё вид" + event_tracking.OVERFLOW_NOTE),
         ]
-        # Повтор до сброса буфера — в итоговом напоминании
-        assert "Повторялось ещё 1 раз с прошлой записи: app.t: w" in caplog.text
+        # Отброшенный случай и повтор до сброса буфера — в итоговом
+        # напоминании
+        assert "Повторялось ещё 2 раз с прошлой записи: app.t: w" in caplog.text
 
 
 class TestWindowsLookups:

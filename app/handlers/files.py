@@ -438,15 +438,15 @@ def _file_errors(file_id: str, directory: Path) -> Iterator[None]:
             status, msg = 403, "Permission denied when reading file"
         else:
             status, msg = 500, "OS error when reading file"
-        # «Сетевой путь не найден» на Windows — тоже FileNotFoundError,
-        # но это недоступность папки, а не отсутствующий файл
-        if not missing or event_tracking.is_network_error(e):
+        # «Сетевой путь не найден» и ERROR_PATH_NOT_FOUND (пропала сама
+        # папка, отключён диск) на Windows — тоже FileNotFoundError, но
+        # это недоступность папки (2000), а не отсутствующий файл
+        if not missing or event_tracking.is_directory_error(e):
             event_tracking.file_error(directory, file_id, e, status)
         elif getattr(e, "winerror", None) == _ERROR_FILE_NOT_FOUND:
             # Файла нет, но папка ответила: она доступна. Только по
-            # этому коду: пропавшая папка или отключённый диск дают
-            # ERROR_PATH_NOT_FOUND (3), а на других ОС ENOENT не
-            # отличает пропавшую папку от пропавшего файла
+            # этому коду: на других ОС ENOENT не отличает пропавшую
+            # папку от пропавшего файла
             event_tracking.directory_ok()
         raise HTTPException(status_code=status, detail=msg) from e
 
@@ -834,7 +834,7 @@ class TrackedFileResponse(FileResponse):
                 if status is None
                 else f"{status}, ответ оборван"
             )
-            if not event_tracking.is_network_error(e):
+            if not event_tracking.is_directory_error(e):
                 # Ошибка самого файла (например, его ещё пишут): папка
                 # ответила, как и при ответе 400/403 по атрибутам
                 event_tracking.directory_ok()

@@ -8,18 +8,20 @@
 import logging
 import sys
 import time
-from collections.abc import Hashable
 from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from app.event_tracking import EventId, admit, is_tracked, mark_unsent, unsent_key
+from app.event_tracking import (
+    UNSENT_ATTRIBUTE,
+    EventId,
+    OnUnsent,
+    admit,
+    is_tracked,
+    unsent_callback,
+)
 
 logger = logging.getLogger(__name__)
-
-# Аргументы mark_unsent: код события и ключ повторов (None — ключ
-# переполнения); None — у события нет ключа повторов
-_UnsentKey = tuple[int, Hashable | None] | None
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 # Логгеры, которые пишут с уровня INFO (uvicorn.access — журнал
@@ -115,11 +117,11 @@ class EventLogHandler(logging.Handler):
         self._win32evtlog = win32evtlog
         self._source = win32evtlog.RegisterEventSource(None, EVENT_SOURCE)
         # Текст форматируется при записи: буфер не держит ни аргументы,
-        # ни трассировки с кадрами стека. У записи — ключ повторов
-        # (аргументы mark_unsent) или None: если событие отброшено или
-        # не записалось, первое событие придёт при следующем случае, а
+        # ни трассировки с кадрами стека. У записи — что сделать, если
+        # событие отброшено или не записалось (см. event_tracking._log):
+        # тогда первое событие придёт при следующем случае, а
         # посчитанные повторы сохранятся
-        self._buffer: list[tuple[int, int, str, _UnsentKey]] | None = []
+        self._buffer: list[tuple[int, int, str, OnUnsent | None]] | None = []
         self._dropped = 0
         # Идёт серия отказов ReportEvent: строка о ней уже в журнале
         self._report_failing = False
@@ -148,7 +150,7 @@ class EventLogHandler(logging.Handler):
             self._dropped += 1
             return
         note = ""
-        key = getattr(record, "event_key", None)
+        on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
         if getattr(record, "event_id", None) is None:
             reason = (record.name, str(record.msg))
             note = admit(
@@ -160,20 +162,20 @@ class EventLogHandler(logging.Handler):
             )
             if note is None:
                 return
-            key = (event_id, unsent_key(reason, note))
+            on_unsent = unsent_callback(event_id, reason, note)
         try:
             text = self.format(record) + note
         except Exception:
             # Ключ уже занят: без пометки следующий случай считался бы
             # повтором уже записанного события
-            if key is not None:
-                mark_unsent(*key)
+            if on_unsent is not None:
+                on_unsent()
             self.handleError(record)
             return
         if self._buffer is None:
-            self._report(record.levelno, event_id, text, key)
+            self._report(record.levelno, event_id, text, on_unsent)
         else:
-            self._buffer.append((record.levelno, event_id, text, key))
+            self._buffer.append((record.levelno, event_id, text, on_unsent))
 
     def send_startup_events(self) -> None:
         """Отправить буфер; дальше события пишутся сразу."""
@@ -188,26 +190,28 @@ class EventLogHandler(logging.Handler):
                     (note.levelno, EventId.OTHER_WARNING, self.format(note), None)
                 )
                 self._dropped = 0
-            for levelno, event_id, text, key in buffered:
-                self._report(levelno, event_id, text, key)
+            for levelno, event_id, text, on_unsent in buffered:
+                self._report(levelno, event_id, text, on_unsent)
 
     def discard_startup_events(self) -> None:
         """Отбросить буфер; дальше события пишутся сразу."""
         with self.lock:
             buffered, self._buffer = self._buffer or [], None
             self._dropped = 0
-            for *_, key in buffered:
-                if key is not None:
-                    mark_unsent(*key)
+            for *_, on_unsent in buffered:
+                if on_unsent is not None:
+                    on_unsent()
 
-    def _report(self, levelno: int, event_id: int, text: str, key: _UnsentKey) -> None:
+    def _report(
+        self, levelno: int, event_id: int, text: str, on_unsent: OnUnsent | None
+    ) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
 
         Вместо трассировки handleError в stderr на каждое событие —
         одна строка на серию отказов в файл журнала и консоль (не в
-        журнал событий), сама запись в файле журнала уже есть. Ключ
-        повторов незаписанного события отмечается неотправленным:
-        следующий такой же случай снова даст событие.
+        журнал событий), сама запись в файле журнала уже есть. Для
+        незаписанного события вызывается on_unsent: следующий такой же
+        случай снова даст событие, а число повторов не потеряется.
         """
         if levelno >= logging.ERROR:
             event_type = self._win32evtlog.EVENTLOG_ERROR_TYPE
@@ -227,8 +231,8 @@ class EventLogHandler(logging.Handler):
                 None,
             )
         except Exception as e:
-            if key is not None:
-                mark_unsent(*key)
+            if on_unsent is not None:
+                on_unsent()
             if not self._report_failing:
                 self._report_failing = True
                 logger.warning(

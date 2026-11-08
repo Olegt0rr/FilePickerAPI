@@ -5,6 +5,7 @@ import errno
 import logging
 import sys
 import threading
+import time
 import types
 from unittest import mock
 
@@ -586,4 +587,20 @@ class TestTimer:
             3000,
             "Повторялось ещё 1 раз с прошлой записи: отказ",
         )
-        assert not event_tracking._state.timer.is_alive()  # noqa: SLF001
+        # Таймер работает дальше: flush бывает и перед повтором запуска
+        assert event_tracking._state.timer.is_alive()  # noqa: SLF001
+
+    @pytest.mark.usefixtures("clock")
+    def test_flush_without_wait(self, records):
+        """wait=0 (срочная остановка): идущий такт не ждём."""
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        lock = event_tracking._state.remind_lock  # noqa: SLF001 - замок такта
+        lock.acquire()
+        try:
+            started = time.monotonic()
+            event_tracking.flush(wait=0)
+            assert time.monotonic() - started < 0.5
+        finally:
+            lock.release()
+        assert events(records)[1][1].startswith("Повторялось ещё 1 раз")
