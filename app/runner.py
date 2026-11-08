@@ -13,7 +13,6 @@
 настройки читаются только в create_app(), после настройки журнала.
 """
 
-import asyncio
 import errno
 import getpass
 import importlib
@@ -218,10 +217,12 @@ class InstanceServer(uvicorn.Server):
             self.errors.active = False
             # 1000 встаёт в конец буфера синхронно, до первого запроса:
             # события запросов (2000, 4000) его не опередят. А сама
-            # отправка буфера (до 100 ReportEvent) идёт вне цикла и
-            # первые запросы не задерживает
+            # отправка буфера (до 100 ReportEvent) идёт в своём потоке
+            # без ожидания: зависший ReportEvent не держит запуск
             self.service.on_started()
-            await asyncio.to_thread(send_startup_events)
+            threading.Thread(
+                target=send_startup_events, name="startup-events", daemon=True
+            ).start()
 
 
 class Service:

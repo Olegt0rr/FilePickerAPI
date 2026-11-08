@@ -1053,3 +1053,48 @@ class TestEventIds:
         assert not is_tracked(None)
         mark_tracked(error)
         assert is_tracked(error)
+
+
+class TestHungReportEvent:
+    """Зависший ReportEvent держит один поток, а не всех."""
+
+    def test_other_threads_do_not_wait(self, event_logger, monkeypatch):
+        """Проверить: пока ReportEvent висит в одном потоке, запись из
+        другого не ждёт, сброс ждёт ограниченное время, а после ответа
+        оба события записаны по порядку.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.1)
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            entered.set()
+            release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        thread = threading.Thread(target=test_logger.warning, args=("первое",))
+        thread.start()
+        try:
+            assert entered.wait(5)
+            started = time.monotonic()
+            test_logger.warning("второе")
+            [handler] = test_logger.handlers
+            handler.flush()
+            assert time.monotonic() - started < 2
+            assert evtlog.ReportEvent.call_count == 1
+        finally:
+            release.set()
+            thread.join(5)
+        texts = [text for _, _, text in reported(evtlog)]
+        assert texts == ["app.test_event_log: первое", "app.test_event_log: второе"]
+
+    def test_queue_limit(self, event_logger, monkeypatch):
+        """Проверить: очередь при зависшем ReportEvent ограничена."""
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_QUEUE_LIMIT", 2)
+        [handler] = test_logger.handlers
+        with handler._report_lock:  # noqa: SLF001 - замок записи
+            for number in range(5):
+                test_logger.warning("событие %s", number, extra={"event_id": 2000})
+        handler.flush()
+        assert evtlog.ReportEvent.call_count == 2

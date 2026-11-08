@@ -258,6 +258,36 @@ class TestStart:
         assert answers == ["File Picker API"]
         assert event_ids(evtlog) == [1000, 1001]
 
+    @pytest.mark.usefixtures("port")
+    def test_hung_report_event(self, evtlog, monkeypatch):
+        """Проверить с настоящим Uvicorn: зависший ReportEvent не
+        мешает старту — сервис отвечает, остановка завершается в срок,
+        а события дописываются, когда журнал событий ответит.
+        """
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.1)
+        release = threading.Event()
+        evtlog.ReportEvent.side_effect = lambda *_: release.wait(10)
+        answers = []
+
+        def ask_and_stop(service):
+            response = httpx.get(f"http://127.0.0.1:{runner.PORT}/openapi.json")
+            answers.append(response.json()["info"]["title"])
+            service.request_stop("тест")
+
+        def on_started(service):
+            original(service)
+            threading.Thread(target=ask_and_stop, args=(service,)).start()
+
+        original = runner.Service.on_started
+        monkeypatch.setattr(runner.Service, "on_started", on_started)
+        try:
+            assert runner.run() == 0
+            assert answers == ["File Picker API"]
+            assert event_ids(evtlog) == [1000]
+        finally:
+            release.set()
+        wait_for(lambda: event_ids(evtlog) == [1000, 1001])
+
     @pytest.mark.usefixtures("files_dir")
     def test_directory_not_created(self, evtlog):
         """Проверить: ошибка mkdir — 2004 с ошибкой, без исключения."""
