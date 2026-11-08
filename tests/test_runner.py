@@ -1069,6 +1069,35 @@ class TestUrgentStop:
         # Затем главный поток доходит до остановки сам
         assert result == {"code": 0}
 
+    def test_exits_with_lock_held(self, service_env):
+        """Проверить: замок сервиса занят другим потоком — обработчик
+        всё равно завершает процесс в срок, а запрос остановки
+        выполняется, когда замок освободится.
+        """
+        service = runner.Service(console=True)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with service.lock:
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        try:
+            wait_for(held.is_set)
+            with mock.patch.object(runner, "URGENT_EXIT_SECONDS", 0.05):
+                service.urgent_stop("закрытие консоли")
+            assert service_env.exits == [0]
+            assert not service.stop_requested.is_set()
+        finally:
+            release.set()
+            holder.join(5)
+        wait_for(service.stop_requested.is_set)
+        assert service.stop_reason == "закрытие консоли"
+        assert service.urgent
+
     def test_after_failure(self, service_env):
         """Проверить: срочный сигнал после сбоя ничего не останавливает
         и при зависшем выходе завершает процесс с кодом сбоя.
@@ -1279,6 +1308,31 @@ class TestCompiledExe:
         monkeypatch.setattr(runner.InstanceServer, "run", serve)
         assert runner.run() == 0
         assert event_ids(evtlog) == [1000, 1003, 1001]
+
+    @pytest.mark.usefixtures("port", "fake_serve", "compiled_exe")
+    def test_write_longer_than_close_wait(self, evtlog, monkeypatch, caplog):
+        """Проверить: запись 1003, начатая до закрытия, но задержанная
+        дольше EVENTS_LOCK_SECONDS, — после 1001 только в файл.
+        """
+        monkeypatch.setattr(runner, "PERMISSIONS_WAIT_SECONDS", 0.01)
+        monkeypatch.setattr(runner, "EVENTS_LOCK_SECONDS", 0.05)
+        go = threading.Event()
+        handle = runner.logger.handle
+
+        def slow_handle(record):
+            # Запись уже создана, флаг события в ней задан
+            if getattr(record, "event_id", None) == 1003:
+                go.wait(5)
+            handle(record)
+
+        monkeypatch.setattr(runner.logger, "handle", slow_handle)
+        try:
+            assert runner.run() == 0
+        finally:
+            go.set()
+        wait_for(checks_finished)
+        assert event_ids(evtlog) == [1000, 1001]
+        assert "нарушения" in caplog.text
 
     @pytest.mark.usefixtures("port", "fake_serve")
     def test_late_check_only_to_file(self, compiled_exe, evtlog, monkeypatch, caplog):

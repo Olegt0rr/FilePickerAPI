@@ -52,8 +52,13 @@ def event_id_for(record: logging.LogRecord) -> int | None:
     (extra={"event_log": False}) и записи с уже учтённым исключением
     событий не дают. Код берётся из extra={"event_id": …}; без него —
     4000 для ERROR и выше, 3001 для WARNING, INFO без кода не идёт.
+    Флаг может быть функцией: она вызывается при обработке записи под
+    замком обработчика, а не при её создании.
     """
-    if record.name == "uvicorn.access" or getattr(record, "event_log", True) is False:
+    event_log = getattr(record, "event_log", True)
+    if callable(event_log):
+        event_log = event_log()
+    if record.name == "uvicorn.access" or event_log is False:
         return None
     if record.exc_info and is_tracked(record.exc_info[1]):
         return None

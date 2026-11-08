@@ -607,6 +607,7 @@ class TestEventLogHandler:
             ("app.test_event_log", logging.INFO, {}),
             ("app.test_event_log", logging.WARNING, {"event_log": False}),
             ("app.test_event_log", logging.ERROR, {"event_log": False}),
+            ("app.test_event_log", logging.WARNING, {"event_log": lambda: False}),
         ],
     )
     def test_not_in_event_log(self, event_logger, name, level, extra):
@@ -620,6 +621,15 @@ class TestEventLogHandler:
         )
         handler.handle(record)
         evtlog.ReportEvent.assert_not_called()
+
+    def test_flag_checked_on_emit(self, event_logger):
+        """Проверить: флаг-функция вызывается при обработке записи."""
+        test_logger, evtlog = event_logger
+        allowed = []
+        test_logger.warning("m", extra={"event_log": lambda: bool(allowed)})
+        allowed.append(True)
+        test_logger.warning("m", extra={"event_log": lambda: bool(allowed)})
+        assert evtlog.ReportEvent.call_count == 1
 
     def test_traceback_in_text(self, event_logger):
         """Проверить: трассировка исключения — в тексте события."""

@@ -386,11 +386,22 @@ class Service:
         остановка с долгим ожиданием), его завершает сам обработчик:
         закрытие консоли Windows ждёт не дольше 5 секунд. Возвращается,
         только если _exit подменён (тесты).
+
+        Сам запрос идёт в отдельном потоке: он ждёт замок сервиса без
+        срока, а отсчёт 4,5 секунды должен идти от сигнала, даже если
+        замок занят.
         """
-        self.request_stop(reason, urgent=True)
+        threading.Thread(
+            target=self.request_stop,
+            args=(reason,),
+            kwargs={"urgent": True},
+            name="urgent-stop",
+            daemon=True,
+        ).start()
         if not self.finished.wait(URGENT_EXIT_SECONDS):
-            # Исход уже записан: этим запросом или раньше
-            _exit(self.outcome.exit_code)
+            # Без исхода запрос ещё ждёт замок: это всё равно остановка
+            outcome = self.outcome or Outcome.STOP
+            _exit(outcome.exit_code)
 
     def _wait_for(self, finished: Callable[[], bool], seconds: float) -> None:
         """Ждать finished() не дольше seconds и срока остановки.
@@ -423,11 +434,21 @@ class Service:
                         exc_info=error,
                         extra={
                             "event_id": EventId.BUILD_FOLDER_PERMISSIONS,
-                            "event_log": not self.events_closed,
+                            "event_log": self._events_open,
                         },
                     )
         finally:
             self._thread_finished("permissions_finished")
+
+    def _events_open(self) -> bool:
+        """Можно ли 1003 в журнал событий.
+
+        Вызывается обработчиком журнала событий при отправке под его
+        замком, а последнее событие (1001, 1002) пишется после закрытия
+        под тем же замком: запись, задержанная дольше срока ожидания
+        _close_events(), уйдёт только в файл.
+        """
+        return not self.events_closed
 
     def _close_events(self) -> None:
         """Дождаться проверки прав и закрыть журнал событий для неё.
