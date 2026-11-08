@@ -21,7 +21,7 @@ from uvicorn.protocols.utils import ClientDisconnected
 
 from app import event_tracking, logging_setup
 from app.handlers import files
-from tests.conftest import wait_for, win_error
+from tests.conftest import flush_event_logs, wait_for, win_error
 from tests.test_main import fail_stat_for, reload_app
 
 
@@ -544,6 +544,7 @@ def test_reminder_has_formatted_text(event_log, clock):
     clock.advance(3600)
     event_tracking.tick()
 
+    flush_event_logs()
     texts = [call.args[5][0] for call in event_log.call_args_list]
     assert texts == [
         "uvicorn.error: Exceeded concurrency limit 5.",
@@ -555,6 +556,7 @@ def test_reminder_has_formatted_text(event_log, clock):
 
 
 def reported_ids(report_event):
+    flush_event_logs()
     return [call.args[3] for call in report_event.call_args_list]
 
 

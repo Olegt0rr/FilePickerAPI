@@ -42,7 +42,8 @@ TRUNCATED_NOTE = "\n… (обрезано, полный текст в FilePicker
 STARTUP_BUFFER_LIMIT = 100
 # Ожидание замка обработчика при сбросе журнала перед выходом
 FLUSH_LOCK_SECONDS = 1.0
-# Ожидание записи очереди журнала событий при сбросе перед выходом
+# Ожидание записи очереди журнала событий при сбросе перед выходом и
+# при закрытии обработчика
 EVENT_FLUSH_SECONDS = 3.0
 # Сколько событий держать в очереди, пока ReportEvent не отвечает;
 # остальные есть в файле журнала
@@ -115,16 +116,30 @@ class EventLogHandler(logging.Handler):
     роняет запрос: о серии отказов пишется одна строка в файл журнала,
     а сами записи в нём уже есть.
 
-    ReportEvent вызывается вне замка обработчика: события встают в
-    очередь, и пишет её тот поток, которому достался замок записи.
-    Остальные потоки его не ждут, поэтому зависший ReportEvent (служба
-    журнала событий не отвечает) держит только один поток, а не
-    запуск Uvicorn и все запросы с событиями.
+    ReportEvent вызывается только в потоке-писателе: события встают в
+    очередь, и ни один другой поток записи не ждёт. Зависший ReportEvent
+    (служба журнала событий не отвечает) держит только писателя, а не
+    цикл событий Uvicorn, запуск и запросы. Очередь ограничена
+    EVENT_QUEUE_LIMIT; о событиях сверх неё пишется одна пометка, когда
+    очередь опустеет. Очередь и писатель — под своим замком, а не под
+    замком обработчика: его держит flush_handlers, пока ждёт очередь.
     """
 
     def __init__(self) -> None:
         """Открыть источник событий FilePickerAPI."""
         super().__init__()
+        # До открытия источника: обработчик попадает в список logging
+        # уже в super().__init__, и logging.shutdown закроет его, даже
+        # если источник не открылся
+        # События для ReportEvent по порядку и состояние писателя;
+        # меняются под self._ready
+        self._ready = threading.Condition(threading.Lock())
+        self._pending: deque[tuple[int, int, str]] = deque()
+        self._lost = 0
+        self._busy = False
+        self._closing = False
+        self._writer: threading.Thread | None = None
+        self._source = None
         import win32evtlog
 
         self._win32evtlog = win32evtlog
@@ -137,17 +152,12 @@ class EventLogHandler(logging.Handler):
         self._discarded = False
         # Идёт серия отказов ReportEvent: строка о ней уже в журнале
         self._report_failing = False
-        # События для ReportEvent по порядку; меняется под self.lock
-        self._pending: deque[tuple[int, int, str]] = deque()
-        self._report_lock = threading.Lock()
         # Время и уровень Event Viewer показывает сам
         self.setFormatter(logging.Formatter("%(name)s: %(message)s"))
-
-    def handle(self, record: logging.LogRecord) -> bool:
-        """Принять запись под замком, а писать очередь — после него."""
-        result = super().handle(record)
-        self._drain()
-        return bool(result)
+        # Запись без события не берёт замок обработчика: строку об
+        # отказе ReportEvent пишет писатель, пока flush_handlers держит
+        # этот замок и ждёт очередь
+        self.addFilter(lambda record: event_id_for(record) is not None)
 
     def emit(self, record: logging.LogRecord) -> None:
         """Поставить событие в очередь или отложить его в буфер.
@@ -157,9 +167,8 @@ class EventLogHandler(logging.Handler):
         каждом некорректном HTTP-запросе из сети, давал бы событие на
         каждое соединение сканера портов.
         """
-        event_id = event_id_for(record)
-        if event_id is None:
-            return
+        # Записи без события отсеял фильтр обработчика
+        event_id = int(event_id_for(record) or 0)
         outcome = getattr(record, "outcome", False)
         if self._discarded and not outcome:
             return
@@ -192,8 +201,8 @@ class EventLogHandler(logging.Handler):
         text = self.format(record) + note
         if self._buffer is not None:
             self._buffer.append((record.levelno, event_id, text))
-        elif len(self._pending) < EVENT_QUEUE_LIMIT:
-            self._pending.append((record.levelno, event_id, text))
+        else:
+            self._enqueue([(record.levelno, event_id, text)])
 
     def send_startup_events(self) -> None:
         """Отправить буфер; дальше события пишутся сразу."""
@@ -208,8 +217,7 @@ class EventLogHandler(logging.Handler):
                     (note.levelno, EventId.OTHER_WARNING, self.format(note))
                 )
                 self._dropped = 0
-            self._pending.extend(buffered)
-        self._drain()
+            self._enqueue(buffered)
 
     def discard_startup_events(self) -> None:
         """Отбросить буфер; дальше пишутся только записи исхода.
@@ -223,35 +231,56 @@ class EventLogHandler(logging.Handler):
             self._dropped = 0
 
     def flush(self) -> None:
-        """Дописать очередь, ожидая замок записи ограниченное время."""
-        self._drain(EVENT_FLUSH_SECONDS)
+        """Дождаться записи очереди не дольше EVENT_FLUSH_SECONDS."""
+        with self._ready:
+            self._ready.wait_for(
+                lambda: not (self._pending or self._busy), EVENT_FLUSH_SECONDS
+            )
 
-    def _pop(self) -> tuple[int, int, str] | None:
-        with self.lock:
-            return self._pending.popleft() if self._pending else None
+    def _enqueue(self, items: list[tuple[int, int, str]]) -> None:
+        """Поставить события в очередь и разбудить писателя."""
+        with self._ready:
+            if self._closing:
+                return
+            free = max(EVENT_QUEUE_LIMIT - len(self._pending), 0)
+            self._pending.extend(items[:free])
+            self._lost += len(items) - len(items[:free])
+            if self._writer is None:
+                self._writer = threading.Thread(
+                    target=self._write, name="event-log-writer", daemon=True
+                )
+                self._writer.start()
+            self._ready.notify_all()
 
-    def _drain(self, timeout: float = 0) -> None:
-        """Записать очередь, если её не пишет другой поток.
+    def _lost_note(self) -> tuple[int, int, str]:
+        note = _service_record(
+            f"Отброшено событий, пока журнал событий не отвечал: {self._lost}, "
+            "они есть в файле журнала"
+        )
+        self._lost = 0
+        return note.levelno, EventId.OTHER_WARNING, self.format(note)
 
-        Поток с замком записи пишет и события, добавленные за это время
-        другими потоками: после снятия замка очередь проверяется ещё
-        раз. timeout — сколько ждать замок (сброс перед выходом).
+    def _write(self) -> None:
+        """Писать очередь до закрытия, затем закрыть источник событий.
+
+        Источник закрывает писатель: так ReportEvent не получит
+        освобождённый дескриптор, даже если закрытие его не дождалось.
         """
         while True:
-            if timeout:
-                acquired = self._report_lock.acquire(timeout=timeout)
-            else:
-                acquired = self._report_lock.acquire(blocking=False)
-            if not acquired:
-                return
-            try:
-                while (item := self._pop()) is not None:
-                    self._report(*item)
-            finally:
-                self._report_lock.release()
-            with self.lock:
-                if not self._pending:
-                    return
+            with self._ready:
+                self._busy = False
+                self._ready.notify_all()
+                while not self._pending and not self._lost and not self._closing:
+                    self._ready.wait()
+                if self._pending:
+                    item = self._pending.popleft()
+                elif self._lost:
+                    item = self._lost_note()
+                else:
+                    break
+                self._busy = True
+            self._report(*item)
+        self._deregister()
 
     def _report(self, levelno: int, event_id: int, text: str) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
@@ -290,11 +319,24 @@ class EventLogHandler(logging.Handler):
         self._report_failing = False
 
     def close(self) -> None:
-        """Закрыть источник событий."""
+        """Дописать очередь (не дольше EVENT_FLUSH_SECONDS) и закрыть.
+
+        С писателем источник закрывает он сам, когда допишет очередь.
+        """
+        with self._ready:
+            self._closing = True
+            writer = self._writer
+            self._ready.notify_all()
+        if writer is None:
+            self._deregister()
+        else:
+            writer.join(EVENT_FLUSH_SECONDS)
+        super().close()
+
+    def _deregister(self) -> None:
         source, self._source = self._source, None
         if source is not None:
             self._win32evtlog.DeregisterEventSource(source)
-        super().close()
 
 
 class LogFileHandler(TimedRotatingFileHandler):

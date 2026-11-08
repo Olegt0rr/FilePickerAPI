@@ -15,6 +15,7 @@ import pytest
 
 from app import event_tracking, logging_setup
 from app.event_tracking import EventId, is_tracked, mark_tracked
+from tests.conftest import flush_event_logs, wait_for
 from tests.platforms import windows_only
 
 # Настоящие функции: conftest подменяет их в каждом тесте
@@ -40,6 +41,7 @@ def fake_win32evtlog():
 def reported(evtlog):
     """События, переданные в ReportEvent: (код, тип, текст)."""
     events = []
+    flush_event_logs()
     for call in evtlog.ReportEvent.call_args_list:
         source, event_type, category, event_id, sid, strings, data = call.args
         assert (source, category, sid, data) == ("source-handle", 0, None, None)
@@ -243,6 +245,7 @@ class TestSetupLogging:
         )
         logging_setup.setup_logging(console=False)
         evtlog.RegisterEventSource.assert_called_once_with(None, "FilePickerAPI")
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
 
         logging_setup.send_startup_events()
@@ -619,6 +622,7 @@ class TestEventLogHandler:
             {"name": name, "levelno": level, "msg": "m", **extra}
         )
         handler.handle(record)
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
 
     def test_traceback_in_text(self, event_logger):
@@ -645,6 +649,7 @@ class TestEventLogHandler:
             raise error
         except OSError:
             test_logger.exception("Exception in ASGI application")
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
 
     def test_long_text_truncated(self, event_logger):
@@ -687,10 +692,13 @@ class TestEventLogHandler:
 
         test_logger.error("ошибка 1")
         test_logger.warning("ошибка 2")
+        flush_event_logs()
         evtlog.ReportEvent.side_effect = None
         test_logger.error("ошибка 3")
+        flush_event_logs()
         evtlog.ReportEvent.side_effect = OSError("снова")
         test_logger.error("ошибка 4")
+        flush_event_logs()
 
         failures = [
             r
@@ -722,6 +730,7 @@ class TestEventLogHandler:
         )
 
         handle_error.assert_called_once()
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
 
     def test_startup_buffer_keeps_text_of_the_moment(self, evtlog):
@@ -760,6 +769,7 @@ class TestEventLogHandler:
         try:
             test_logger.warning("первое")
             test_logger.warning("второе", extra={"event_id": 2004})
+            flush_event_logs()
             evtlog.ReportEvent.assert_not_called()
 
             handler.send_startup_events()
@@ -773,6 +783,7 @@ class TestEventLogHandler:
             (2004, "app.test_buffer: второе"),
             (4000, "app.test_buffer: после старта"),
         ]
+        flush_event_logs()
         evtlog.DeregisterEventSource.assert_called_once_with("source-handle")
 
     def test_startup_buffer_overflow(self, evtlog):
@@ -822,6 +833,7 @@ class TestEventLogHandler:
         handler.send_startup_events()
         handler.close()
 
+        flush_event_logs()
         assert evtlog.ReportEvent.call_count == 2
         assert "Не удалось записать событие 2004 в журнал событий: full" in caplog.text
 
@@ -856,6 +868,7 @@ class TestEventLogHandler:
         handler.close()
 
         assert [e[0] for e in reported(evtlog)] == [1005]
+        flush_event_logs()
         evtlog.DeregisterEventSource.assert_called_once()
 
     def test_outcome_passes_full_buffer(self, evtlog):
@@ -903,6 +916,7 @@ class TestEventLogHandler:
             )
         handler.handle(warning)
         handler.send_startup_events()
+        flush_event_logs()
         evtlog.ReportEvent.reset_mock()
 
         handler.handle(warning)
@@ -1081,6 +1095,7 @@ class TestHungReportEvent:
             [handler] = test_logger.handlers
             handler.flush()
             assert time.monotonic() - started < 2
+            flush_event_logs()
             assert evtlog.ReportEvent.call_count == 1
         finally:
             release.set()
@@ -1089,12 +1104,79 @@ class TestHungReportEvent:
         assert texts == ["app.test_event_log: первое", "app.test_event_log: второе"]
 
     def test_queue_limit(self, event_logger, monkeypatch):
-        """Проверить: очередь при зависшем ReportEvent ограничена."""
+        """Проверить: очередь при зависшем ReportEvent ограничена, а об
+        отброшенных событиях после ответа пишется одна пометка.
+        """
         test_logger, evtlog = event_logger
         monkeypatch.setattr(logging_setup, "EVENT_QUEUE_LIMIT", 2)
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            entered.set()
+            release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("событие 0", extra={"event_id": 2000})
+        assert entered.wait(5)
+        for number in range(1, 5):
+            test_logger.warning("событие %s", number, extra={"event_id": 2000})
+        release.set()
+        assert [text for _, _, text in reported(evtlog)] == [
+            "app.test_event_log: событие 0",
+            "app.test_event_log: событие 1",
+            "app.test_event_log: событие 2",
+            (
+                "app.logging_setup: Отброшено событий, пока журнал событий не "
+                "отвечал: 2, они есть в файле журнала"
+            ),
+        ]
+
+    def test_flush_under_handler_lock(self, event_logger, monkeypatch):
+        """Проверить: сброс под замком обработчика (как flush_handlers)
+        дожидается писателя, даже когда тот пишет строку об отказе.
+        """
+        test_logger, evtlog = event_logger
         [handler] = test_logger.handlers
-        with handler._report_lock:  # noqa: SLF001 - замок записи
-            for number in range(5):
-                test_logger.warning("событие %s", number, extra={"event_id": 2000})
-        handler.flush()
-        assert evtlog.ReportEvent.call_count == 2
+        # Строка об отказе ReportEvent доходит и до этого обработчика
+        monkeypatch.setattr(
+            logging.getLogger(logging_setup.__name__), "handlers", [handler]
+        )
+        started = threading.Event()
+
+        def report(*_args):
+            started.wait(5)
+            message = "нет ответа"
+            raise OSError(message)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("первое", extra={"event_id": 2000})
+        test_logger.info("1001", extra={"event_id": 1001})
+        with handler.lock:
+            started.set()
+            moment = time.monotonic()
+            handler.flush()
+            assert time.monotonic() - moment < 2
+        assert [e[0] for e in reported(evtlog)] == [2000, 1001]
+
+    def test_close_waits_for_writer(self, event_logger, monkeypatch):
+        """Проверить: close() дописывает очередь, а источник закрывает
+        писатель после последнего ReportEvent.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.1)
+        [handler] = test_logger.handlers
+        release = threading.Event()
+        calls = []
+
+        def report(*_args):
+            release.wait(10)
+            calls.append(evtlog.DeregisterEventSource.called)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("событие", extra={"event_id": 2000})
+        handler.close()
+        evtlog.DeregisterEventSource.assert_not_called()
+        test_logger.warning("после закрытия", extra={"event_id": 2000})
+        release.set()
+        wait_for(lambda: evtlog.DeregisterEventSource.called)
+        assert calls == [False]
