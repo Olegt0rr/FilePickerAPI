@@ -14,7 +14,15 @@ from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from app.event_tracking import EventId, admit, is_tracked
+from app.event_tracking import (
+    UNSENT_ATTRIBUTE,
+    UNSENT_RETRY_SECONDS,
+    EventId,
+    OnUnsent,
+    admit,
+    is_tracked,
+    unsent_callback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +110,11 @@ def truncate_event_text(text: str) -> str:
     return head.decode("utf-16-le", "ignore") + TRUNCATED_NOTE
 
 
+# Событие для ReportEvent: уровень, код, текст и что сделать, если оно
+# отброшено или не записалось (см. event_tracking._log)
+_Event = tuple[int, int, str, OnUnsent | None]
+
+
 class EventLogHandler(logging.Handler):
     """Записи журнала в журнал событий Application.
 
@@ -134,7 +147,7 @@ class EventLogHandler(logging.Handler):
         # События для ReportEvent по порядку и состояние писателя;
         # меняются под self._ready
         self._ready = threading.Condition(threading.Lock())
-        self._pending: deque[tuple[int, int, str]] = deque()
+        self._pending: deque[_Event] = deque()
         self._lost = 0
         self._busy = False
         self._closing = False
@@ -145,8 +158,10 @@ class EventLogHandler(logging.Handler):
         self._win32evtlog = win32evtlog
         self._source = win32evtlog.RegisterEventSource(None, EVENT_SOURCE)
         # Текст форматируется при записи: буфер не держит ни аргументы,
-        # ни трассировки с кадрами стека
-        self._buffer: list[tuple[int, int, str]] | None = []
+        # ни трассировки с кадрами стека. Для отброшенного или не
+        # записанного события вызывается его on_unsent: первое событие
+        # придёт при следующем случае, а посчитанные повторы сохранятся
+        self._buffer: list[_Event] | None = []
         self._dropped = 0
         # Буфер отброшен: дальше — только записи исхода
         self._discarded = False
@@ -170,7 +185,9 @@ class EventLogHandler(logging.Handler):
         # Записи без события отсеял фильтр обработчика
         event_id = int(event_id_for(record) or 0)
         outcome = getattr(record, "outcome", False)
+        on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
         if self._discarded and not outcome:
+            _unsent(on_unsent, 0)
             return
         try:
             message = record.getMessage()
@@ -186,23 +203,36 @@ class EventLogHandler(logging.Handler):
             and not outcome
         ):
             self._dropped += 1
+            # Повторы этой записи учтены ещё в event_tracking (track,
+            # 2000): без пометки её событие не пришло бы никогда
+            _unsent(on_unsent, 0)
             return
         note = ""
         if getattr(record, "event_id", None) is None:
+            reason = (record.name, str(record.msg))
             note = admit(
                 event_id,
-                (record.name, str(record.msg)),
+                reason,
                 # Ключ — шаблон, а текст напоминания — первая запись
                 f"{record.name}: {message}",
                 record.levelno,
             )
             if note is None:
                 return
-        text = self.format(record) + note
+            on_unsent = unsent_callback(event_id, reason, note)
+        try:
+            text = self.format(record) + note
+        except Exception:
+            # Ключ уже занят: без пометки следующий случай считался бы
+            # повтором уже записанного события
+            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+            self.handleError(record)
+            return
+        event = (record.levelno, event_id, text, on_unsent)
         if self._buffer is not None:
-            self._buffer.append((record.levelno, event_id, text))
+            self._buffer.append(event)
         else:
-            self._enqueue([(record.levelno, event_id, text)])
+            self._enqueue([event])
 
     def send_startup_events(self) -> None:
         """Отправить буфер; дальше события пишутся сразу."""
@@ -214,7 +244,7 @@ class EventLogHandler(logging.Handler):
                     "они есть в файле журнала"
                 )
                 buffered.append(
-                    (note.levelno, EventId.OTHER_WARNING, self.format(note))
+                    (note.levelno, EventId.OTHER_WARNING, self.format(note), None)
                 )
                 self._dropped = 0
             self._enqueue(buffered)
@@ -226,9 +256,11 @@ class EventLogHandler(logging.Handler):
         журнала; итоговых напоминаний второй экземпляр не пишет.
         """
         with self.lock:
-            self._buffer = None
+            buffered, self._buffer = self._buffer or [], None
             self._discarded = True
             self._dropped = 0
+            for *_, on_unsent in buffered:
+                _unsent(on_unsent, 0)
 
     def flush(self) -> None:
         """Дождаться записи очереди не дольше EVENT_FLUSH_SECONDS."""
@@ -237,28 +269,36 @@ class EventLogHandler(logging.Handler):
                 lambda: not (self._pending or self._busy), EVENT_FLUSH_SECONDS
             )
 
-    def _enqueue(self, items: list[tuple[int, int, str]]) -> None:
-        """Поставить события в очередь и разбудить писателя."""
+    def _enqueue(self, items: list[_Event]) -> None:
+        """Поставить события в очередь и разбудить писателя.
+
+        Событие, не вставшее в очередь (она полна или обработчик
+        закрыт), не записано, как при отказе ReportEvent: очередь полна,
+        только пока журнал событий не отвечает. Его on_unsent
+        вызывается с UNSENT_RETRY_SECONDS, вне замка очереди.
+        """
         with self._ready:
-            if self._closing:
-                return
-            free = max(EVENT_QUEUE_LIMIT - len(self._pending), 0)
-            self._pending.extend(items[:free])
-            self._lost += len(items) - len(items[:free])
+            free = 0 if self._closing else EVENT_QUEUE_LIMIT - len(self._pending)
+            rejected = items[max(free, 0) :]
+            self._pending.extend(items[: max(free, 0)])
+            if not self._closing:
+                self._lost += len(rejected)
             if self._writer is None:
                 self._writer = threading.Thread(
                     target=self._write, name="event-log-writer", daemon=True
                 )
                 self._writer.start()
             self._ready.notify_all()
+        for *_, on_unsent in rejected:
+            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
 
-    def _lost_note(self) -> tuple[int, int, str]:
+    def _lost_note(self) -> _Event:
         note = _service_record(
             f"Отброшено событий, пока журнал событий не отвечал: {self._lost}, "
             "они есть в файле журнала"
         )
         self._lost = 0
-        return note.levelno, EventId.OTHER_WARNING, self.format(note)
+        return note.levelno, EventId.OTHER_WARNING, self.format(note), None
 
     def _write(self) -> None:
         """Писать очередь до закрытия, затем закрыть источник событий.
@@ -282,12 +322,16 @@ class EventLogHandler(logging.Handler):
             self._report(*item)
         self._deregister()
 
-    def _report(self, levelno: int, event_id: int, text: str) -> None:
+    def _report(
+        self, levelno: int, event_id: int, text: str, on_unsent: OnUnsent | None
+    ) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
 
         Вместо трассировки handleError в stderr на каждое событие —
         одна строка на серию отказов в файл журнала и консоль (не в
-        журнал событий), сама запись в файле журнала уже есть.
+        журнал событий), сама запись в файле журнала уже есть. Для
+        незаписанного события вызывается on_unsent: следующий такой же
+        случай снова даст событие, а число повторов не потеряется.
         """
         if levelno >= logging.ERROR:
             event_type = self._win32evtlog.EVENTLOG_ERROR_TYPE
@@ -307,6 +351,7 @@ class EventLogHandler(logging.Handler):
                 None,
             )
         except Exception as e:
+            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
             if not self._report_failing:
                 self._report_failing = True
                 logger.warning(
@@ -337,6 +382,11 @@ class EventLogHandler(logging.Handler):
         source, self._source = self._source, None
         if source is not None:
             self._win32evtlog.DeregisterEventSource(source)
+
+
+def _unsent(on_unsent: OnUnsent | None, retry_after: float) -> None:
+    if on_unsent is not None:
+        on_unsent(retry_after)
 
 
 class LogFileHandler(TimedRotatingFileHandler):
