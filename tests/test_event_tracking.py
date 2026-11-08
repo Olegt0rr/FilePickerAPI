@@ -5,6 +5,7 @@ import errno
 import logging
 import sys
 import threading
+import time
 import types
 from unittest import mock
 
@@ -246,14 +247,15 @@ class TestDirectoryState:
 
     @pytest.mark.usefixtures("clock")
     def test_aborted_200_and_206_one_reason(self, records):
-        """Обрыв обычного и Range-ответа при одной ошибке — одна
-        причина: 2000 одно, без смены на каждое чередование.
+        """Ошибка списка, обрыв обычного и Range-ответа при одной
+        ошибке ОС — одна причина: 2000 одно, без смены на каждое
+        чередование.
         """
         error = OSError(errno.EIO, "I/O")
-        for status in ("200, ответ оборван", "206, ответ оборван") * 2:
+        for status in (500, "200, ответ оборван", "206, ответ оборван") * 2:
             event_tracking.directory_error("/srv", error, status)
         assert [e for e, _ in events(records)] == [2000]
-        assert len(records()) == 4
+        assert len(records()) == 6
 
     @pytest.mark.usefixtures("clock")
     @pytest.mark.parametrize(
@@ -370,6 +372,38 @@ class TestAccessOrder:
         assert [e for e, _ in sent] == [2000, 2001]
         assert "Ответ клиенту: 403" in sent[0][1]
         assert sent[1][1].endswith("ошибочных ответов: 2")
+
+    def test_success_waits_for_publishing_error(self, monkeypatch, records):
+        """Сбой A прошёл проверку успехов, но ещё не опубликован, а
+        B, начатый позже, успешен: B видит сбой и даёт 2001.
+        """
+        entered, release = threading.Event(), threading.Event()
+        unavailable = event_tracking._Unavailable  # noqa: SLF001 - состояние
+
+        def slow_unavailable(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return unavailable(*args, **kwargs)
+
+        monkeypatch.setattr(event_tracking, "_Unavailable", slow_unavailable)
+        first, second = self.request(), self.request()
+        error = OSError(errno.EIO, "I/O")
+        failing = threading.Thread(
+            target=first.run, args=(event_tracking.directory_error, "/srv", error, 500)
+        )
+        succeeding = threading.Thread(
+            target=second.run, args=(event_tracking.directory_ok,)
+        )
+        failing.start()
+        assert entered.wait(5)
+        succeeding.start()
+        succeeding.join(0.2)
+        release.set()
+        failing.join(5)
+        succeeding.join(5)
+
+        assert [e for e, _ in events(records)] == [2000, 2001]
+        assert event_tracking._state.directory is None  # noqa: SLF001
 
     def test_without_begin_access(self, records):
         """Без begin_access — номер момента вызова (как раньше)."""
@@ -524,3 +558,49 @@ class TestTimer:
         assert "Ошибка такта учёта повторов" in caplog.text
         [record] = [r for r in caplog.records if r.name == "app.event_tracking"]
         assert record.event_log is False
+
+    def test_flush_waits_for_tick(self, monkeypatch, clock, records):
+        """Такт снял счётчик и задержался перед записью напоминания:
+        flush ждёт его, напоминание записано до возврата из flush.
+        """
+        for _ in range(2):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        clock.advance(60 * 60)
+        entered, release = threading.Event(), threading.Event()
+        log = event_tracking._log  # noqa: SLF001 - запись учёта
+
+        def slow_log(*args, **kwargs):
+            if threading.current_thread().name == "event-tracking-timer":
+                entered.set()
+                release.wait(5)
+            log(*args, **kwargs)
+
+        monkeypatch.setattr(event_tracking, "_log", slow_log)
+        monkeypatch.setattr(event_tracking, "TICK_SECONDS", 0.01)
+        event_tracking.start_timer()
+        assert entered.wait(5)
+        threading.Timer(0.2, release.set).start()
+
+        event_tracking.flush()
+
+        assert events(records)[1] == (
+            3000,
+            "Повторялось ещё 1 раз с прошлой записи: отказ",
+        )
+        # Таймер работает дальше: flush бывает и перед повтором запуска
+        assert event_tracking._state.timer.is_alive()  # noqa: SLF001
+
+    @pytest.mark.usefixtures("clock")
+    def test_flush_without_wait(self, records):
+        """wait=0 (срочная остановка): идущий такт не ждём."""
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        lock = event_tracking._state.remind_lock  # noqa: SLF001 - замок такта
+        lock.acquire()
+        try:
+            started = time.monotonic()
+            event_tracking.flush(wait=0)
+            assert time.monotonic() - started < 0.5
+        finally:
+            lock.release()
+        assert events(records)[1][1].startswith("Повторялось ещё 1 раз")

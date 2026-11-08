@@ -47,6 +47,14 @@ def wait_for(condition: Callable[[], object], timeout: float = 10) -> None:
         time.sleep(0.05)
 
 
+def flush_event_logs() -> None:
+    """Дождаться писателей журнала событий: ReportEvent в их потоке."""
+    for ref in list(logging._handlerList):  # noqa: SLF001 - все обработчики
+        handler = ref()
+        if isinstance(handler, logging_setup.EventLogHandler):
+            handler.flush()
+
+
 @pytest.fixture
 def service_env(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     """runner.run() без выхода процесса и без обработчиков сигналов.

@@ -16,11 +16,12 @@
 """
 
 import contextvars
+import functools
 import itertools
 import logging
 import threading
 import time
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -43,6 +44,9 @@ OVERFLOW_NOTE = (
 )
 SLOW_SECONDS = 10.0
 
+# ERROR_PATH_NOT_FOUND: fileId — имя без подпапок, поэтому у пути к
+# файлу не найдена сама папка (удалена, отключён диск)
+_ERROR_PATH_NOT_FOUND = 3
 # Коды Windows, означающие недоступность сетевой папки, а не ошибку
 # отдельного файла
 NETWORK_WINERRORS = frozenset(
@@ -73,14 +77,25 @@ clock = time.monotonic
 # результата: успех обращения, начатого до сбоя, не даёт 2001, а сбой
 # обращения, начатого до успеха, не даёт 2000
 _access_numbers = itertools.count(1)
-# Номера и last_ok_access — под своей блокировкой: без GIL next() и
-# «прочитать max, записать» не атомарны. Под ней ничего не логируется
+# Номера, last_ok_access, публикация сбоя и счётчики недоступной папки
+# — под своей короткой блокировкой: без GIL next() и «прочитать,
+# изменить, записать» не атомарны. Под ней ничего не логируется, поэтому
+# её берут и обратные вызовы EventLogHandler, где бы он их ни вызвал
 _access_lock = threading.Lock()
 _access: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "directory_access", default=None
 )
-# Причина недоступности для оборванного ответа (вместо кода ответа)
-ABORTED_KEY = "ответ оборван"
+# Сколько flush по умолчанию ждёт идущий такт таймера: напоминание,
+# которое такт уже снял со счётчика, должно успеть записаться до 1001
+REMIND_WAIT_SECONDS = 1.0
+
+# Атрибут записи журнала: что сделать, если её событие не записалось.
+# Аргумент — через сколько секунд писать событие снова
+UNSENT_ATTRIBUTE = "event_unsent"
+OnUnsent = Callable[[float], None]
+# После отказа записи событие пишется снова не раньше чем через минуту:
+# пока журнал событий отказывает, запросы не ждут ReportEvent каждый
+UNSENT_RETRY_SECONDS = 60.0
 
 
 class EventId(IntEnum):
@@ -121,6 +136,11 @@ class _Entry:
     summary: str
     last_write: float
     count: int = 0
+    # Событие ключа не записано (отброшено со стартовым буфером, отказ
+    # ReportEvent): случай после retry_at пишется как первый, а счётчик
+    # сохраняется
+    unsent: bool = False
+    retry_at: float = 0.0
 
 
 @dataclass
@@ -136,6 +156,31 @@ class _Unavailable:
     # Номер самого позднего обращения, закончившегося сбоем
     access: int
     errors_since_write: int = 0
+    # 2000 не записалось: ошибочный ответ после retry_at пишет его снова
+    unsent: bool = False
+    retry_at: float = 0.0
+
+
+# Обратные вызовы для незаписанных событий о папке. EventLogHandler
+# вызывает их и под directory_lock этого же потока, и из стартового
+# буфера без него, поэтому поля — под _access_lock, а не directory_lock
+
+
+def _directory_unsent(state: _Unavailable, retry_after: float) -> None:
+    retry_at = clock() + retry_after
+    with _access_lock:
+        state.unsent = True
+        state.retry_at = retry_at
+
+
+def _restore_directory_errors(
+    state: _Unavailable,
+    count: int,
+    _retry_after: float,
+) -> None:
+    """2002 не записалось: ошибочные ответы уйдут следующим."""
+    with _access_lock:
+        state.errors_since_write += count
 
 
 class _State:
@@ -145,12 +190,15 @@ class _State:
     EventLogHandler вызывает admit под своей блокировкой, и запись под
     lock дала бы взаимную блокировку. Состояние директории меняется
     под directory_lock, и запись о нём идёт под ним же: так 2001 не
-    опередит 2000. EventLogHandler directory_lock не берёт.
+    опередит 2000. EventLogHandler directory_lock не берёт. Сбой
+    публикуется в directory ещё и под блокировкой номеров обращений.
     """
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.directory_lock = threading.Lock()
+        # Напоминания такта и итог flush не пишутся одновременно
+        self.remind_lock = threading.Lock()
         self.keys: dict[int, dict[Hashable, _Entry]] = {}
         # Ключ переполнения на код: только число ошибок, без причин, —
         # память постоянна при любом потоке новых fileId
@@ -181,15 +229,13 @@ def admit(
         keys = _state.keys.setdefault(event_id, {})
         entry = keys.get(reason)
         if entry is not None:
-            entry.count += 1
-            return None
+            return _repeat(entry, "", now)
         if len(keys) < MAX_KEYS_PER_EVENT:
             keys[reason] = _Entry(level, summary, now)
             return ""
         overflow = _state.overflow.get(event_id)
         if overflow is not None:
-            overflow.count += 1
-            return None
+            return _repeat(overflow, OVERFLOW_NOTE, now)
         _state.overflow[event_id] = _Entry(
             level,
             f"ошибки с кодом {event_id} сверх {MAX_KEYS_PER_EVENT} видов "
@@ -199,14 +245,74 @@ def admit(
     return OVERFLOW_NOTE
 
 
+def _repeat(entry: _Entry, note: str, now: float) -> str | None:
+    """Повтор ключа: счёт, а если первое событие отброшено — оно."""
+    if entry.unsent and now >= entry.retry_at:
+        entry.unsent = False
+        entry.last_write = now
+        return note
+    entry.count += 1
+    return None
+
+
+def mark_unsent(
+    event_id: int, reason: Hashable | None, retry_after: float = 0.0
+) -> None:
+    """Отметить, что событие ключа так и не записано.
+
+    Следующий случай ключа снова даст событие, а этот случай и
+    повторы, посчитанные до того, не теряются: они уйдут напоминанием.
+    reason=None — ключ переполнения этого кода. retry_after — через
+    сколько секунд случай снова даст событие.
+    """
+    retry_at = clock() + retry_after
+    with _state.lock:
+        if reason is None:
+            entry = _state.overflow.get(event_id)
+        else:
+            entry = _state.keys.get(event_id, {}).get(reason)
+        if entry is not None:
+            entry.unsent = True
+            entry.retry_at = retry_at
+            entry.count += 1
+
+
+def unsent_callback(event_id: int, reason: Hashable, note: str) -> OnUnsent:
+    """Что сделать, если событие, пропущенное admit, не запишется."""
+    return functools.partial(
+        mark_unsent, event_id, None if note == OVERFLOW_NOTE else reason
+    )
+
+
+def _restore_count(
+    entry: _Entry, count: int, _retry_after: float, *, unsent: bool
+) -> None:
+    """Напоминание не записано: повторы вернуть в счётчик.
+
+    Если и первое событие ключа не записано, оно снова ждёт записи.
+    """
+    with _state.lock:
+        entry.count += count
+        entry.unsent = entry.unsent or unsent
+
+
 def _log(
     level: int,
     event_id: int | None,
     message: str,
     exc: BaseException | None = None,
+    *,
+    on_unsent: OnUnsent | None = None,
 ) -> None:
-    """Записать строку; без кода — только в файл журнала."""
+    """Записать строку; без кода — только в файл журнала.
+
+    on_unsent вызывает EventLogHandler, если событие не записалось
+    (отказ ReportEvent или форматтера, отброшенный стартовый буфер):
+    так первое событие ключа, 2000 или число повторов не теряются.
+    """
     extra = {"event_log": False} if event_id is None else {"event_id": event_id}
+    if event_id is not None and on_unsent is not None:
+        extra[UNSENT_ATTRIBUTE] = on_unsent
     logger.log(level, "%s", message, exc_info=exc, extra=extra)
 
 
@@ -227,7 +333,13 @@ def track(
     if note is None:
         _log(level, None, message, exc)
     else:
-        _log(level, event_id, message + note, exc)
+        _log(
+            level,
+            event_id,
+            message + note,
+            exc,
+            on_unsent=unsent_callback(event_id, reason, note),
+        )
     if exc is not None:
         mark_tracked(exc)
 
@@ -257,9 +369,13 @@ def describe_error(error: BaseException) -> str:
     return f"{error.filename}: {text}" if error.filename else text
 
 
-def is_network_error(error: BaseException) -> bool:
-    """Проверить, означает ли ошибка недоступность сетевой папки."""
-    return getattr(error, "winerror", None) in NETWORK_WINERRORS
+def is_directory_error(error: BaseException) -> bool:
+    """Проверить, означает ли ошибка недоступность папки с файлами.
+
+    Это сетевой код Windows или ERROR_PATH_NOT_FOUND.
+    """
+    winerror = getattr(error, "winerror", None)
+    return winerror in NETWORK_WINERRORS or winerror == _ERROR_PATH_NOT_FOUND
 
 
 def _reason(error: BaseException) -> Hashable:
@@ -293,11 +409,11 @@ def directory_error(
     """
     now = clock()
     access = _current_access()
-    # Оборванный ответ — одна причина, с каким бы кодом ни ушли
-    # заголовки: иначе чередование 200 и 206 (докачка по Range) давало
-    # бы 2000 на каждое переключение
-    status_key = ABORTED_KEY if isinstance(status, str) else status
-    reason = (status_key, _reason(error))
+    # Причина — код ошибки ОС, а код ответа только в тексте: иначе
+    # чередование ошибки списка (500) и обрыва скачивания, а также 200 и
+    # 206 (докачка по Range) при одной ошибке давало бы 2000 на каждое
+    # переключение
+    reason = _reason(error)
     description = describe_error(error)
     message = (
         f"Папка с файлами {directory} недоступна: {description}. "
@@ -307,8 +423,24 @@ def directory_error(
     # Запись — под той же блокировкой, что и решение: иначе 2001 из
     # параллельного успешного запроса мог бы опередить это 2000
     with _state.directory_lock:
-        state = _state.directory
-        if state is None and access < _state.last_ok_access:
+        # Проверка last_ok_access и публикация сбоя — под той же
+        # блокировкой номеров, под которой directory_ok обновляет
+        # last_ok_access и смотрит на состояние: иначе успех, пришедший
+        # между ними, не увидел бы сбоя, и папка осталась бы недоступной
+        with _access_lock:
+            state = _state.directory
+            stale = state is None and access < _state.last_ok_access
+            if state is None and not stale:
+                _state.directory = _Unavailable(
+                    str(directory),
+                    reason,
+                    description,
+                    now,
+                    now,
+                    errors=1,
+                    access=access,
+                )
+        if stale:
             # Обращение начато до другого, уже успешного: папка
             # доступна, ошибка — только в файл журнала
             _log(logging.WARNING, None, message, exc)
@@ -316,35 +448,59 @@ def directory_error(
             return
         if state is None:
             changed = True
-            _state.directory = _Unavailable(
-                str(directory), reason, description, now, now, errors=1, access=access
-            )
+            state = _state.directory
         else:
-            # Ошибка обращения, начатого раньше последнего сбоя, —
-            # повтор: причину она не меняет, иначе более старая
-            # вытеснила бы новую
-            changed = state.reason != reason and access >= state.access
-            state.access = max(state.access, access)
-            state.errors += 1
-            if changed:
-                if state.errors_since_write:
-                    message += (
-                        f". До смены причины ошибочных ответов с прошлой записи: "
-                        f"{state.errors_since_write} ({state.description})"
-                    )
-                state.reason = reason
-                state.description = description
-                state.last_write = now
-                state.errors_since_write = 0
-            else:
-                state.errors_since_write += 1
+            # Поля — под _access_lock: их меняют и обратные вызовы
+            # EventLogHandler для незаписанных 2000 и 2002
+            with _access_lock:
+                changed, message = _update_unavailable(
+                    state, reason, description, access, now, message
+                )
         _log(
             logging.WARNING,
             EventId.DIRECTORY_UNAVAILABLE if changed else None,
             message,
             exc,
+            on_unsent=functools.partial(_directory_unsent, state),
         )
     mark_tracked(error)
+
+
+def _update_unavailable(  # noqa: PLR0913, PLR0917 - поля одной ошибки
+    state: _Unavailable,
+    reason: Hashable,
+    description: str,
+    access: int,
+    now: float,
+    message: str,
+) -> tuple[bool, str]:
+    """Учесть ошибку уже недоступной папки.
+
+    Возвращает, писать ли 2000, и текст записи.
+    """
+    # Ошибка обращения, начатого раньше последнего сбоя, — повтор:
+    # причину она не меняет, иначе более старая вытеснила бы новую
+    new_reason = state.reason != reason and access >= state.access
+    # Прошлое 2000 не записалось — пишется снова, не чаще раза в минуту
+    resend = state.unsent and now >= state.retry_at
+    state.access = max(state.access, access)
+    state.errors += 1
+    if not (new_reason or resend):
+        state.errors_since_write += 1
+        return False, message
+    if state.errors_since_write:
+        message += (
+            ". До смены причины ошибочных ответов с прошлой записи: "
+            if new_reason
+            else ". Ошибочных ответов с прошлой записи: "
+        ) + f"{state.errors_since_write} ({state.description})"
+    if new_reason:
+        state.reason = reason
+        state.description = description
+    state.unsent = False
+    state.last_write = now
+    state.errors_since_write = 0
+    return True, message
 
 
 def begin_access() -> int:
@@ -375,24 +531,29 @@ def directory_ok() -> None:
     делает: сбой мог случиться уже после него.
     """
     access = _current_access()
-    # Под короткой блокировкой номеров, а не directory_lock: успешные
-    # запросы не ждут записи о чужой ошибке
+    # Под короткой блокировкой номеров, а не directory_lock: пока папка
+    # доступна, успешные запросы не ждут записи о чужой ошибке. Сбой,
+    # опубликованный до этого, виден здесь; опубликованный после — уже
+    # видит новый last_ok_access
     with _access_lock:
         _state.last_ok_access = max(_state.last_ok_access, access)
-    if _state.directory is None:
+        unavailable = _state.directory is not None
+    if not unavailable:
         return
     with _state.directory_lock:
         state = _state.directory
         if state is None or access < state.access:
             return
         _state.directory = None
-        _log(
-            logging.INFO,
-            EventId.DIRECTORY_RESTORED,
+        message = (
             f"Папка с файлами {state.path} снова доступна: была недоступна "
             f"{format_duration(clock() - state.since)}, "
-            f"ошибочных ответов: {state.errors}",
+            f"ошибочных ответов: {state.errors}"
         )
+        if state.unsent:
+            # 2000 так и не записалось: причина — здесь
+            message += f". Причина недоступности: {state.description}"
+        _log(logging.INFO, EventId.DIRECTORY_RESTORED, message)
 
 
 def file_error(
@@ -400,11 +561,11 @@ def file_error(
 ) -> None:
     """Учесть ошибку доступа к скачиваемому файлу.
 
-    Сетевой код Windows — недоступность директории (2000), прочие
-    ошибки — 3000 с ключом «код ошибки + fileId». Для ответа 5xx запись
-    идёт с трассировкой исходной ошибки.
+    Сетевой код Windows или ERROR_PATH_NOT_FOUND — недоступность
+    директории (2000), прочие ошибки — 3000 с ключом «код ошибки +
+    fileId». Для ответа 5xx запись идёт с трассировкой исходной ошибки.
     """
-    if is_network_error(error):
+    if is_directory_error(error):
         directory_error(directory, error, status)
         return
     track(
@@ -446,7 +607,7 @@ def _remind_or_close(
     entry: _Entry,
     event_id: int,
     now: float,
-    reminders: list[tuple[int, int, str]],
+    reminders: list[tuple[int, int, str, OnUnsent]],
     *,
     final: bool,
 ) -> bool:
@@ -458,11 +619,15 @@ def _remind_or_close(
         return False
     if entry.count:
         count, entry.count, entry.last_write = entry.count, 0, now
+        # Напоминание записано — отброшенное первое событие уже не
+        # нужно; если не запишется, _restore_count вернёт и его
+        unsent, entry.unsent = entry.unsent, False
         reminders.append(
             (
                 entry.level,
                 event_id,
                 f"Повторялось ещё {count} раз с прошлой записи: {entry.summary}",
+                functools.partial(_restore_count, entry, count, unsent=unsent),
             )
         )
         return False
@@ -472,7 +637,7 @@ def _remind_or_close(
 def _remind(*, final: bool) -> None:
     """Напоминания по ключам и 2002 о недоступной папке."""
     now = clock()
-    reminders: list[tuple[int, int, str]] = []
+    reminders: list[tuple[int, int, str, OnUnsent]] = []
     with _state.lock:
         for event_id, entries in _state.keys.items():
             closed = [
@@ -489,37 +654,52 @@ def _remind(*, final: bool) -> None:
         ]
         for event_id in closed:
             del _state.overflow[event_id]
-    for level, event_id, message in reminders:
-        _log(level, event_id, message)
+    for level, event_id, message, on_unsent in reminders:
+        _log(level, event_id, message, on_unsent=on_unsent)
     with _state.directory_lock:
         state = _state.directory
         if state is not None and (
             final
             or (state.errors_since_write and now - state.last_write >= REMINDER_SECONDS)
         ):
+            with _access_lock:
+                count, state.errors_since_write = state.errors_since_write, 0
+                state.last_write = now
             _log(
                 logging.WARNING,
                 EventId.DIRECTORY_STILL_UNAVAILABLE,
                 f"Папка с файлами {state.path} по-прежнему недоступна "
                 f"({format_duration(now - state.since)}): "
                 f"{state.description}. Ошибочных ответов с прошлой "
-                f"записи: {state.errors_since_write}",
+                f"записи: {count}",
+                on_unsent=functools.partial(_restore_directory_errors, state, count),
             )
-            state.errors_since_write = 0
-            state.last_write = now
 
 
 def tick() -> None:
-    """Такт таймера: напоминания через час после последней записи."""
-    _remind(final=False)
+    """Такт таймера: напоминания через час после последней записи.
+
+    Под remind_lock до конца записи: flush ждёт такт, который уже снял
+    счётчики, но ещё не записал напоминания.
+    """
+    with _state.remind_lock:
+        _remind(final=False)
 
 
-def flush() -> None:
+def flush(*, wait: float = REMIND_WAIT_SECONDS) -> None:
     """Итог при остановке: ненулевые счётчики и недоступная папка.
 
-    Вызывается перед событием остановки (1001) или ошибки (1002).
+    Вызывается перед событием остановки (1001) или ошибки (1002), в
+    том числе перед повтором запуска, поэтому таймер не
+    останавливает. Идущий такт ждёт не дольше wait секунд: при срочной
+    остановке, когда процесс вот-вот завершат, — wait=0.
     """
-    _remind(final=True)
+    acquired = _state.remind_lock.acquire(timeout=wait)
+    try:
+        _remind(final=True)
+    finally:
+        if acquired:
+            _state.remind_lock.release()
 
 
 def _run_timer(stop: threading.Event) -> None:

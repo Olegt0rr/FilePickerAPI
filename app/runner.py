@@ -19,7 +19,6 @@
 настройки читаются только в create_app(), после настройки журнала.
 """
 
-import asyncio
 import errno
 import getpass
 import importlib
@@ -294,12 +293,12 @@ class InstanceServer(uvicorn.Server):
         await super().startup(sockets=sockets)
         if self.started:
             self.errors.active = False
-            # 1000 встаёт в конец буфера синхронно, до первого запроса:
-            # события запросов (2000, 4000) его не опередят. А сама
-            # отправка буфера (до 100 ReportEvent) идёт вне цикла и
-            # первые запросы не задерживает
+            # 1000 встаёт в конец буфера до первого запроса: события
+            # запросов (2000, 4000) его не опередят. Буфер лишь встаёт в
+            # очередь журнала событий, ReportEvent вызывает её писатель:
+            # зависший ReportEvent не держит цикл событий
             self.service.on_started()
-            await asyncio.to_thread(send_startup_events)
+            send_startup_events()
 
 
 class Service:
@@ -498,7 +497,7 @@ class Service:
     def on_started(self) -> None:
         """Слушатель запустился: 1000 в конец буфера стартовых событий.
 
-        Буфер отправляет InstanceServer.startup вне цикла событий.
+        Буфер ставит в очередь журнала событий InstanceServer.startup.
         Запись исхода (outcome) проходит и в полный буфер.
         """
         if self.stop_requested.is_set():
@@ -660,16 +659,23 @@ class Service:
         """1002 перед повтором: запись ждём не дольше срока.
 
         Исход ещё не занят, и сторож не запущен: запись, зависшая на
-        замке обработчика, иначе остановила бы повторы навсегда.
+        замке обработчика, иначе остановила бы повторы навсегда. Ошибка
+        самой записи, как и раньше, поднимается в рабочем потоке, и
+        work() пишет о ней 1002.
         """
-        thread = threading.Thread(
-            target=self._report_failure,
-            args=(message, error),
-            name="report-failure",
-            daemon=True,
-        )
+        errors: list[BaseException] = []
+
+        def report() -> None:
+            try:
+                self._report_failure(message, error)
+            except BaseException as e:
+                errors.append(e)
+
+        thread = threading.Thread(target=report, name="report-failure", daemon=True)
         thread.start()
         thread.join(REPORT_WAIT_SECONDS)
+        if errors:
+            raise errors[0]
 
     def _fail(self, message: str, error: BaseException | None) -> None:
         """Сбой: 1002 и код 1; при остановке — пометка в 1001."""
@@ -704,6 +710,10 @@ class Service:
         в пределах того же срока: он демонический, а короткое ожидание
         отличает зависший mkdir от только что начатого. При срочной
         остановке его не ждём, а только проверяем: у Windows срок 5 с.
+        Вместе с ожиданием такта учёта повторов (event_tracking.flush,
+        до секунды, при срочной — без ожидания) и сбросом журнала
+        (flush_handlers, до 1 + 3 секунд) — в пределах срока сторожа;
+        при срочной остановке процесс в срок завершает обработчик.
         """
         if self.worker is not None:
             self._wait_for(lambda: self.worker_finished, STOP_WAIT_SECONDS)
@@ -715,8 +725,12 @@ class Service:
             self.directory_thread is not None and not self.directory_finished
         )
         self._close_events()
-        # Повторы во время мягкой остановки тоже попадают в итог
-        event_tracking.flush()
+        # Повторы во время мягкой остановки тоже попадают в итог. При
+        # срочной такт не ждём: на всё у Windows 5 секунд
+        if self.urgent:
+            event_tracking.flush(wait=0)
+        else:
+            event_tracking.flush()
         # Остановка до старта слушателя: накопленное — перед 1001
         send_startup_events()
         message = f"Сервис остановлен: {self.stop_reason}"

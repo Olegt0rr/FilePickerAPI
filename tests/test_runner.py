@@ -29,7 +29,7 @@ from fastapi import FastAPI
 import app
 from app import event_tracking, instance_check, logging_setup, runner, stop_signals
 from app.instance_check import Probe, ProbeResult
-from tests.conftest import start_then_stop, wait_for
+from tests.conftest import flush_event_logs, start_then_stop, wait_for
 from tests.platforms import linux_only, windows_only
 from tests.test_main import reload_app, run_python
 
@@ -122,10 +122,12 @@ def evtlog(monkeypatch):
 
 
 def event_ids(evtlog):
+    flush_event_logs()
     return [call.args[3] for call in evtlog.ReportEvent.call_args_list]
 
 
 def event_texts(evtlog, event_id):
+    flush_event_logs()
     return [
         call.args[5][0]
         for call in evtlog.ReportEvent.call_args_list
@@ -260,6 +262,36 @@ class TestStart:
         assert answers == ["File Picker API"]
         assert event_ids(evtlog) == [1000, 1001]
 
+    @pytest.mark.usefixtures("port")
+    def test_hung_report_event(self, evtlog, monkeypatch):
+        """Проверить с настоящим Uvicorn: зависший ReportEvent не
+        мешает старту — сервис отвечает, остановка завершается в срок,
+        а события дописываются, когда журнал событий ответит.
+        """
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.1)
+        release = threading.Event()
+        evtlog.ReportEvent.side_effect = lambda *_: release.wait(10)
+        answers = []
+
+        def ask_and_stop(service):
+            response = httpx.get(f"http://127.0.0.1:{runner.PORT}/openapi.json")
+            answers.append(response.json()["info"]["title"])
+            service.request_stop("тест")
+
+        def on_started(service):
+            original(service)
+            threading.Thread(target=ask_and_stop, args=(service,)).start()
+
+        original = runner.Service.on_started
+        monkeypatch.setattr(runner.Service, "on_started", on_started)
+        try:
+            assert runner.run() == 0
+            assert answers == ["File Picker API"]
+            assert event_ids(evtlog) == [1000]
+        finally:
+            release.set()
+        wait_for(lambda: event_ids(evtlog) == [1000, 1001])
+
     @pytest.mark.usefixtures("files_dir")
     def test_directory_not_created(self, evtlog):
         """Проверить: ошибка mkdir — 2004 с ошибкой, без исключения."""
@@ -298,6 +330,7 @@ class TestSecondInstance:
             assert f"PID {os.getpid()}" in text
         else:
             assert "PID" not in text
+        flush_event_logs()
         assert evtlog.ReportEvent.call_args.args[1] == 4
         assert "уже работает" in caplog.text
 
@@ -313,6 +346,7 @@ class TestSecondInstance:
         [text] = event_texts(evtlog, 1006)
         assert "версия 0.0.1-other" in text
         assert f"версия этого запуска {app.__version__}" in text
+        flush_event_logs()
         assert evtlog.ReportEvent.call_args.args[1] == 2
 
     def test_answers_from_third_request(self, evtlog, port):
@@ -756,6 +790,30 @@ class TestStop:
             release.set()
         assert len(attempts) == 2
 
+    def test_retry_report_error(self, monkeypatch):
+        """Проверить: ошибка записи 1002 перед повтором — сбой запуска
+        с кодом 1, как и раньше, а не трассировка в stderr из потока.
+        """
+        attempts, messages = [], []
+        original = runner.Service._report_failure  # noqa: SLF001 - подмена
+
+        def serve(server, _sockets=None):
+            attempts.append(server)
+            raise SystemExit(1)
+
+        def report(service, message, error):
+            messages.append(message)
+            if len(messages) == 1:
+                failure = "отказ записи"
+                raise RuntimeError(failure)
+            original(service, message, error)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        monkeypatch.setattr(runner.Service, "_report_failure", report)
+        assert runner.run() == 1
+        assert len(attempts) == 1
+        assert messages[1] == "Непредвиденная ошибка запуска сервиса"
+
     @pytest.mark.usefixtures("port")
     def test_hung_worker(self, service_env, evtlog, monkeypatch):
         """Проверить: рабочий поток не завершился за срок — пометка в
@@ -889,6 +947,8 @@ class TestUrgentStop:
         причиной; обработчик возвращается только после выхода процесса.
         """
         handler = {}
+        flush = mock.Mock(wraps=event_tracking.flush)
+        monkeypatch.setattr(event_tracking, "flush", flush)
 
         def serve(server, _sockets=None):
             server.started = True
@@ -907,6 +967,8 @@ class TestUrgentStop:
         assert event_ids(evtlog) == [1000, 3000, 3000, 1001]
         assert "Повторялось ещё 5 раз" in event_texts(evtlog, 3000)[1]
         assert event_texts(evtlog, 1001) == [f"app.runner: Сервис остановлен: {reason}"]
+        # Такт учёта повторов не ждём: срок Windows — 5 секунд
+        flush.assert_called_once_with(wait=0)
 
     @pytest.mark.usefixtures("port")
     def test_waits_from_urgent_signal(self, service_env, evtlog, monkeypatch):

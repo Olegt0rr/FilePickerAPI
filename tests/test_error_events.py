@@ -21,7 +21,7 @@ from uvicorn.protocols.utils import ClientDisconnected
 
 from app import event_tracking, logging_setup
 from app.handlers import files
-from tests.conftest import wait_for, win_error
+from tests.conftest import flush_event_logs, wait_for, win_error
 from tests.test_main import fail_stat_for, reload_app
 
 
@@ -138,23 +138,31 @@ class TestOneErrorOneEvent:
         assert [e for e, _ in events()] == [2000, 2001]
 
     @pytest.mark.parametrize(
-        ("error", "restored"),
+        ("error", "expected"),
         [
-            (win_error(2, FileNotFoundError), True),
-            # Пропавшая папка или отключённый диск на Windows
-            (win_error(3, FileNotFoundError), False),
+            (win_error(2, FileNotFoundError), [2000, 2001]),
+            # Пропавшая папка или отключённый диск на Windows — новая
+            # причина недоступности
+            (win_error(3, FileNotFoundError), [2000, 2000]),
             # На других ОС ENOENT и у пропавшей папки
-            (FileNotFoundError(errno.ENOENT, "No such file"), False),
+            (FileNotFoundError(errno.ENOENT, "No such file"), [2000]),
         ],
     )
-    def test_missing_file_restores_only_by_code(self, client, events, error, restored):
+    def test_missing_file_restores_only_by_code(self, client, events, error, expected):
         """404 «File not found» — 2001 только по коду Windows 2."""
         with mock.patch("os.scandir", side_effect=PermissionError("denied")):
             assert client.get("/files").status_code == 403
         with fail_stat_for("a.txt", error):
             assert client.get("/files/a.txt").status_code == 404
-        expected = [2000, 2001] if restored else [2000]
         assert [e for e, _ in events()] == expected
+
+    def test_path_not_found_is_directory_error(self, client, events):
+        """WinError 3 при скачивании — 2000 с ответом 404."""
+        with fail_stat_for("a.txt", win_error(3, FileNotFoundError)):
+            assert client.get("/files/a.txt").status_code == 404
+        [(event_id, record)] = events()
+        assert event_id == 2000
+        assert "Ответ клиенту: 404" in record.getMessage()
 
     def test_fs_calls_not_increased(self, client, files_dir):
         """Учёт не добавляет обращений к ФС: один scandir на список."""
@@ -544,6 +552,7 @@ def test_reminder_has_formatted_text(event_log, clock):
     clock.advance(3600)
     event_tracking.tick()
 
+    flush_event_logs()
     texts = [call.args[5][0] for call in event_log.call_args_list]
     assert texts == [
         "uvicorn.error: Exceeded concurrency limit 5.",
@@ -555,6 +564,7 @@ def test_reminder_has_formatted_text(event_log, clock):
 
 
 def reported_ids(report_event):
+    flush_event_logs()
     return [call.args[3] for call in report_event.call_args_list]
 
 
