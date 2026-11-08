@@ -1269,19 +1269,80 @@ class TestStopSignals:
         assert "Не удалось установить обработчик Ctrl+C: нет" in caplog.text
         assert stop_signals._console_handler is None  # noqa: SLF001
 
-    def test_install_signals(self, monkeypatch):
-        """Проверить: вне Windows SIGINT и SIGTERM — остановка."""
+    @pytest.fixture
+    def posix_handler(self, monkeypatch):
+        """Обработчик SIGTERM вне Windows, без настоящих сигналов."""
         monkeypatch.setattr(stop_signals, "_windows", lambda: False)
-        with mock.patch.object(stop_signals.signal, "signal") as set_signal:
-            stop = mock.Mock()
-            INSTALL(stop)
-        assert [c.args[0] for c in set_signal.call_args_list] == [
-            signal.SIGINT,
-            signal.SIGTERM,
-        ]
-        handler = set_signal.call_args.args[1]
+        monkeypatch.setattr(stop_signals, "_pending", None)
+        monkeypatch.setattr(stop_signals, "_stop", None)
+
+        def install(stop):
+            with mock.patch.object(stop_signals.signal, "signal") as set_signal:
+                INSTALL(stop)
+            assert [c.args[0] for c in set_signal.call_args_list] == [
+                signal.SIGINT,
+                signal.SIGTERM,
+            ]
+            return set_signal.call_args.args[1]
+
+        return install
+
+    def test_install_signals(self, posix_handler):
+        """Проверить: вне Windows SIGINT и SIGTERM — остановка с первой
+        причиной, но только когда главный поток передаст её (deliver).
+        """
+        stop = mock.Mock()
+        stop_signals.deliver()
+        handler = posix_handler(stop)
         handler(signal.SIGTERM, None)
+        handler(signal.SIGINT, None)
+        stop.assert_not_called()
+        stop_signals.deliver()
+        stop_signals.deliver()
         stop.assert_called_once_with("сигнал SIGTERM")
+
+    def test_signal_while_event_lock_held(self, posix_handler):
+        """Проверить: сигнал, пришедший, пока главный поток держит замок
+        service.decided (внутри decided.wait), не ждёт этот замок.
+
+        Обработчик вызывается в потоке, который сам держит замок
+        события, как главный поток при сигнале; раньше он ждал его
+        вечно в request_stop → decided.set().
+        """
+        service = runner.Service(console=False)
+        handler = posix_handler(service.request_stop)
+
+        def signal_under_lock():
+            with service.decided._cond:  # noqa: SLF001 - замок события
+                handler(signal.SIGTERM, None)
+
+        thread = threading.Thread(target=signal_under_lock, daemon=True)
+        thread.start()
+        thread.join(2)
+        assert not thread.is_alive()
+        stop_signals.deliver()
+        assert service.decided.is_set()
+        assert service.stop_reason == "сигнал SIGTERM"
+
+    @pytest.mark.usefixtures("port")
+    def test_run_delivers_signal(self, service_env, posix_handler, monkeypatch):
+        """Проверить: run(), ожидая исход, сам вызывает остановку по
+        причине, которую запомнил обработчик сигнала.
+        """
+        handlers = []
+        monkeypatch.setattr(
+            stop_signals, "install", lambda stop: handlers.append(posix_handler(stop))
+        )
+
+        def serve(server, _sockets=None):
+            server.started = True
+            server.service.on_started()
+            handlers[0](signal.SIGTERM, None)
+            wait_for(lambda: server.should_exit, 5)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        assert runner.run() == 0
+        assert service_env.exits == [0]
 
     def test_platform(self):
         assert stop_signals._windows() is (sys.platform == "win32")  # noqa: SLF001
