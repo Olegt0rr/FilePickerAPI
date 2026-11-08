@@ -81,6 +81,9 @@ EXIT_DEADLINE_SECONDS = 28
 # Сколько ждать записи 1002 перед повтором: зависшая запись в журнал
 # не должна останавливать повторы
 REPORT_WAIT_SECONDS = 5
+# Как часто главный поток, ожидая исход, передаёт остановке причину
+# сигнала: её запоминает обработчик в stop_signals
+SIGNAL_POLL_SECONDS = 0.1
 # Ошибка привязки: asyncio пересоздаёт исключение без winerror, а errno
 # на Windows — 10048 (WSAEADDRINUSE)
 ADDRESS_IN_USE = frozenset({errno.EADDRINUSE, 10048})
@@ -779,7 +782,10 @@ def run() -> int:
         target=service.work, name="service-worker", daemon=True
     )
     service.worker.start()
-    service.decided.wait()
+    # Обработчик сигнала только запоминает причину: остановку вызывает
+    # этот поток, а не обработчик посреди decided.wait()
+    while not service.decided.wait(SIGNAL_POLL_SECONDS):
+        stop_signals.deliver()
 
     outcome = service.outcome
     # Сторож: запись в журнал может зависнуть на замке обработчика

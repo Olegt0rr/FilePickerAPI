@@ -3,13 +3,21 @@
 Ctrl+C обрабатывается одним путём на платформу: на Windows —
 консольным обработчиком SetConsoleCtrlHandler (он вызывается раньше
 обработчика Python, и KeyboardInterrupt не возникает), вне Windows —
-обработчиками SIGINT и SIGTERM в главном потоке. На Windows ещё есть
-скрытое окно верхнего уровня FilePickerAPI.Instance: без окна процесс
-не получил бы сообщений о завершении сеанса и о закрытии от Restart
-Manager. Обычные сигналы вызывают функцию остановки stop, срочные
-(закрытие консоли, завершение сеанса) — urgent_stop, которая не
-возвращается до завершения процесса. Модули pywin32 импортируются
-лениво и только на Windows.
+обработчиками SIGINT и SIGTERM. На Windows ещё есть скрытое окно
+верхнего уровня FilePickerAPI.Instance: без окна процесс не получил
+бы сообщений о завершении сеанса и о закрытии от Restart Manager.
+Обычные сигналы вызывают функцию остановки stop, срочные (закрытие
+консоли, завершение сеанса) — urgent_stop, которая не возвращается до
+завершения процесса. Модули pywin32 импортируются лениво и только на
+Windows.
+
+Обработчик сигнала Python выполняется в главном потоке между
+байт-кодами, в том числе пока тот держит внутренний замок
+threading.Event в service.decided.wait(). Функция остановки берёт
+замки (свой и этого события), и вызов из обработчика ждал бы их вечно.
+Поэтому обработчик только запоминает причину, а функцию остановки
+вызывает главный поток через deliver(). Консольный обработчик и окно
+Windows работают в своих потоках, и им такое ограничение не нужно.
 """
 
 import functools
@@ -49,6 +57,9 @@ _CONSOLE_REASONS = {
 # Обработчик консоли живёт до конца процесса: ссылка не даёт его
 # собрать, пока Windows может его вызвать
 _console_handler: Callable[[int], bool] | None = None
+# Причина из обработчика сигнала, ещё не переданная функции остановки
+_pending: str | None = None
+_stop: Callable[[str], object] | None = None
 
 
 class StopHandlers(NamedTuple):
@@ -171,8 +182,14 @@ def _install_console_handler(handlers: StopHandlers) -> None:
 
 
 def _install_signal_handlers(stop: Callable[[str], object]) -> None:
+    global _stop  # noqa: PLW0603 - одна функция остановки на процесс
+    _stop = stop
+
     def handler(signum: int, _frame: FrameType | None) -> None:
-        stop(f"сигнал {signal.Signals(signum).name}")
+        global _pending  # noqa: PLW0603 - обработчик не берёт замков
+        # Только присваивание: ни замков, ни threading.Event
+        if _pending is None:
+            _pending = f"сигнал {signal.Signals(signum).name}"
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, handler)
@@ -180,6 +197,21 @@ def _install_signal_handlers(stop: Callable[[str], object]) -> None:
 
 def _windows() -> bool:
     return sys.platform == "win32"
+
+
+def deliver() -> None:
+    """Передать функции остановки причину пришедшего сигнала.
+
+    Вызывается главным потоком вне обработчика сигнала, пока он ждёт
+    исход. Повторный сигнал до передачи причину не меняет: остановка
+    идемпотентна, и важна первая причина.
+    """
+    global _pending  # noqa: PLW0603 - причина из обработчика сигнала
+    reason = _pending
+    if reason is None or _stop is None:
+        return
+    _pending = None
+    _stop(reason)
 
 
 def install(
