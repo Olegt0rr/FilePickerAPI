@@ -209,6 +209,14 @@ class TestDirectoryState:
         assert event_tracking.is_tracked(error)
 
     @pytest.mark.usefixtures("clock")
+    def test_winerror_and_errno_are_different_reasons(self, records):
+        """WinError 5 (отказ в доступе) и errno 5 (EIO) — не одно."""
+        event_tracking.directory_error("/srv", OSError(errno.EIO, "I/O"), 500)
+        event_tracking.directory_error("/srv", win_error(errno.EIO), 500)
+
+        assert [e for e, _ in events(records)] == [2000, 2000]
+
+    @pytest.mark.usefixtures("clock")
     def test_reason_change(self, records):
         """Смена причины 404 → 403 — новое 2000."""
         missing = FileNotFoundError(errno.ENOENT, "No such file", "/srv")

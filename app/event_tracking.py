@@ -15,17 +15,16 @@
 только добавляются, смысл существующих не меняется.
 """
 
-import bisect
 import contextvars
 import functools
 import itertools
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from enum import IntEnum
-from operator import attrgetter
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -101,6 +100,12 @@ OnSent = Callable[[], None]
 # Атрибут записи журнала: только в журнал событий — строка о ней в
 # файле журнала и консоли уже есть
 EVENT_ONLY_ATTRIBUTE = "event_only"
+# Атрибут обработчика: он сообщает об исходе записи (SENT_ATTRIBUTE,
+# UNSENT_ATTRIBUTE) — только тогда события о папке ждут его ответа
+CONFIRMS_ATTRIBUTE = "confirms_event_log"
+# Сколько ждать исхода переданного события о папке, прежде чем писать
+# его снова: обработчик мог потерять запись
+OUTCOME_TIMEOUT_SECONDS = 5 * 60.0
 # После отказа записи событие пишется снова не раньше чем через минуту:
 # пока журнал событий отказывает, запросы не ждут ReportEvent каждый
 UNSENT_RETRY_SECONDS = 60.0
@@ -173,70 +178,88 @@ class _Unavailable:
 class _Pending:
     """Событие о папке (2000, 2001, 2002), которое ещё не записано."""
 
-    # Порядок появления: очередь упорядочена по нему
-    seq: int
     level: int
     event_id: int
     message: str
-    # Трассировка ответа 5xx текстом: без кадров стека в памяти
+    # Исключение ответа 5xx до первой попытки записи; после неё —
+    # трассировка текстом, без кадров стека в памяти
+    exc: BaseException | None = None
     traceback: str = ""
+    # Строка уже есть в файле журнала и консоли: дальше — только в
+    # журнал событий
+    logged: bool = False
     retry_at: float = 0.0
+    # Когда передано обработчику (пока исход не известен)
+    sent_at: float = 0.0
     # Сколько более ранних событий отброшено сверх PENDING_LIMIT
     dropped_before: int = 0
 
+    def detach_exc(self) -> None:
+        """Заменить исключение текстом трассировки."""
+        if self.exc is not None:
+            self.traceback = _format_traceback(self.exc)
+            self.exc = None
+
     def text(self) -> str:
-        """Текст события: сообщение, отброшенные, трассировка."""
-        text = self.message
-        if self.dropped_before:
-            text += (
-                ". Более ранних событий о папке не записано в журнал "
-                f"событий: {self.dropped_before}, они есть в файле журнала"
-            )
-        if self.traceback:
-            text += "\n" + self.traceback
-        return text
+        """Текст события: сообщение и число отброшенных до него."""
+        if not self.dropped_before:
+            return self.message
+        return (
+            f"{self.message}. Более ранних событий о папке не записано в "
+            f"журнал событий: {self.dropped_before}, они есть в файле журнала"
+        )
 
 
 # События о папке пишутся в журнал событий через одну очередь по
 # порядку появления и со своим текстом: так 2000 о смене причины
 # сохраняет число ответов прежней причины, а 2001 не опередит своё
 # 2000. Обработчику передаётся одно событие за раз: следующее — только
-# когда он сообщил, что это записано (обратный вызов _sent). Так порядок
+# когда он сообщил, что это записано (_pending_sent). Так порядок
 # держится, даже если обработчик пишет позже и в другом потоке
 # (стартовый буфер, поток записи). Обратные вызовы приходят и без
 # directory_lock, поэтому очередь — под _access_lock
 
-# Обработчиков журнала событий: без них события о папке идут в журнал
-# сразу, как обычные записи, — подтверждать их некому
-_event_log_handlers = 0
 
+def _confirmed(level: int) -> bool:
+    """Проверить, дойдёт ли запись до обработчика с ответом об исходе.
 
-def event_log_attached(*, attached: bool) -> None:
-    """Учесть появление или закрытие обработчика журнала событий."""
-    global _event_log_handlers  # noqa: PLW0603 - счётчик модуля
-    with _access_lock:
-        _event_log_handlers += 1 if attached else -1
+    Иначе исхода не будет и очередь встала бы навсегда: событие о папке
+    пишется как обычная запись.
+    """
+    if not logger.isEnabledFor(level):
+        return False
+    current: logging.Logger | None = logger
+    while current is not None:
+        if any(
+            getattr(handler, CONFIRMS_ATTRIBUTE, False) and level >= handler.level
+            for handler in current.handlers
+        ):
+            return True
+        current = current.parent if current.propagate else None
+    return False
 
 
 def _enqueue(item: _Pending) -> None:
-    """Поставить событие в очередь на его место (под _access_lock)."""
+    """Поставить событие в конец очереди (под _access_lock)."""
     pending = _state.pending
-    bisect.insort(pending, item, key=attrgetter("seq"))
-    # Переданное обработчику не отбрасывается: его исход ещё придёт
-    first = 1 if pending[0] is _state.in_flight else 0
+    pending.append(item)
     if len(pending) > PENDING_LIMIT:
+        # Переданное обработчику не отбрасывается: его исход ещё придёт
+        first = 1 if pending[0] is _state.in_flight else 0
         # Самое старое остаётся только в файле журнала, а число таких
         # укажет следующее. Срок повтора переходит к нему же: отброс не
         # ускоряет вызовы ReportEvent
-        dropped = pending.pop(first)
+        dropped = pending[first]
+        del pending[first]
         following = pending[first]
         following.dropped_before += dropped.dropped_before + 1
         following.retry_at = max(following.retry_at, dropped.retry_at)
 
 
-def _sent(item: _Pending) -> None:
+def _pending_sent(item: _Pending) -> None:
     """Событие о папке записано: передать обработчику следующее."""
     with _access_lock:
+        item.exc = None
         if item in _state.pending:
             _state.pending.remove(item)
         if _state.in_flight is item:
@@ -247,13 +270,31 @@ def _sent(item: _Pending) -> None:
         _drain(clock(), force=False)
 
 
-def _unsent(item: _Pending, retry_after: float) -> None:
+def _pending_unsent(item: _Pending, retry_after: float) -> None:
     """Событие о папке не записалось: первое в очереди до повтора."""
     retry_at = clock() + retry_after
+    item.detach_exc()
     with _access_lock:
         item.retry_at = retry_at
         if _state.in_flight is item:
             _state.in_flight = None
+
+
+def _next_pending(now: float, *, force: bool) -> _Pending | None:
+    """Первое событие, если его пора передать (под _access_lock)."""
+    pending = _state.pending
+    in_flight = _state.in_flight
+    if in_flight is not None:
+        if now - in_flight.sent_at < OUTCOME_TIMEOUT_SECONDS:
+            return None
+        # Исход так и не пришёл (например, поток записи завис): событие
+        # пишется снова, иначе очередь встала бы навсегда
+        _state.in_flight = None
+    if not pending or (not force and now < pending[0].retry_at):
+        return None
+    head = _state.in_flight = pending[0]
+    head.sent_at = now
+    return head
 
 
 def _drain(now: float, *, force: bool) -> None:
@@ -270,27 +311,39 @@ def _drain(now: float, *, force: bool) -> None:
         _state.draining = True
     while True:
         with _access_lock:
-            pending = _state.pending
-            if (
-                not pending
-                or _state.in_flight is not None
-                or (not force and now < pending[0].retry_at)
-            ):
+            head = _next_pending(now, force=force)
+            if head is None:
                 _state.draining = False
                 return
-            head = _state.in_flight = pending[0]
-        _log(
-            head.level,
-            head.event_id,
-            head.text(),
-            on_unsent=functools.partial(_unsent, head),
-            on_sent=functools.partial(_sent, head),
-            event_only=True,
-        )
+            first_attempt = not head.logged
+            head.logged = True
+        if first_attempt:
+            # Одна запись: файл журнала, консоль и журнал событий
+            _log(
+                head.level,
+                head.event_id,
+                head.text(),
+                head.exc,
+                on_unsent=functools.partial(_pending_unsent, head),
+                on_sent=functools.partial(_pending_sent, head),
+            )
+        else:
+            head.detach_exc()
+            text = head.text()
+            if head.traceback:
+                text += "\n" + head.traceback
+            _log(
+                head.level,
+                head.event_id,
+                text,
+                on_unsent=functools.partial(_pending_unsent, head),
+                on_sent=functools.partial(_pending_sent, head),
+                event_only=True,
+            )
         with _access_lock:
             if _state.in_flight is head or head in _state.pending:
-                # Исход ещё не известен — _sent продолжит; не записалось
-                # — такт после срока повтора
+                # Исход ещё не известен — _pending_sent продолжит; не
+                # записалось — такт после срока повтора
                 _state.draining = False
                 return
 
@@ -307,25 +360,20 @@ def _directory_event(
 ) -> None:
     """Записать событие о папке (под directory_lock).
 
-    В файл журнала и консоль — сразу, в журнал событий — через очередь
-    за ещё не записанными событиями о папке.
+    Если ждущих нет, это одна запись. Иначе строка в файл журнала и
+    консоль идёт сразу, а в журнал событий — за ждущими.
     """
-    with _access_lock:
-        queued = _event_log_handlers > 0
-        if queued:
-            _enqueue(
-                _Pending(
-                    next(_state.pending_numbers),
-                    level,
-                    event_id,
-                    message,
-                    _format_traceback(exc) if exc is not None else "",
-                )
-            )
-    if not queued:
+    if not _confirmed(level):
         _log(level, event_id, message, exc)
         return
-    _log(level, None, message, exc)
+    item = _Pending(level, event_id, message, exc)
+    with _access_lock:
+        behind = bool(_state.pending) or _state.draining
+        item.logged = behind
+        _enqueue(item)
+    if behind:
+        _log(level, None, message, exc)
+        item.detach_exc()
     _drain(clock(), force=False)
 
 
@@ -352,8 +400,7 @@ class _State:
         self.directory: _Unavailable | None = None
         # Незаписанные события о папке: такт таймера пишет их снова не
         # раньше срока повтора, flush — сразу
-        self.pending: list[_Pending] = []
-        self.pending_numbers = itertools.count()
+        self.pending: deque[_Pending] = deque()
         # Событие о папке, переданное обработчику, исход которого ещё
         # не известен; идёт ли _drain
         self.in_flight: _Pending | None = None
@@ -543,11 +590,15 @@ def is_directory_error(error: BaseException) -> bool:
 
 
 def _reason(error: BaseException) -> Hashable:
-    return (
-        getattr(error, "winerror", None)
-        or getattr(error, "errno", None)
-        or type(error).__name__
-    )
+    # Коды Windows и errno — разные пространства: WinError 5 (отказ в
+    # доступе) и errno 5 (EIO) — разные причины
+    winerror = getattr(error, "winerror", None)
+    if winerror:
+        return ("winerror", winerror)
+    errno = getattr(error, "errno", None)
+    if errno:
+        return ("errno", errno)
+    return type(error).__name__
 
 
 def _server_error(error: BaseException, status: int | str) -> BaseException | None:

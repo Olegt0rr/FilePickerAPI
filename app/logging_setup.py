@@ -8,6 +8,7 @@
 import logging
 import sys
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -21,7 +22,6 @@ from app.event_tracking import (
     OnSent,
     OnUnsent,
     admit,
-    event_log_attached,
     is_tracked,
     unsent_callback,
 )
@@ -118,6 +118,9 @@ class EventLogHandler(logging.Handler):
     строка в файл журнала, а сами записи в нём уже есть.
     """
 
+    # Сообщает об исходе записи: события о папке ждут его ответа
+    confirms_event_log = True  # event_tracking.CONFIRMS_ATTRIBUTE
+
     def __init__(self) -> None:
         """Открыть источник событий FilePickerAPI."""
         super().__init__()
@@ -125,9 +128,6 @@ class EventLogHandler(logging.Handler):
 
         self._win32evtlog = win32evtlog
         self._source = win32evtlog.RegisterEventSource(None, EVENT_SOURCE)
-        # События о папке идут через очередь event_tracking: обработчик
-        # подтверждает их запись
-        event_log_attached(attached=True)
         # Текст форматируется при записи: буфер не держит ни аргументы,
         # ни трассировки с кадрами стека. У записи — что сделать, если
         # событие отброшено или не записалось (см. event_tracking._log):
@@ -158,14 +158,14 @@ class EventLogHandler(logging.Handler):
         try:
             message = record.getMessage()
         except Exception:
-            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
         if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
             self._dropped += 1
             # Повторы этой записи учтены ещё в event_tracking (track,
             # 2000): без пометки её событие не пришло бы никогда
-            _unsent(on_unsent, 0)
+            _notify(on_unsent, 0)
             return
         note = ""
         if getattr(record, "event_id", None) is None:
@@ -185,7 +185,7 @@ class EventLogHandler(logging.Handler):
         except Exception:
             # Ключ уже занят: без пометки следующий случай считался бы
             # повтором уже записанного события
-            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
         event = (record.levelno, event_id, text, on_unsent, on_sent)
@@ -216,7 +216,7 @@ class EventLogHandler(logging.Handler):
             buffered, self._buffer = self._buffer or [], None
             self._dropped = 0
             for *_, on_unsent, _on_sent in buffered:
-                _unsent(on_unsent, 0)
+                _notify(on_unsent, 0)
 
     def _report(
         self,
@@ -253,7 +253,7 @@ class EventLogHandler(logging.Handler):
                 None,
             )
         except Exception as e:
-            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             if not self._report_failing:
                 self._report_failing = True
                 logger.warning(
@@ -264,21 +264,30 @@ class EventLogHandler(logging.Handler):
                 )
             return
         self._report_failing = False
-        if on_sent is not None:
-            on_sent()
+        _notify(on_sent)
 
     def close(self) -> None:
         """Закрыть источник событий."""
         source, self._source = self._source, None
         if source is not None:
-            event_log_attached(attached=False)
             self._win32evtlog.DeregisterEventSource(source)
         super().close()
 
 
-def _unsent(on_unsent: OnUnsent | None, retry_after: float) -> None:
-    if on_unsent is not None:
-        on_unsent(retry_after)
+def _notify(callback: Callable[..., None] | None, *args: float) -> None:
+    """Сообщить учёту об исходе события.
+
+    Ошибка учёта не выходит из emit: иначе она дошла бы до кода, который
+    просто писал в журнал (обработчик запроса, отправка буфера).
+    """
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        logger.exception(
+            "Ошибка учёта исхода события журнала событий", extra={"event_log": False}
+        )
 
 
 class LogFileHandler(TimedRotatingFileHandler):

@@ -823,10 +823,103 @@ class TestEventLogHandler:
         assert [e[0] for e in sent] == [2000, 2000]
         assert sent[1][2] == sent[0][2]
         assert sent[1][2].endswith("\nOSError: [Errno 5] I/O")
-        # В файл журнала и консоль — каждый ответ один раз
+        # Первая попытка — одна запись, повтор — только в журнал событий
         event_only = [r for r in caplog.records if getattr(r, "event_only", False)]
-        assert [r.event_id for r in event_only] == [2000, 2000]
-        assert all(r.exc_info is None for r in event_only)
+        assert [r.event_id for r in event_only] == [2000]
+        assert event_only[0].exc_info is None
+
+    def test_filtered_level_does_not_block_queue(self, tracking_handler):
+        """Проверить: 2001 отсечено уровнем логгера — очередь не ждёт
+        его исхода, и следующее 2000 пишется.
+        """
+        evtlog = tracking_handler
+        logging.getLogger("app.event_tracking").setLevel(logging.WARNING)
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_ok()
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2000]
+
+    @pytest.mark.usefixtures("clock")
+    def test_not_reached_handler_does_not_block_queue(self, event_logger, caplog):
+        """Проверить: обработчик журнала событий не на пути записей
+        учёта — события о папке пишутся без очереди.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        _, evtlog = event_logger
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_ok()
+
+        evtlog.ReportEvent.assert_not_called()
+        assert [r.event_id for r in caplog.records if hasattr(r, "event_id")] == [
+            2000,
+            2001,
+        ]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_lost_outcome_resent_after_timeout(self, tracking_handler, clock, caplog):
+        """Проверить: исход 2000 так и не пришёл — через срок ожидания
+        такт пишет его снова, а 2001 — после него.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        with mock.patch.object(handler, "_report"):
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_ok()
+        event_tracking.tick()
+        evtlog.ReportEvent.assert_not_called()
+        clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+        event_tracking.tick()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+
+    def test_late_outcome_after_timeout(self, tracking_handler, clock, caplog):
+        """Проверить: исход пришёл после срока ожидания — повтор не
+        ломает очередь.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        with mock.patch.object(handler, "_report") as report:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+        event_tracking.tick()
+        # Исход первой попытки — уже после повтора
+        *_, on_sent = report.call_args.args
+        on_sent()
+        event_tracking.directory_ok()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_outcome_callback_error_stays_in_handler(self, event_logger, caplog):
+        """Проверить: ошибка обратного вызова учёта остаётся в emit."""
+        test_logger, evtlog = event_logger
+        test_logger.warning(
+            "событие",
+            extra={"event_id": 2000, "event_sent": mock.Mock(side_effect=ValueError)},
+        )
+        evtlog.ReportEvent.side_effect = OSError("full")
+        test_logger.warning(
+            "событие",
+            extra={
+                "event_id": 2000,
+                "event_unsent": mock.Mock(side_effect=ValueError),
+            },
+        )
+
+        errors = [
+            r
+            for r in caplog.records
+            if r.getMessage().startswith("Ошибка учёта исхода")
+        ]
+        assert len(errors) == 2
+        assert all(r.event_log is False and r.exc_info for r in errors)
+
+    def test_handler_confirms_outcome(self):
+        """Проверить: EventLogHandler сообщает об исходе записи."""
+        assert getattr(logging_setup.EventLogHandler, event_tracking.CONFIRMS_ATTRIBUTE)
 
     @pytest.mark.usefixtures("clock")
     def test_unsent_reason_change_keeps_reason(self, tracking_handler):
