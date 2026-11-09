@@ -13,11 +13,15 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from app.event_tracking import (
+    EVENT_ONLY_ATTRIBUTE,
+    SENT_ATTRIBUTE,
     UNSENT_ATTRIBUTE,
     UNSENT_RETRY_SECONDS,
     EventId,
+    OnSent,
     OnUnsent,
     admit,
+    event_log_attached,
     is_tracked,
     unsent_callback,
 )
@@ -46,6 +50,10 @@ EVENT_SOURCE_KEY = (
 MAX_EVENT_TEXT = 31_839
 TRUNCATED_NOTE = "\n… (обрезано, полный текст в FilePickerAPI.log)"
 STARTUP_BUFFER_LIMIT = 100
+
+# Событие в буфере: уровень, код, текст и что сделать, если оно не
+# записалось или записано
+_Event = tuple[int, int, str, OnUnsent | None, OnSent | None]
 
 # Обработчики, добавленные setup_logging: повторная настройка их снимает
 _handlers: list[logging.Handler] = []
@@ -117,12 +125,15 @@ class EventLogHandler(logging.Handler):
 
         self._win32evtlog = win32evtlog
         self._source = win32evtlog.RegisterEventSource(None, EVENT_SOURCE)
+        # События о папке идут через очередь event_tracking: обработчик
+        # подтверждает их запись
+        event_log_attached(attached=True)
         # Текст форматируется при записи: буфер не держит ни аргументы,
         # ни трассировки с кадрами стека. У записи — что сделать, если
         # событие отброшено или не записалось (см. event_tracking._log):
         # тогда первое событие придёт при следующем случае, а
         # посчитанные повторы сохранятся
-        self._buffer: list[tuple[int, int, str, OnUnsent | None]] | None = []
+        self._buffer: list[_Event] | None = []
         self._dropped = 0
         # Идёт серия отказов ReportEvent: строка о ней уже в журнале
         self._report_failing = False
@@ -140,20 +151,21 @@ class EventLogHandler(logging.Handler):
         event_id = event_id_for(record)
         if event_id is None:
             return
-        try:
-            message = record.getMessage()
-        except Exception:
-            self.handleError(record)
-            return
         # Лимит буфера — до учёта повторов: отброшенная запись не
         # должна занять ключ, иначе её первое событие не придёт никогда
         on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
+        on_sent = getattr(record, SENT_ATTRIBUTE, None)
+        try:
+            message = record.getMessage()
+        except Exception:
+            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+            self.handleError(record)
+            return
         if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
             self._dropped += 1
             # Повторы этой записи учтены ещё в event_tracking (track,
             # 2000): без пометки её событие не пришло бы никогда
-            if on_unsent is not None:
-                on_unsent(0)
+            _unsent(on_unsent, 0)
             return
         note = ""
         if getattr(record, "event_id", None) is None:
@@ -173,14 +185,14 @@ class EventLogHandler(logging.Handler):
         except Exception:
             # Ключ уже занят: без пометки следующий случай считался бы
             # повтором уже записанного события
-            if on_unsent is not None:
-                on_unsent(UNSENT_RETRY_SECONDS)
+            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
+        event = (record.levelno, event_id, text, on_unsent, on_sent)
         if self._buffer is None:
-            self._report(record.levelno, event_id, text, on_unsent)
+            self._report(*event)
         else:
-            self._buffer.append((record.levelno, event_id, text, on_unsent))
+            self._buffer.append(event)
 
     def send_startup_events(self) -> None:
         """Отправить буфер; дальше события пишутся сразу."""
@@ -192,23 +204,27 @@ class EventLogHandler(logging.Handler):
                     "они есть в файле журнала"
                 )
                 buffered.append(
-                    (note.levelno, EventId.OTHER_WARNING, self.format(note), None)
+                    (note.levelno, EventId.OTHER_WARNING, self.format(note), None, None)
                 )
                 self._dropped = 0
-            for levelno, event_id, text, on_unsent in buffered:
-                self._report(levelno, event_id, text, on_unsent)
+            for event in buffered:
+                self._report(*event)
 
     def discard_startup_events(self) -> None:
         """Отбросить буфер; дальше события пишутся сразу."""
         with self.lock:
             buffered, self._buffer = self._buffer or [], None
             self._dropped = 0
-            for *_, on_unsent in buffered:
-                if on_unsent is not None:
-                    on_unsent(0)
+            for *_, on_unsent, _on_sent in buffered:
+                _unsent(on_unsent, 0)
 
     def _report(
-        self, levelno: int, event_id: int, text: str, on_unsent: OnUnsent | None
+        self,
+        levelno: int,
+        event_id: int,
+        text: str,
+        on_unsent: OnUnsent | None,
+        on_sent: OnSent | None,
     ) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
 
@@ -216,7 +232,8 @@ class EventLogHandler(logging.Handler):
         одна строка на серию отказов в файл журнала и консоль (не в
         журнал событий), сама запись в файле журнала уже есть. Для
         незаписанного события вызывается on_unsent: следующий такой же
-        случай снова даст событие, а число повторов не потеряется.
+        случай снова даст событие, а число повторов не потеряется. Для
+        записанного — on_sent.
         """
         if levelno >= logging.ERROR:
             event_type = self._win32evtlog.EVENTLOG_ERROR_TYPE
@@ -236,8 +253,7 @@ class EventLogHandler(logging.Handler):
                 None,
             )
         except Exception as e:
-            if on_unsent is not None:
-                on_unsent(UNSENT_RETRY_SECONDS)
+            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
             if not self._report_failing:
                 self._report_failing = True
                 logger.warning(
@@ -248,13 +264,21 @@ class EventLogHandler(logging.Handler):
                 )
             return
         self._report_failing = False
+        if on_sent is not None:
+            on_sent()
 
     def close(self) -> None:
         """Закрыть источник событий."""
         source, self._source = self._source, None
         if source is not None:
+            event_log_attached(attached=False)
             self._win32evtlog.DeregisterEventSource(source)
         super().close()
+
+
+def _unsent(on_unsent: OnUnsent | None, retry_after: float) -> None:
+    if on_unsent is not None:
+        on_unsent(retry_after)
 
 
 class LogFileHandler(TimedRotatingFileHandler):
@@ -283,9 +307,10 @@ class LogFileHandler(TimedRotatingFileHandler):
         Если файл не открылся при ротации, FileHandler.emit пытался бы
         открыть его на каждой записи. До следующей попытки ротации
         записи в файл не идут, консоль и журнал событий их получают.
-        Запись о самом отказе файла (file_log=False) сюда не пишется.
+        Запись о самом отказе файла (file_log=False) и запись «только в
+        журнал событий» сюда не пишутся.
         """
-        if getattr(record, "file_log", True) is False:
+        if getattr(record, "file_log", True) is False or not not_event_only(record):
             return
         if self.stream is None and time.time() < self.rolloverAt:
             return
@@ -416,6 +441,11 @@ def event_source_registered() -> bool:
     return True
 
 
+def not_event_only(record: logging.LogRecord) -> bool:
+    """Фильтр файла и консоли: без записей «только в журнал событий»."""
+    return not getattr(record, EVENT_ONLY_ATTRIBUTE, False)
+
+
 def _add(handler: logging.Handler) -> logging.Handler:
     logging.getLogger().addHandler(handler)
     _handlers.append(handler)
@@ -441,7 +471,9 @@ def setup_logging(*, console: bool) -> None:
     formatter = logging.Formatter(LOG_FORMAT)
 
     if console:
-        _add(logging.StreamHandler(sys.stderr)).setFormatter(formatter)
+        console = _add(logging.StreamHandler(sys.stderr))
+        console.setFormatter(formatter)
+        console.addFilter(not_event_only)
     if not _windows():
         return
     # Журнал событий раньше файла: 1004 о недоступном файле попадает в

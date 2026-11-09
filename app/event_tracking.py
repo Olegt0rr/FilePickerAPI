@@ -95,6 +95,12 @@ REMIND_WAIT_SECONDS = 1.0
 # Аргумент — через сколько секунд писать событие снова
 UNSENT_ATTRIBUTE = "event_unsent"
 OnUnsent = Callable[[float], None]
+# Атрибут записи журнала: что сделать, когда её событие записано
+SENT_ATTRIBUTE = "event_sent"
+OnSent = Callable[[], None]
+# Атрибут записи журнала: только в журнал событий — строка о ней в
+# файле журнала и консоли уже есть
+EVENT_ONLY_ATTRIBUTE = "event_only"
 # После отказа записи событие пишется снова не раньше чем через минуту:
 # пока журнал событий отказывает, запросы не ждут ReportEvent каждый
 UNSENT_RETRY_SECONDS = 60.0
@@ -163,7 +169,7 @@ class _Unavailable:
     errors_since_write: int = 0
 
 
-@dataclass
+@dataclass(eq=False)
 class _Pending:
     """Событие о папке (2000, 2001, 2002), которое ещё не записано."""
 
@@ -172,68 +178,125 @@ class _Pending:
     level: int
     event_id: int
     message: str
+    # Трассировка ответа 5xx текстом: без кадров стека в памяти
+    traceback: str = ""
     retry_at: float = 0.0
+    # Сколько более ранних событий отброшено сверх PENDING_LIMIT
+    dropped_before: int = 0
+
+    def text(self) -> str:
+        """Текст события: сообщение, отброшенные, трассировка."""
+        text = self.message
+        if self.dropped_before:
+            text += (
+                ". Более ранних событий о папке не записано в журнал "
+                f"событий: {self.dropped_before}, они есть в файле журнала"
+            )
+        if self.traceback:
+            text += "\n" + self.traceback
+        return text
 
 
-# Незаписанные события о папке ждут в одной очереди по порядку появления
-# и со своим текстом: так 2000 о смене причины сохраняет число ответов
-# прежней причины, а 2001 не опередит своё 2000. EventLogHandler
-# вызывает _requeue и под directory_lock этого же потока, и из
-# стартового буфера без него, поэтому очередь — под _access_lock
+# События о папке пишутся в журнал событий через одну очередь по
+# порядку появления и со своим текстом: так 2000 о смене причины
+# сохраняет число ответов прежней причины, а 2001 не опередит своё
+# 2000. Обработчику передаётся одно событие за раз: следующее — только
+# когда он сообщил, что это записано (обратный вызов _sent). Так порядок
+# держится, даже если обработчик пишет позже и в другом потоке
+# (стартовый буфер, поток записи). Обратные вызовы приходят и без
+# directory_lock, поэтому очередь — под _access_lock
+
+# Обработчиков журнала событий: без них события о папке идут в журнал
+# сразу, как обычные записи, — подтверждать их некому
+_event_log_handlers = 0
+
+
+def event_log_attached(*, attached: bool) -> None:
+    """Учесть появление или закрытие обработчика журнала событий."""
+    global _event_log_handlers  # noqa: PLW0603 - счётчик модуля
+    with _access_lock:
+        _event_log_handlers += 1 if attached else -1
 
 
 def _enqueue(item: _Pending) -> None:
     """Поставить событие в очередь на его место (под _access_lock)."""
     pending = _state.pending
     bisect.insort(pending, item, key=attrgetter("seq"))
+    # Переданное обработчику не отбрасывается: его исход ещё придёт
+    first = 1 if pending[0] is _state.in_flight else 0
     if len(pending) > PENDING_LIMIT:
-        # Самое старое остаётся только в файле журнала, а их число
-        # укажет следующее записанное событие о папке. Срок повтора
-        # переходит следующему: отброс не ускоряет вызовы ReportEvent
-        dropped = pending.pop(0)
-        pending[0].retry_at = max(pending[0].retry_at, dropped.retry_at)
-        _state.pending_dropped += 1
+        # Самое старое остаётся только в файле журнала, а число таких
+        # укажет следующее. Срок повтора переходит к нему же: отброс не
+        # ускоряет вызовы ReportEvent
+        dropped = pending.pop(first)
+        following = pending[first]
+        following.dropped_before += dropped.dropped_before + 1
+        following.retry_at = max(following.retry_at, dropped.retry_at)
 
 
-def _requeue(item: _Pending, retry_after: float) -> None:
-    """Событие о папке не записалось: снова в очередь на своё место."""
-    item.retry_at = clock() + retry_after
+def _sent(item: _Pending) -> None:
+    """Событие о папке записано: передать обработчику следующее."""
     with _access_lock:
-        _enqueue(item)
+        if item in _state.pending:
+            _state.pending.remove(item)
+        if _state.in_flight is item:
+            _state.in_flight = None
+        # Идущий _drain (запись в этом же потоке) продолжит сам
+        idle = not _state.draining
+    if idle:
+        _drain(clock(), force=False)
 
 
-def _drain(now: float, *, force: bool) -> bool:
-    """Записать ждущие события о папке по порядку (под directory_lock).
+def _unsent(item: _Pending, retry_after: float) -> None:
+    """Событие о папке не записалось: первое в очереди до повтора."""
+    retry_at = clock() + retry_after
+    with _access_lock:
+        item.retry_at = retry_at
+        if _state.in_flight is item:
+            _state.in_flight = None
 
-    Если срок повтора первого не наступил (без force) или оно снова не
-    записалось, остальные ждут за ним. Возвращает, пуста ли очередь.
-    Ждущее событие уже есть в файле журнала: пишется только в журнал
-    событий.
+
+def _drain(now: float, *, force: bool) -> None:
+    """Передать обработчику ждущие события о папке по порядку.
+
+    Передаёт первое, если обработчик не занят предыдущим и срок повтора
+    наступил (с force — без срока). Если исход ещё не известен или
+    событие не записалось, остальные ждут за ним. Одновременно идёт
+    один _drain: другой поток только ставит событие в очередь.
     """
+    with _access_lock:
+        if _state.draining:
+            return
+        _state.draining = True
     while True:
         with _access_lock:
-            if not _state.pending:
-                return True
-            head = _state.pending[0]
-            if not force and now < head.retry_at:
-                return False
-            del _state.pending[0]
-            dropped, _state.pending_dropped = _state.pending_dropped, 0
-        if dropped:
-            head.message += (
-                f" (ещё {dropped} событий о папке не записано в журнал "
-                "событий, они есть в файле журнала)"
-            )
+            pending = _state.pending
+            if (
+                not pending
+                or _state.in_flight is not None
+                or (not force and now < pending[0].retry_at)
+            ):
+                _state.draining = False
+                return
+            head = _state.in_flight = pending[0]
         _log(
             head.level,
             head.event_id,
-            head.message,
-            on_unsent=functools.partial(_requeue, head),
-            file_log=False,
+            head.text(),
+            on_unsent=functools.partial(_unsent, head),
+            on_sent=functools.partial(_sent, head),
+            event_only=True,
         )
         with _access_lock:
-            if any(item is head for item in _state.pending):
-                return False
+            if _state.in_flight is head or head in _state.pending:
+                # Исход ещё не известен — _sent продолжит; не записалось
+                # — такт после срока повтора
+                _state.draining = False
+                return
+
+
+def _format_traceback(exc: BaseException) -> str:
+    return logging.Formatter().formatException((type(exc), exc, exc.__traceback__))
 
 
 def _directory_event(
@@ -242,19 +305,28 @@ def _directory_event(
     message: str,
     exc: BaseException | None = None,
 ) -> None:
-    """Записать событие о папке после ждущих (под directory_lock).
+    """Записать событие о папке (под directory_lock).
 
-    Пока ждущие не записаны, событие встаёт в очередь за ними, а в
-    файл журнала пишется сразу.
+    В файл журнала и консоль — сразу, в журнал событий — через очередь
+    за ещё не записанными событиями о папке.
     """
     with _access_lock:
-        item = _Pending(next(_state.pending_numbers), level, event_id, message)
-    if _drain(clock(), force=False):
-        _log(level, event_id, message, exc, on_unsent=functools.partial(_requeue, item))
+        queued = _event_log_handlers > 0
+        if queued:
+            _enqueue(
+                _Pending(
+                    next(_state.pending_numbers),
+                    level,
+                    event_id,
+                    message,
+                    _format_traceback(exc) if exc is not None else "",
+                )
+            )
+    if not queued:
+        _log(level, event_id, message, exc)
         return
     _log(level, None, message, exc)
-    with _access_lock:
-        _enqueue(item)
+    _drain(clock(), force=False)
 
 
 class _State:
@@ -282,8 +354,10 @@ class _State:
         # раньше срока повтора, flush — сразу
         self.pending: list[_Pending] = []
         self.pending_numbers = itertools.count()
-        # Сколько ждущих отброшено сверх PENDING_LIMIT
-        self.pending_dropped = 0
+        # Событие о папке, переданное обработчику, исход которого ещё
+        # не известен; идёт ли _drain
+        self.in_flight: _Pending | None = None
+        self.draining = False
         # Номер самого позднего успешного обращения к папке
         self.last_ok_access = 0
         self.timer: threading.Thread | None = None
@@ -383,23 +457,26 @@ def _log(  # noqa: PLR0913 - поля одной записи
     exc: BaseException | None = None,
     *,
     on_unsent: OnUnsent | None = None,
-    file_log: bool = True,
+    on_sent: OnSent | None = None,
+    event_only: bool = False,
 ) -> None:
     """Записать строку; без кода — только в файл журнала.
 
     on_unsent вызывает EventLogHandler, если событие не записалось
     (отказ ReportEvent или форматтера, отброшенный стартовый буфер):
     так первое событие ключа, событие о папке или число повторов не
-    теряются. file_log=False — повтор события, строка о котором в
-    файле журнала уже есть.
+    теряются; on_sent — когда событие записано. event_only — только в
+    журнал событий: строка в файле журнала и консоли уже есть.
     """
     extra: dict[str, object] = (
         {"event_log": False} if event_id is None else {"event_id": event_id}
     )
     if event_id is not None and on_unsent is not None:
         extra[UNSENT_ATTRIBUTE] = on_unsent
-    if not file_log:
-        extra["file_log"] = False
+    if event_id is not None and on_sent is not None:
+        extra[SENT_ATTRIBUTE] = on_sent
+    if event_only:
+        extra[EVENT_ONLY_ATTRIBUTE] = True
     logger.log(level, "%s", message, exc_info=exc, extra=extra)
 
 
