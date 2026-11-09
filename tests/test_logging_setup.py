@@ -798,6 +798,53 @@ class TestEventLogHandler:
         assert "Ошибочных ответов с прошлой записи: 1 ([Errno 5] I/O)" in sent[1][2]
 
     @pytest.mark.usefixtures("clock")
+    def test_unsent_reason_change_keeps_count(self, tracking_handler):
+        """Проверить: 2000 о смене причины не записалось — ответы с
+        прошлой записи не теряются и уходят итоговым 2002.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [None, OSError("full"), None]
+        missing = FileNotFoundError(2, "No such file", "/srv")
+        for _ in range(3):
+            event_tracking.directory_error("/srv", missing, 404)
+        event_tracking.directory_error("/srv", PermissionError(13, "denied"), 403)
+        event_tracking.flush()
+
+        sent = reported(evtlog)
+        assert [e[0] for e in sent] == [2000, 2000, 2002]
+        assert sent[-1][2].endswith("Ошибочных ответов с прошлой записи: 2")
+
+    def test_unsent_restored_resent_by_tick(self, tracking_handler, clock, caplog):
+        """Проверить: 2001 не записалось — такт через минуту пишет его
+        снова, а папка остаётся доступной.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [None, OSError("full"), None]
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_ok()
+        event_tracking.tick()
+        assert evtlog.ReportEvent.call_count == 2
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.tick()
+        event_tracking.flush()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001, 2001]
+        assert event_tracking._state.directory is None  # noqa: SLF001
+
+    @pytest.mark.usefixtures("clock")
+    def test_unsent_restored_before_new_unavailable(self, tracking_handler, caplog):
+        """Проверить: незаписанное 2001 пишется до нового 2000."""
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [None, OSError("full"), None, None]
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_ok()
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001, 2001, 2000]
+
+    @pytest.mark.usefixtures("clock")
     def test_restored_after_unsent_names_reason(self, tracking_handler, caplog):
         """Проверить: 2000 так и не записалось — в 2001 есть причина."""
         caplog.set_level(logging.INFO, logger="app.event_tracking")

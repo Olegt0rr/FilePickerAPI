@@ -166,11 +166,13 @@ class _Unavailable:
 # буфера без него, поэтому поля — под _access_lock, а не directory_lock
 
 
-def _directory_unsent(state: _Unavailable, retry_after: float) -> None:
+def _directory_unsent(state: _Unavailable, count: int, retry_after: float) -> None:
+    """2000 не записалось: пишется снова, а снятые им ответы вернуть."""
     retry_at = clock() + retry_after
     with _access_lock:
         state.unsent = True
         state.retry_at = retry_at
+        state.errors_since_write += count
 
 
 def _restore_directory_errors(
@@ -181,6 +183,39 @@ def _restore_directory_errors(
     """2002 не записалось: ошибочные ответы уйдут следующим."""
     with _access_lock:
         state.errors_since_write += count
+
+
+@dataclass
+class _PendingRestored:
+    """Незаписанное событие 2001 и когда писать его снова."""
+
+    message: str
+    retry_at: float
+
+
+def _restored_unsent(message: str, retry_after: float) -> None:
+    retry_at = clock() + retry_after
+    with _access_lock:
+        _state.restored = _PendingRestored(message, retry_at)
+
+
+def _log_restored(message: str) -> None:
+    _log(
+        logging.INFO,
+        EventId.DIRECTORY_RESTORED,
+        message,
+        on_unsent=functools.partial(_restored_unsent, message),
+    )
+
+
+def _resend_restored(now: float, *, force: bool) -> None:
+    """Записать снова незаписанное 2001 (под directory_lock)."""
+    with _access_lock:
+        pending = _state.restored
+        if pending is None or (not force and now < pending.retry_at):
+            return
+        _state.restored = None
+    _log_restored(pending.message)
 
 
 class _State:
@@ -204,6 +239,9 @@ class _State:
         # память постоянна при любом потоке новых fileId
         self.overflow: dict[int, _Entry] = {}
         self.directory: _Unavailable | None = None
+        # 2001, которое не записалось: такт таймера или flush пишет его
+        # снова, папка при этом остаётся доступной
+        self.restored: _PendingRestored | None = None
         # Номер самого позднего успешного обращения к папке
         self.last_ok_access = 0
         self.timer: threading.Thread | None = None
@@ -447,13 +485,16 @@ def directory_error(
             mark_tracked(error)
             return
         if state is None:
-            changed = True
+            changed, count = True, 0
             state = _state.directory
+            # Прошлое восстановление, которое не записалось, — до нового
+            # 2000, иначе порядок событий в журнале перепутается
+            _resend_restored(now, force=True)
         else:
             # Поля — под _access_lock: их меняют и обратные вызовы
             # EventLogHandler для незаписанных 2000 и 2002
             with _access_lock:
-                changed, message = _update_unavailable(
+                changed, count, message = _update_unavailable(
                     state, reason, description, access, now, message
                 )
         _log(
@@ -461,7 +502,7 @@ def directory_error(
             EventId.DIRECTORY_UNAVAILABLE if changed else None,
             message,
             exc,
-            on_unsent=functools.partial(_directory_unsent, state),
+            on_unsent=functools.partial(_directory_unsent, state, count),
         )
     mark_tracked(error)
 
@@ -473,10 +514,12 @@ def _update_unavailable(  # noqa: PLR0913, PLR0917 - поля одной оши�
     access: int,
     now: float,
     message: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, int, str]:
     """Учесть ошибку уже недоступной папки.
 
-    Возвращает, писать ли 2000, и текст записи.
+    Возвращает, писать ли 2000, сколько ошибочных ответов с прошлой
+    записи оно снимает со счётчика (их вернёт _directory_unsent, если
+    2000 не запишется) и текст записи.
     """
     # Ошибка обращения, начатого раньше последнего сбоя, — повтор:
     # причину она не меняет, иначе более старая вытеснила бы новую
@@ -487,20 +530,21 @@ def _update_unavailable(  # noqa: PLR0913, PLR0917 - поля одной оши�
     state.errors += 1
     if not (new_reason or resend):
         state.errors_since_write += 1
-        return False, message
-    if state.errors_since_write:
+        return False, 0, message
+    count = state.errors_since_write
+    if count:
         message += (
             ". До смены причины ошибочных ответов с прошлой записи: "
             if new_reason
             else ". Ошибочных ответов с прошлой записи: "
-        ) + f"{state.errors_since_write} ({state.description})"
+        ) + f"{count} ({state.description})"
     if new_reason:
         state.reason = reason
         state.description = description
     state.unsent = False
     state.last_write = now
     state.errors_since_write = 0
-    return True, message
+    return True, count, message
 
 
 def begin_access() -> int:
@@ -553,7 +597,8 @@ def directory_ok() -> None:
         if state.unsent:
             # 2000 так и не записалось: причина — здесь
             message += f". Причина недоступности: {state.description}"
-        _log(logging.INFO, EventId.DIRECTORY_RESTORED, message)
+        # Не записалось — повторит такт таймера или flush
+        _log_restored(message)
 
 
 def file_error(
@@ -657,6 +702,7 @@ def _remind(*, final: bool) -> None:
     for level, event_id, message, on_unsent in reminders:
         _log(level, event_id, message, on_unsent=on_unsent)
     with _state.directory_lock:
+        _resend_restored(now, force=final)
         state = _state.directory
         if state is not None and (
             final
