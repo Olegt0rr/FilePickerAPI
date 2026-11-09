@@ -10,14 +10,18 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from app.event_tracking import (
+    EVENT_ONLY_ATTRIBUTE,
+    SENT_ATTRIBUTE,
     UNSENT_ATTRIBUTE,
     UNSENT_RETRY_SECONDS,
     EventId,
+    OnSent,
     OnUnsent,
     admit,
     is_tracked,
@@ -116,8 +120,8 @@ def truncate_event_text(text: str) -> str:
 
 
 # Событие для ReportEvent: уровень, код, текст и что сделать, если оно
-# отброшено или не записалось (см. event_tracking._log)
-_Event = tuple[int, int, str, OnUnsent | None]
+# отброшено или не записалось и если записано (см. event_tracking._log)
+_Event = tuple[int, int, str, OnUnsent | None, OnSent | None]
 
 
 class EventLogHandler(logging.Handler):
@@ -140,8 +144,15 @@ class EventLogHandler(logging.Handler):
     цикл событий Uvicorn, запуск и запросы. Очередь ограничена
     EVENT_QUEUE_LIMIT; о событиях сверх неё пишется одна пометка, когда
     очередь опустеет. Очередь и писатель — под своим замком, а не под
-    замком обработчика: его держит flush_handlers, пока ждёт очередь.
+    замком обработчика.
+
+    Об исходе каждого события писатель сообщает учёту (on_sent или
+    on_unsent): события о папке ждут этого ответа, и следующее событие
+    о папке пишется из обратного вызова в потоке писателя.
     """
+
+    # Сообщает об исходе записи: события о папке ждут его ответа
+    confirms_event_log = True  # event_tracking.CONFIRMS_ATTRIBUTE
 
     def __init__(self) -> None:
         """Открыть источник событий FilePickerAPI."""
@@ -175,8 +186,8 @@ class EventLogHandler(logging.Handler):
         # Время и уровень Event Viewer показывает сам
         self.setFormatter(logging.Formatter("%(name)s: %(message)s"))
         # Запись без события не берёт замок обработчика: строку об
-        # отказе ReportEvent пишет писатель, пока flush_handlers держит
-        # этот замок и ждёт очередь
+        # отказе ReportEvent пишет писатель, а замок может держать
+        # поток, который ждёт очередь
         self.addFilter(lambda record: event_id_for(record) is not None)
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -195,12 +206,14 @@ class EventLogHandler(logging.Handler):
             return
         outcome = getattr(record, "outcome", False)
         on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
+        on_sent = getattr(record, SENT_ATTRIBUTE, None)
         if self._discarded and not outcome:
-            _unsent(on_unsent, 0)
+            _notify(on_unsent, 0)
             return
         try:
             message = record.getMessage()
         except Exception:
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
         # Лимит буфера — до учёта повторов: отброшенная запись не
@@ -214,7 +227,7 @@ class EventLogHandler(logging.Handler):
             self._dropped += 1
             # Повторы этой записи учтены ещё в event_tracking (track,
             # 2000): без пометки её событие не пришло бы никогда
-            _unsent(on_unsent, 0)
+            _notify(on_unsent, 0)
             return
         note = ""
         if getattr(record, "event_id", None) is None:
@@ -234,10 +247,10 @@ class EventLogHandler(logging.Handler):
         except Exception:
             # Ключ уже занят: без пометки следующий случай считался бы
             # повтором уже записанного события
-            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
-        event = (record.levelno, event_id, text, on_unsent)
+        event = (record.levelno, event_id, text, on_unsent, on_sent)
         if self._buffer is not None:
             self._buffer.append(event)
         else:
@@ -253,7 +266,7 @@ class EventLogHandler(logging.Handler):
                     "они есть в файле журнала"
                 )
                 buffered.append(
-                    (note.levelno, EventId.OTHER_WARNING, self.format(note), None)
+                    (note.levelno, EventId.OTHER_WARNING, self.format(note), None, None)
                 )
                 self._dropped = 0
             self._enqueue(buffered)
@@ -268,8 +281,8 @@ class EventLogHandler(logging.Handler):
             buffered, self._buffer = self._buffer or [], None
             self._discarded = True
             self._dropped = 0
-            for *_, on_unsent in buffered:
-                _unsent(on_unsent, 0)
+            for *_, on_unsent, _on_sent in buffered:
+                _notify(on_unsent, 0)
 
     def flush(self) -> None:
         """Дождаться записи очереди не дольше EVENT_FLUSH_SECONDS."""
@@ -298,8 +311,8 @@ class EventLogHandler(logging.Handler):
                 )
                 self._writer.start()
             self._ready.notify_all()
-        for *_, on_unsent in rejected:
-            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+        for *_, on_unsent, _on_sent in rejected:
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
 
     def _lost_note(self) -> _Event:
         note = _service_record(
@@ -307,7 +320,7 @@ class EventLogHandler(logging.Handler):
             "они есть в файле журнала"
         )
         self._lost = 0
-        return note.levelno, EventId.OTHER_WARNING, self.format(note), None
+        return note.levelno, EventId.OTHER_WARNING, self.format(note), None, None
 
     def _write(self) -> None:
         """Писать очередь до закрытия, затем закрыть источник событий.
@@ -332,7 +345,12 @@ class EventLogHandler(logging.Handler):
         self._deregister()
 
     def _report(
-        self, levelno: int, event_id: int, text: str, on_unsent: OnUnsent | None
+        self,
+        levelno: int,
+        event_id: int,
+        text: str,
+        on_unsent: OnUnsent | None,
+        on_sent: OnSent | None,
     ) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
 
@@ -340,7 +358,8 @@ class EventLogHandler(logging.Handler):
         одна строка на серию отказов в файл журнала и консоль (не в
         журнал событий), сама запись в файле журнала уже есть. Для
         незаписанного события вызывается on_unsent: следующий такой же
-        случай снова даст событие, а число повторов не потеряется.
+        случай снова даст событие, а число повторов не потеряется. Для
+        записанного — on_sent.
         """
         if levelno >= logging.ERROR:
             event_type = self._win32evtlog.EVENTLOG_ERROR_TYPE
@@ -360,7 +379,7 @@ class EventLogHandler(logging.Handler):
                 None,
             )
         except Exception as e:
-            _unsent(on_unsent, UNSENT_RETRY_SECONDS)
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             if not self._report_failing:
                 self._report_failing = True
                 logger.warning(
@@ -371,6 +390,7 @@ class EventLogHandler(logging.Handler):
                 )
             return
         self._report_failing = False
+        _notify(on_sent)
 
     def close(self) -> None:
         """Дописать очередь (не дольше EVENT_FLUSH_SECONDS) и закрыть.
@@ -393,9 +413,21 @@ class EventLogHandler(logging.Handler):
             self._win32evtlog.DeregisterEventSource(source)
 
 
-def _unsent(on_unsent: OnUnsent | None, retry_after: float) -> None:
-    if on_unsent is not None:
-        on_unsent(retry_after)
+def _notify(callback: Callable[..., None] | None, *args: float) -> None:
+    """Сообщить учёту об исходе события.
+
+    Ошибка учёта не выходит из emit и не останавливает писателя: иначе
+    она дошла бы до кода, который просто писал в журнал (обработчик
+    запроса, отправка буфера).
+    """
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        logger.exception(
+            "Ошибка учёта исхода события журнала событий", extra={"event_log": False}
+        )
 
 
 class LogFileHandler(TimedRotatingFileHandler):
@@ -424,9 +456,10 @@ class LogFileHandler(TimedRotatingFileHandler):
         Если файл не открылся при ротации, FileHandler.emit пытался бы
         открыть его на каждой записи. До следующей попытки ротации
         записи в файл не идут, консоль и журнал событий их получают.
-        Запись о самом отказе файла (file_log=False) сюда не пишется.
+        Запись о самом отказе файла (file_log=False) и запись «только в
+        журнал событий» сюда не пишутся.
         """
-        if getattr(record, "file_log", True) is False:
+        if getattr(record, "file_log", True) is False or not not_event_only(record):
             return
         if self.stream is None and time.time() < self.rolloverAt:
             return
@@ -557,6 +590,11 @@ def event_source_registered() -> bool:
     return True
 
 
+def not_event_only(record: logging.LogRecord) -> bool:
+    """Фильтр файла и консоли: без записей «только в журнал событий»."""
+    return not getattr(record, EVENT_ONLY_ATTRIBUTE, False)
+
+
 def _add(handler: logging.Handler) -> logging.Handler:
     logging.getLogger().addHandler(handler)
     _handlers.append(handler)
@@ -582,7 +620,9 @@ def setup_logging(*, console: bool) -> None:
     formatter = logging.Formatter(LOG_FORMAT)
 
     if console:
-        _add(logging.StreamHandler(sys.stderr)).setFormatter(formatter)
+        stream = _add(logging.StreamHandler(sys.stderr))
+        stream.setFormatter(formatter)
+        stream.addFilter(not_event_only)
     if not _windows():
         return
     # Журнал событий раньше файла: 1004 о недоступном файле попадает в
@@ -634,9 +674,15 @@ def flush_handlers() -> None:
     flush() берёт замок обработчика, а его может держать зависший
     поток (например, запись в переполненный канал консоли). Поэтому
     замок ждём не дольше FLUSH_LOCK_SECONDS, и такой обработчик
-    пропускаем: процесс должен завершиться в срок.
+    пропускаем: процесс должен завершиться в срок. Журнал событий
+    ждёт свою очередь без этого замка: его берёт писатель, когда из
+    обратного вызова об исходе события пишет следующее событие о папке.
     """
     for handler in _handlers:
+        if isinstance(handler, EventLogHandler):
+            with suppress(Exception):
+                handler.flush()
+            continue
         if not handler.lock.acquire(timeout=FLUSH_LOCK_SECONDS):
             continue
         try:
