@@ -666,6 +666,63 @@ class TestServerErrors:
         assert event_ids(evtlog) == [1001]
 
 
+class TestFinalEventOrder:
+    """Завершающее событие — после событий о папке, ждущих ответа."""
+
+    @pytest.fixture
+    def slow_first_report(self, evtlog):
+        """Журнал событий настроен, первое событие пишется медленно."""
+        logging_setup.setup_logging(console=False)
+        logging_setup.send_startup_events()
+        calls = []
+
+        def report(*args):
+            calls.append(args[3])
+            if len(calls) == 1:
+                time.sleep(0.3)
+
+        evtlog.ReportEvent.side_effect = report
+        return calls
+
+    @pytest.mark.usefixtures("clock")
+    def test_stop_after_delayed_ack(self, slow_first_report):
+        """Проверить: подтверждение 2000 запаздывает — итоговое 2002
+        ложится раньше 1001.
+        """
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        service = runner.Service(console=False)
+        service.stop_reason = "тест"
+        service.finalize()
+        flush_event_logs()
+
+        assert slow_first_report == [2000, 2002, 1001]
+
+    @pytest.mark.usefixtures("clock")
+    def test_failure_after_delayed_ack(self, slow_first_report):
+        """Проверить: то же перед 1002."""
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        service = runner.Service(console=False)
+        service._report_failure("сбой", None)  # noqa: SLF001
+        flush_event_logs()
+
+        assert slow_first_report == [2000, 2002, 1002]
+
+    def test_wait_leaves_exit_reserve(self, monkeypatch):
+        """Проверить: ожидание журнала событий оставляет запас срока
+        сторожа на сброс журнала.
+        """
+        waits = []
+        monkeypatch.setattr(runner, "wait_event_log", waits.append)
+        monkeypatch.setattr(runner, "clock", lambda: 100.0)
+        service = runner.Service(console=False)
+        service.exit_deadline = 100.0 + runner.EXIT_RESERVE_SECONDS + 1
+        service._wait_event_log()  # noqa: SLF001
+        service.exit_deadline = 100.0
+        service._wait_event_log()  # noqa: SLF001
+
+        assert waits == [1, 0]
+
+
 class TestStop:
     """Обычная остановка: 1001 один раз, напоминания, зависания."""
 

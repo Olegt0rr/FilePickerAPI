@@ -63,6 +63,9 @@ EVENT_FLUSH_SECONDS = 3.0
 # Сколько событий держать в очереди, пока ReportEvent не отвечает;
 # остальные есть в файле журнала
 EVENT_QUEUE_LIMIT = 1000
+# Сколько строк диагностики (отказ ReportEvent, ошибка учёта) ждут
+# вывода в файл и консоль, пока они не отвечают; остальные отбрасываются
+DIAGNOSTICS_LIMIT = 100
 
 # Обработчики, добавленные setup_logging: повторная настройка их снимает
 _handlers: list[logging.Handler] = []
@@ -145,12 +148,12 @@ class EventLogHandler(logging.Handler):
     очередь опустеет. Очередь и писатель — под своим замком, а не под
     замком обработчика.
 
-    Писатель вызывает только ReportEvent. Строка об отказе ReportEvent
-    (в файл и консоль) и обратные вызовы учёта об исходе (on_sent,
-    on_unsent; они пишут следующее событие о папке и строки об ошибках
-    учёта) идут по порядку в отдельном потоке исходов: запись в
-    зависшую консоль иначе остановила бы писателя, а с ним и все
-    остальные события.
+    Писатель вызывает только ReportEvent. Обратные вызовы учёта об
+    исходе (on_sent, on_unsent; они ставят следующее событие о папке)
+    идут по порядку в потоке исходов, а строки диагностики (отказ
+    ReportEvent, ошибка учёта; они пишутся в файл и консоль) — в своём
+    потоке с ограниченной очередью. Запись в зависшую консоль не
+    останавливает ни писателя, ни подтверждения событий о папке.
     """
 
     # Сообщает об исходе записи: события о папке ждут его ответа
@@ -170,11 +173,10 @@ class EventLogHandler(logging.Handler):
         self._busy = False
         self._closing = False
         self._writer: threading.Thread | None = None
-        # Обратные вызовы об исходе и строки об отказе — по порядку в
+        # Обратные вызовы об исходе и строки диагностики — каждые в
         # своём потоке; тоже под self._ready
-        self._outcomes: deque[Callable[[], None]] = deque()
-        self._outcome_busy = False
-        self._outcome_thread: threading.Thread | None = None
+        self._outcomes = _Lane(self, "event-log-outcomes")
+        self._diagnostics = _Lane(self, "event-log-diagnostics", DIAGNOSTICS_LIMIT)
         self._source = None
         import win32evtlog
 
@@ -312,22 +314,23 @@ class EventLogHandler(logging.Handler):
                 _notify(on_unsent, 0)
 
     def flush(self) -> None:
-        """Дождаться очереди и исходов не дольше EVENT_FLUSH_SECONDS.
+        """Дождаться очереди и исходов не дольше EVENT_FLUSH_SECONDS."""
+        self.wait_idle(EVENT_FLUSH_SECONDS)
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Дождаться очереди, исходов и диагностики не дольше timeout.
 
         Исходы тоже: обратный вызов об исходе 2000 ставит в очередь
-        2001.
+        2001. False — не дождались.
         """
         with self._ready:
-            self._ready.wait_for(
+            return self._ready.wait_for(
                 lambda: (
-                    not (
-                        self._pending
-                        or self._busy
-                        or self._outcomes
-                        or self._outcome_busy
-                    )
+                    not (self._pending or self._busy)
+                    and self._outcomes.idle()
+                    and self._diagnostics.idle()
                 ),
-                EVENT_FLUSH_SECONDS,
+                timeout,
             )
 
     def _enqueue(self, items: list[_Event]) -> None:
@@ -353,33 +356,30 @@ class EventLogHandler(logging.Handler):
         for _level, _id, _text, on_unsent, _on_sent, _current in rejected:
             _notify(on_unsent, UNSENT_RETRY_SECONDS)
 
-    def _defer(self, action: Callable[[], None]) -> None:
-        """Выполнить action в потоке исходов, по порядку."""
-        with self._ready:
-            self._outcomes.append(action)
-            if self._outcome_thread is None:
-                self._outcome_thread = threading.Thread(
-                    target=self._run_outcomes, name="event-log-outcomes", daemon=True
-                )
-                self._outcome_thread.start()
-            self._ready.notify_all()
+    def _defer(self, callback: Callable[..., None] | None, *args: float) -> None:
+        """Сообщить учёту об исходе в потоке исходов, по порядку.
 
-    def _run_outcomes(self) -> None:
-        """Выполнять отложенные действия до закрытия обработчика."""
-        while True:
-            with self._ready:
-                self._outcome_busy = False
-                self._ready.notify_all()
-                while not self._outcomes and not self._closing:
-                    self._ready.wait()
-                if not self._outcomes:
-                    # Под замком: действие, отложенное позже (писатель
-                    # дописывает очередь), запустит новый поток
-                    self._outcome_thread = None
-                    return
-                action = self._outcomes.popleft()
-                self._outcome_busy = True
-            action()
+        Ошибка обратного вызова уходит строкой в поток диагностики.
+        """
+        if callback is not None:
+            self._outcomes.put(functools.partial(self._outcome, callback, *args))
+
+    def _outcome(self, callback: Callable[..., None], *args: float) -> None:
+        try:
+            callback(*args)
+        except Exception as e:
+            self._diagnose(
+                functools.partial(
+                    logger.error,
+                    "Ошибка учёта исхода события журнала событий",
+                    exc_info=e,
+                    extra={"event_log": False},
+                )
+            )
+
+    def _diagnose(self, action: Callable[[], None]) -> None:
+        """Вывести строку диагностики в её потоке (сверх лимита нет)."""
+        self._diagnostics.put(action)
 
     def _lost_note(self) -> _Event:
         note = _service_record(
@@ -419,12 +419,12 @@ class EventLogHandler(logging.Handler):
         журнал событий), сама запись в файле журнала уже есть. Для
         незаписанного события вызывается on_unsent: следующий такой же
         случай снова даст событие, а число повторов не потеряется. Для
-        записанного — on_sent. Строка и обратные вызовы — в потоке
-        исходов (_defer), а не здесь. Если is_current говорит, что
-        событие уже не нужно (его попытку сменил повтор), оно не
-        пишется. Проверка — здесь, в потоке писателя прямо перед
-        ReportEvent, а не при постановке в очередь: событие могло
-        устареть, пока ждало.
+        записанного — on_sent. Обратные вызовы — в потоке исходов
+        (_defer), строка — в потоке диагностики (_diagnose). Если
+        is_current говорит, что событие уже не нужно (его попытку
+        сменил повтор), оно не пишется. Проверка — здесь, в потоке
+        писателя прямо перед ReportEvent, а не при постановке в
+        очередь: событие могло устареть, пока ждало.
         """
         levelno, event_id, text, on_unsent, on_sent, is_current = event
         if not _still_current(is_current):
@@ -447,10 +447,10 @@ class EventLogHandler(logging.Handler):
                 None,
             )
         except Exception as e:
-            self._defer(functools.partial(_notify, on_unsent, UNSENT_RETRY_SECONDS))
+            self._defer(on_unsent, UNSENT_RETRY_SECONDS)
             if not self._report_failing:
                 self._report_failing = True
-                self._defer(
+                self._diagnose(
                     functools.partial(
                         logger.warning,
                         "Не удалось записать событие %s в журнал событий: %s",
@@ -461,7 +461,7 @@ class EventLogHandler(logging.Handler):
                 )
             return
         self._report_failing = False
-        self._defer(functools.partial(_notify, on_sent))
+        self._defer(on_sent)
 
     def close(self) -> None:
         """Дописать очередь (не дольше EVENT_FLUSH_SECONDS) и закрыть.
@@ -482,6 +482,66 @@ class EventLogHandler(logging.Handler):
         source, self._source = self._source, None
         if source is not None:
             self._win32evtlog.DeregisterEventSource(source)
+
+
+class _Lane:
+    """Действия по порядку в своём демоническом потоке.
+
+    Состояние — под замком обработчика self._ready (его же ждёт
+    flush). Поток запускается при первом действии и выходит при
+    закрытии обработчика, когда очередь пуста; действие после этого
+    запускает новый. limit — сколько действий ждут, остальные
+    отбрасываются.
+    """
+
+    def __init__(
+        self, handler: "EventLogHandler", name: str, limit: int | None = None
+    ) -> None:
+        self._handler = handler
+        self._name = name
+        self._limit = limit
+        self._actions: deque[Callable[[], None]] = deque()
+        self._busy = False
+        self._thread: threading.Thread | None = None
+
+    def put(self, action: Callable[[], None]) -> None:
+        ready = self._handler._ready  # noqa: SLF001 - общий замок
+        with ready:
+            if self._limit is not None and len(self._actions) >= self._limit:
+                return
+            self._actions.append(action)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name=self._name, daemon=True
+                )
+                self._thread.start()
+            ready.notify_all()
+
+    def idle(self) -> bool:
+        """Очередь пуста и действие не выполняется (под замком)."""
+        return not (self._actions or self._busy)
+
+    @property
+    def thread(self) -> threading.Thread | None:
+        return self._thread
+
+    def _run(self) -> None:
+        handler = self._handler
+        ready = handler._ready  # noqa: SLF001 - общий замок
+        while True:
+            with ready:
+                self._busy = False
+                ready.notify_all()
+                while not self._actions and not handler._closing:  # noqa: SLF001
+                    ready.wait()
+                if not self._actions:
+                    # Под замком: действие, отложенное позже (писатель
+                    # дописывает очередь), запустит новый поток
+                    self._thread = None
+                    return
+                action = self._actions.popleft()
+                self._busy = True
+            action()
 
 
 def _still_current(is_current: IsCurrent | None) -> bool:
@@ -750,6 +810,19 @@ def discard_startup_events() -> None:
     for handler in _handlers:
         if isinstance(handler, EventLogHandler):
             handler.discard_startup_events()
+
+
+def wait_event_log(timeout: float) -> None:
+    """Дождаться журнала событий не дольше timeout.
+
+    Очередь, подтверждения и события, которые они ставят: итоговое
+    2002, ждущее подтверждения 2000, ляжет в журнал событий раньше
+    следующей записи (1001 или 1002).
+    """
+    deadline = time.monotonic() + timeout
+    for handler in _handlers:
+        if isinstance(handler, EventLogHandler):
+            handler.wait_idle(max(deadline - time.monotonic(), 0))
 
 
 def flush_handlers() -> None:
