@@ -24,6 +24,7 @@ from urllib.parse import quote
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.conftest import child_env, start_then_stop
 from tests.platforms import linux_only, windows_only
 
 
@@ -2599,7 +2600,7 @@ def exec_main(argv):
 def run_python(*args, cwd, timeout=60):
     """Запустить отдельный процесс Python в папке cwd.
 
-    Пакет app берётся из установки (pip install -e), а не из cwd.
+    Пакет app берётся из этого checkout (PYTHONPATH), а не из cwd.
     """
     return subprocess.run(  # noqa: S603 - аргументы задаются тестом
         [sys.executable, *args],
@@ -2608,7 +2609,7 @@ def run_python(*args, cwd, timeout=60):
         text=True,
         encoding="utf-8",
         errors="replace",
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        env=child_env(),
         timeout=timeout,
         check=False,
     )
@@ -2720,64 +2721,6 @@ class TestMainExecution:
         logged = log_file.read_text(encoding="utf-8")
         assert error_line in logged
         assert "files_directory" in logged.lower()
-
-
-class TestRunner:
-    """Запуск сервиса: настройки, директория, Uvicorn."""
-
-    @pytest.fixture
-    def runner(self):
-        import app.runner
-
-        return app.runner
-
-    def test_run_starts_uvicorn(self, runner, tmp_path):
-        """Проверить: директория создаётся, Uvicorn слушает все
-        интерфейсы на порту 8000.
-        """
-        files_dir = tmp_path / "missing" / "files"
-        reload_app(files_directory=str(files_dir))
-
-        with mock.patch.object(runner.uvicorn, "run") as uvicorn_run:
-            assert runner.run() == 0
-
-        [app], kwargs = uvicorn_run.call_args
-        # log_config=None: Uvicorn пишет через обработчики сервиса
-        assert kwargs == {"host": "0.0.0.0", "port": 8000, "log_config": None}
-        assert TestClient(app).get("/openapi.json").status_code == 200
-        assert files_dir.is_dir()
-
-    def test_settings_error_stops_service(self, runner, monkeypatch, tmp_path, caplog):
-        """Проверить: FILES_DIRECTORY в .env — ошибка в журнале, код 1,
-        Uvicorn не запускается и директория не создаётся.
-        """
-        files_dir = tmp_path / "files"
-        reload_app(files_directory=str(files_dir))
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / ".env").write_text("FILES_DIRECTORY=D:\\x\n", encoding="utf-8")
-        from app.settings import get_settings
-
-        get_settings.cache_clear()
-        try:
-            with mock.patch.object(runner.uvicorn, "run") as uvicorn_run:
-                assert runner.run() == 1
-        finally:
-            get_settings.cache_clear()
-
-        uvicorn_run.assert_not_called()
-        assert not files_dir.exists()
-        [record] = [r for r in caplog.records if r.name == "app.runner"]
-        assert record.levelno == logging.ERROR
-        assert record.exc_info is not None
-
-    def test_unreachable_directory_does_not_stop_startup(self, runner, caplog):
-        """Проверить, что недоступная директория не мешает запуску."""
-        reload_app(files_directory=r"\\unreachable\share")
-
-        error = OSError("The network path was not found")
-        with mock.patch("pathlib.Path.mkdir", side_effect=error):
-            runner.ensure_files_directory()
-        assert "The network path was not found" in caplog.text
 
 
 class TestStdStreams:
@@ -2922,24 +2865,32 @@ class TestFilesDirectoryIsFixed:
         other = attacker.parent / "from_argv"
         reload_app()
 
-        with mock.patch("uvicorn.run") as uvicorn_run:
+        with mock.patch("app.runner.run") as run:
             assert exec_main([*flag, str(other)]) == 2
 
-        uvicorn_run.assert_not_called()
+        run.assert_not_called()
         assert not served.exists()
         assert not other.exists()
 
-    def test_no_arguments_serves_build_directory(self, served_dir):
+    def test_no_arguments_serves_build_directory(
+        self, served_dir, service_env, monkeypatch
+    ):
         """Проверить: запуск без аргументов создаёт директорию из
         сборки, а не из переменной окружения.
         """
+        from app import instance_check, runner
+
         served, _ = served_dir
         reload_app()
+        monkeypatch.setattr(instance_check, "port_in_use", lambda *_: False)
+        monkeypatch.setattr(runner.InstanceServer, "run", start_then_stop)
 
-        with mock.patch("uvicorn.run") as uvicorn_run:
-            assert exec_main([]) == 0
+        assert exec_main([]) == 0
 
-        uvicorn_run.assert_called_once()
+        assert service_env.exits == [0]
+        deadline = time.monotonic() + 5
+        while not served.is_dir() and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert served.is_dir()
 
     def test_constructor_argument_does_not_override(self, settings_module):

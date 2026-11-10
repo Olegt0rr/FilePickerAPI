@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 import types
 from logging.handlers import TimedRotatingFileHandler
@@ -12,8 +13,9 @@ from unittest import mock
 
 import pytest
 
-from app import logging_setup
+from app import event_tracking, logging_setup
 from app.event_tracking import EventId, is_tracked, mark_tracked
+from tests.conftest import flush_event_logs, wait_for
 from tests.platforms import windows_only
 
 # Настоящие функции: conftest подменяет их в каждом тесте
@@ -39,6 +41,7 @@ def fake_win32evtlog():
 def reported(evtlog):
     """События, переданные в ReportEvent: (код, тип, текст)."""
     events = []
+    flush_event_logs()
     for call in evtlog.ReportEvent.call_args_list:
         source, event_type, category, event_id, sid, strings, data = call.args
         assert (source, category, sid, data) == ("source-handle", 0, None, None)
@@ -104,8 +107,8 @@ class TestSetupLogging:
         assert len(handlers) == int(console)
         if console:
             [handler] = handlers
-            assert type(handler) is logging.StreamHandler
-            assert handler.stream is sys.stderr
+            assert type(handler) is logging_setup.ConsoleHandler
+            assert handler._stream is sys.stderr  # noqa: SLF001
             assert handler.formatter._fmt == logging_setup.LOG_FORMAT  # noqa: SLF001
         assert logging.getLogger().level == logging.WARNING
         for name in ("app", "uvicorn.error", "uvicorn.access"):
@@ -136,6 +139,29 @@ class TestSetupLogging:
         assert re.search(r" INFO app\.test: строка в файле$", text, re.MULTILINE)
         assert 'INFO uvicorn.access: 127.0.0.1 - "GET /files" 200' in text
         assert "не попадает" not in text
+
+    @pytest.mark.usefixtures("on_windows")
+    def test_event_only_not_in_file_or_console(self, tmp_path, capsys):
+        """Проверить: повтор события о папке («только в журнал
+        событий») не попадает ни в файл журнала, ни в консоль.
+        """
+        logging_setup.setup_logging(console=True)
+        test_logger = logging.getLogger("app.test")
+        test_logger.warning("повтор", extra={"event_id": 2000, "event_only": True})
+        test_logger.warning("строка")
+
+        [file_handler] = [
+            h for h in our_handlers() if isinstance(h, logging_setup.LogFileHandler)
+        ]
+        file_handler.flush()
+        for handler in our_handlers():
+            handler.flush()
+        text = (log_dir(tmp_path) / "FilePickerAPI.log").read_text(encoding="utf-8")
+        err = capsys.readouterr().err
+        assert "строка" in text
+        assert "строка" in err
+        assert "повтор" not in text
+        assert "повтор" not in err
 
     @pytest.mark.usefixtures("on_windows")
     def test_file_handler_parameters(self, tmp_path):
@@ -242,6 +268,7 @@ class TestSetupLogging:
         )
         logging_setup.setup_logging(console=False)
         evtlog.RegisterEventSource.assert_called_once_with(None, "FilePickerAPI")
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
 
         logging_setup.send_startup_events()
@@ -253,16 +280,21 @@ class TestSetupLogging:
 
     @pytest.mark.usefixtures("on_windows")
     def test_second_instance_discards_startup_events(self, monkeypatch, evtlog):
-        """Проверить: у второго экземпляра буфер отбрасывается, а его
-        событие пишется сразу.
+        """Проверить: у второго экземпляра буфер отбрасывается, поздние
+        записи событий не дают, а запись исхода пишется сразу.
         """
         monkeypatch.setattr(logging_setup, "event_source_registered", lambda: True)
         logging_setup.setup_logging(console=False)
         logging.getLogger("app.test").warning("буферное предупреждение")
 
         logging_setup.discard_startup_events()
+        logging.getLogger("app.test").warning(
+            "поздняя проверка прав",
+            extra={"event_id": EventId.BUILD_FOLDER_PERMISSIONS},
+        )
         logging.getLogger("app.test").info(
-            "сервис уже работает", extra={"event_id": EventId.ALREADY_RUNNING}
+            "сервис уже работает",
+            extra={"event_id": EventId.ALREADY_RUNNING, "outcome": True},
         )
 
         assert [e[:2] for e in reported(evtlog)] == [
@@ -551,17 +583,35 @@ class TestLogFileRotation:
 class TestEventLogHandler:
     """Журнал событий с поддельным win32evtlog."""
 
+    CODE_CASES = (
+        # Каждый код — с уровнем, которым его пишет сервис
+        (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
+        (logging.INFO, EventId.SERVICE_STOPPED, 1001, 4),
+        (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
+        (logging.WARNING, EventId.BUILD_FOLDER_PERMISSIONS, 1003, 2),
+        (logging.WARNING, EventId.LOG_FILE_UNAVAILABLE, 1004, 2),
+        (logging.INFO, EventId.ALREADY_RUNNING, 1005, 4),
+        (logging.WARNING, EventId.OTHER_VERSION_RUNNING, 1006, 2),
+        (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
+        (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
+        (logging.WARNING, EventId.DIRECTORY_STILL_UNAVAILABLE, 2002, 2),
+        (logging.WARNING, EventId.DIRECTORY_SLOW, 2003, 2),
+        (logging.WARNING, EventId.DIRECTORY_NOT_CREATED, 2004, 2),
+        (logging.WARNING, EventId.FILE_ACCESS_ERROR, 3000, 2),
+        (logging.WARNING, EventId.OTHER_WARNING, 3001, 2),
+        (logging.ERROR, EventId.UNEXPECTED_ERROR, 4000, 1),
+        # Без кода — по уровню
+        (logging.WARNING, None, 3001, 2),
+        (logging.ERROR, None, 4000, 1),
+        (logging.CRITICAL, None, 4000, 1),
+    )
+
+    def test_every_code_checked(self):
+        """Проверить: в test_code_and_type есть каждый код."""
+        assert {case[1] for case in self.CODE_CASES} - {None} == set(EventId)
+
     @pytest.mark.parametrize(
-        ("level", "event_id", "expected_id", "expected_type"),
-        [
-            (logging.INFO, EventId.SERVICE_STARTED, 1000, 4),
-            (logging.INFO, EventId.DIRECTORY_RESTORED, 2001, 4),
-            (logging.WARNING, EventId.DIRECTORY_UNAVAILABLE, 2000, 2),
-            (logging.WARNING, None, 3001, 2),
-            (logging.ERROR, EventId.SERVICE_FAILED, 1002, 1),
-            (logging.ERROR, None, 4000, 1),
-            (logging.CRITICAL, None, 4000, 1),
-        ],
+        ("level", "event_id", "expected_id", "expected_type"), CODE_CASES
     )
     def test_code_and_type(
         self, event_logger, level, event_id, expected_id, expected_type
@@ -583,6 +633,7 @@ class TestEventLogHandler:
             ("app.test_event_log", logging.INFO, {}),
             ("app.test_event_log", logging.WARNING, {"event_log": False}),
             ("app.test_event_log", logging.ERROR, {"event_log": False}),
+            ("app.test_event_log", logging.WARNING, {"event_log": lambda: False}),
         ],
     )
     def test_not_in_event_log(self, event_logger, name, level, extra):
@@ -595,7 +646,35 @@ class TestEventLogHandler:
             {"name": name, "levelno": level, "msg": "m", **extra}
         )
         handler.handle(record)
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
+
+    def test_flag_checked_on_emit(self, event_logger):
+        """Проверить: флаг-функция вызывается при обработке записи."""
+        test_logger, evtlog = event_logger
+        allowed = []
+        test_logger.warning("m", extra={"event_log": lambda: bool(allowed)})
+        allowed.append(True)
+        test_logger.warning("m", extra={"event_log": lambda: bool(allowed)})
+        assert [event_id for event_id, *_ in reported(evtlog)] == [3001]
+
+    def test_flag_closed_after_filter(self, event_logger):
+        """Проверить: флаг-функция закрылась между фильтром обработчика
+        и emit — события нет, и это не отказ записи.
+        """
+        test_logger, evtlog = event_logger
+        answers = iter([True, False])
+        on_unsent = mock.Mock()
+        test_logger.warning(
+            "m",
+            extra={
+                "event_id": 1003,
+                "event_log": lambda: next(answers),
+                logging_setup.UNSENT_ATTRIBUTE: on_unsent,
+            },
+        )
+        assert reported(evtlog) == []
+        on_unsent.assert_not_called()
 
     def test_traceback_in_text(self, event_logger):
         """Проверить: трассировка исключения — в тексте события."""
@@ -621,6 +700,7 @@ class TestEventLogHandler:
             raise error
         except OSError:
             test_logger.exception("Exception in ASGI application")
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
 
     def test_long_text_truncated(self, event_logger):
@@ -663,10 +743,13 @@ class TestEventLogHandler:
 
         test_logger.error("ошибка 1")
         test_logger.warning("ошибка 2")
+        flush_event_logs()
         evtlog.ReportEvent.side_effect = None
         test_logger.error("ошибка 3")
+        flush_event_logs()
         evtlog.ReportEvent.side_effect = OSError("снова")
         test_logger.error("ошибка 4")
+        flush_event_logs()
 
         failures = [
             r
@@ -698,7 +781,960 @@ class TestEventLogHandler:
         )
 
         handle_error.assert_called_once()
+        flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
+
+    def test_formatter_error_uses_handle_error(self, event_logger, clock):
+        """Проверить: сбой форматтера не выходит из handle(), а ключ
+        повторов не занят — такой же случай через минуту даёт событие.
+        """
+        test_logger, evtlog = event_logger
+        handler = test_logger.handlers[0]
+        with (
+            mock.patch.object(handler, "handleError") as handle_error,
+            mock.patch.object(handler, "format", side_effect=ValueError("формат")),
+        ):
+            test_logger.warning("отказ %s", 1)
+
+        handle_error.assert_called_once()
+        evtlog.ReportEvent.assert_not_called()
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        test_logger.warning("отказ %s", 2)
+        assert [e[2] for e in reported(evtlog)] == ["app.test_event_log: отказ 2"]
+
+    def test_report_error_resends_same_key(self, event_logger, clock):
+        """Проверить: первое событие ключа не записалось — случай в
+        течение минуты считается повтором без вызова ReportEvent, а
+        случай после неё снова даёт событие.
+        """
+        test_logger, evtlog = event_logger
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+
+        test_logger.warning("отказ %s", "сети")
+        flush_event_logs()
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS - 1)
+        test_logger.warning("отказ %s", "сети")
+        flush_event_logs()
+        flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 1
+        clock.advance(1)
+        test_logger.warning("отказ %s", "сети")
+        flush_event_logs()
+        test_logger.warning("отказ %s", "сети")
+        flush_event_logs()
+
+        flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 2
+
+    def test_report_error_resends_tracked_key(self, event_logger, clock):
+        """Проверить: то же для ключа из event_tracking.track."""
+        test_logger, evtlog = event_logger
+        handler = test_logger.handlers[0]
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+        try:
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+            flush_event_logs()
+            clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+            for _ in range(2):
+                event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+                flush_event_logs()
+        finally:
+            tracking_logger.removeHandler(handler)
+
+        flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 2
+
+    @pytest.fixture
+    def tracking_handler(self, event_logger):
+        """EventLogHandler на логгере учёта ошибок."""
+        test_logger, evtlog = event_logger
+        handler = test_logger.handlers[0]
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        yield evtlog
+        tracking_logger.removeHandler(handler)
+
+    def test_report_error_resends_directory_unavailable(
+        self, tracking_handler, clock, caplog
+    ):
+        """Проверить: 2000 не записалось — ответы в течение минуты
+        ReportEvent не вызывают, такт после неё пишет то же 2000 с
+        трассировкой только в журнал событий, дальше — повторы без
+        событий.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [OSError("full"), None]
+        for _ in range(2):
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 1
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+
+        sent = reported(evtlog)
+        assert [e[0] for e in sent] == [2000, 2000]
+        assert sent[1][2] == sent[0][2]
+        assert sent[1][2].endswith("\nOSError: [Errno 5] I/O")
+        # Первая попытка — одна запись, повтор — только в журнал событий
+        event_only = [r for r in caplog.records if getattr(r, "event_only", False)]
+        assert [r.event_id for r in event_only] == [2000]
+        assert event_only[0].exc_info is None
+
+    def test_filtered_level_does_not_block_queue(self, tracking_handler):
+        """Проверить: 2001 отсечено уровнем логгера — очередь не ждёт
+        его исхода, и следующее 2000 пишется.
+        """
+        evtlog = tracking_handler
+        logging.getLogger("app.event_tracking").setLevel(logging.WARNING)
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_ok()
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2000]
+
+    @pytest.mark.usefixtures("clock")
+    def test_not_reached_handler_does_not_block_queue(self, event_logger, caplog):
+        """Проверить: обработчик журнала событий не на пути записей
+        учёта — события о папке пишутся без очереди.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        _, evtlog = event_logger
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+
+        flush_event_logs()
+        evtlog.ReportEvent.assert_not_called()
+        assert [r.event_id for r in caplog.records if hasattr(r, "event_id")] == [
+            2000,
+            2001,
+        ]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_lost_outcome_resent_after_timeout(self, tracking_handler, clock, caplog):
+        """Проверить: исход 2000 так и не пришёл — через срок ожидания
+        такт пишет его снова, а 2001 — после него.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        with mock.patch.object(handler, "_report"):
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+        event_tracking.tick()
+        flush_event_logs()
+        evtlog.ReportEvent.assert_not_called()
+        clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+
+    def test_late_outcome_after_timeout(self, tracking_handler, clock, caplog):
+        """Проверить: исход пришёл после срока ожидания — повтор не
+        ломает очередь.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        with mock.patch.object(handler, "_report") as report:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+        clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+        # Исход первой попытки — уже после повтора
+        *_, on_sent, _is_current = report.call_args.args[0]
+        on_sent()
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_in_startup_buffer_not_written(self, evtlog, clock, caplog):
+        """Проверить: 2000 дольше срока ожидания в стартовом буфере —
+        повтор не даёт копии после 2001 (порядок 2000, 2001).
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            event_tracking.directory_ok()
+            clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+            event_tracking.tick()
+            handler.send_startup_events()
+            flush_event_logs()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_waiting_event_keeps_no_exception(self, evtlog, caplog):
+        """Проверить: 2000 ждёт отправки стартового буфера — исключение
+        запроса с кадрами стека не держится, трассировка — текстом.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            [item] = event_tracking._state.pending  # noqa: SLF001
+            assert item.exc is None
+            assert item.traceback.endswith("OSError: [Errno 5] I/O")
+            handler.send_startup_events()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        [(event_id, _, text)] = reported(evtlog)
+        assert event_id == 2000
+        assert text.endswith("OSError: [Errno 5] I/O")
+
+    @pytest.mark.usefixtures("clock")
+    def test_writer_queue_keeps_no_exception(self, tracking_handler, caplog):
+        """Проверить: 2000 ждёт в очереди потока записи — ни очередь, ни
+        событие учёта не держат исключение запроса; исход из потока
+        записи (_pending_sent) не мешает отвязке трассировки.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            if not entered.is_set():
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        logging.getLogger("app.test_event_log").warning(
+            "занят", extra={"event_id": 3001}
+        )
+        assert entered.wait(5)
+        error = OSError(5, "I/O")
+        event_tracking.directory_error("/srv", error, 500)
+        [item] = event_tracking._state.pending  # noqa: SLF001
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        queued = list(handler._pending)  # noqa: SLF001 - очередь потока записи
+        release.set()
+        flush_event_logs()
+
+        assert item.exc is None
+        assert item.traceback.endswith("OSError: [Errno 5] I/O")
+        assert all(error not in event for event in queued)
+        assert [e[0] for e in reported(evtlog)] == [3001, 2000]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_failure_ignored(self, tracking_handler, clock, caplog):
+        """Проверить: исход прежней попытки 2000 после повтора не
+        сбивает ожидание исхода новой.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        with mock.patch.object(handler, "_report") as report:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+            event_tracking.tick()
+            flush_event_logs()
+        [first], [second] = (call.args for call in report.call_args_list)
+        _, _, _, first_unsent, first_sent, _ = first
+        first_unsent(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.directory_ok()
+        flush_event_logs()
+        evtlog.ReportEvent.assert_not_called()
+        # Записалась и прежняя попытка: 2001 по-прежнему ждёт последнюю
+        first_sent()
+        flush_event_logs()
+        evtlog.ReportEvent.assert_not_called()
+        _, _, _, _, second_sent, _ = second
+        second_sent()
+
+        assert [e[0] for e in reported(evtlog)] == [2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_in_writer_queue_not_written(
+        self, tracking_handler, clock, caplog
+    ):
+        """Проверить: 2000 ждёт в очереди потока записи дольше срока
+        ожидания исхода, такт пишет повтор — поток проверяет попытку
+        прямо перед ReportEvent, и в журнале событий 2000, 2001 без
+        второй копии 2000.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def report(*args):
+            calls.append(args[3])
+            if len(calls) == 1:
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        # Поток записи занят чужим событием: 2000 ждёт за ним в очереди
+        logging.getLogger("app.test_event_log").warning(
+            "занят", extra={"event_id": 3001}
+        )
+        assert entered.wait(5)
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+        event_tracking.tick()
+        release.set()
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+
+        assert calls == [3001, 2000, 2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_current_check_error_still_writes(self, event_logger, caplog):
+        """Проверить: ошибка проверки «нужно ли событие» — пишется."""
+        test_logger, evtlog = event_logger
+        test_logger.warning(
+            "событие",
+            extra={
+                "event_id": 2000,
+                "event_current": mock.Mock(side_effect=ValueError),
+            },
+        )
+
+        assert [e[0] for e in reported(evtlog)] == [2000]
+        assert "Ошибка учёта исхода события журнала событий" in caplog.text
+
+    def test_outcome_callback_error_stays_in_handler(self, event_logger, caplog):
+        """Проверить: ошибка обратного вызова учёта остаётся в emit."""
+        test_logger, evtlog = event_logger
+        test_logger.warning(
+            "событие",
+            extra={"event_id": 2000, "event_sent": mock.Mock(side_effect=ValueError)},
+        )
+        flush_event_logs()
+        evtlog.ReportEvent.side_effect = OSError("full")
+        test_logger.warning(
+            "событие",
+            extra={
+                "event_id": 2000,
+                "event_unsent": mock.Mock(side_effect=ValueError),
+            },
+        )
+        flush_event_logs()
+
+        errors = [
+            r
+            for r in caplog.records
+            if r.getMessage().startswith("Ошибка учёта исхода")
+        ]
+        assert len(errors) == 2
+        assert all(r.event_log is False and r.exc_info for r in errors)
+
+    def test_handler_confirms_outcome(self):
+        """Проверить: EventLogHandler сообщает об исходе записи."""
+        assert getattr(logging_setup.EventLogHandler, event_tracking.CONFIRMS_ATTRIBUTE)
+
+    @pytest.mark.usefixtures("clock")
+    def test_unsent_reason_change_keeps_reason(self, tracking_handler):
+        """Проверить: 2000 о смене причины не записалось — его повтор
+        называет прежнюю причину и число её ответов, а 2002 — уже
+        только ответы новой.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [None, OSError("full"), None, None]
+        missing = FileNotFoundError(2, "No such file", "/srv")
+        for _ in range(3):
+            event_tracking.directory_error("/srv", missing, 404)
+            flush_event_logs()
+        event_tracking.directory_error("/srv", PermissionError(13, "denied"), 403)
+        flush_event_logs()
+        event_tracking.flush()
+        flush_event_logs()
+
+        sent = reported(evtlog)
+        assert [e[0] for e in sent] == [2000, 2000, 2000, 2002]
+        assert sent[2][2] == sent[1][2]
+        assert re.search(
+            r"До смены причины ошибочных ответов с прошлой записи: 2 \(.*No such file",
+            sent[2][2],
+        )
+        assert "denied" in sent[3][2]
+        assert sent[3][2].endswith("Ошибочных ответов с прошлой записи: 0")
+
+    def test_unsent_restored_resent_by_tick(self, tracking_handler, clock, caplog):
+        """Проверить: 2001 не записалось — такт через минуту пишет его
+        снова, а папка остаётся доступной.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [None, OSError("full"), None]
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+        event_tracking.tick()
+        flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 2
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+        event_tracking.flush()
+        flush_event_logs()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001, 2001]
+        assert event_tracking._state.directory is None  # noqa: SLF001
+
+    @pytest.mark.usefixtures("clock")
+    def test_flush_resends_before_retry(self, tracking_handler, caplog):
+        """Проверить: flush пишет незаписанное 2001 сразу, не дожидаясь
+        срока повтора.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [None, OSError("full"), None]
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+        event_tracking.flush()
+        flush_event_logs()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001, 2001]
+
+    @pytest.mark.usefixtures("clock")
+    def test_unsent_restored_before_new_unavailable(self, tracking_handler, caplog):
+        """Проверить: пока 2001 ждёт повтора, новое 2000 ждёт за ним."""
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [None, OSError("full"), None, None, None]
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 2
+        event_tracking.flush()
+        flush_event_logs()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001, 2001, 2000, 2002]
+
+    def test_unsent_unavailable_before_restored(self, tracking_handler, clock, caplog):
+        """Проверить: 2000 не записалось — 2001 ждёт за ним и пишется
+        после него.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 1
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2000, 2001]
+
+    def test_repeated_failure_keeps_every_event(self, tracking_handler, clock, caplog):
+        """Проверить: незаписанное 2001 снова не записалось — оно не
+        теряется за следующими событиями и пишется раньше них.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        evtlog.ReportEvent.side_effect = OSError("full")
+        event_tracking.directory_ok()
+        flush_event_logs()
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+        clock.advance(1)
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        clock.advance(5)
+        event_tracking.directory_ok()
+        flush_event_logs()
+        evtlog.ReportEvent.side_effect = None
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+
+        sent = reported(evtlog)
+        assert [e[0] for e in sent] == [2000, 2001, 2001, 2001, 2000, 2001]
+        assert sent[3][2] == sent[1][2]
+        assert sent[5][2] != sent[1][2]
+
+    def test_pending_limit(self, tracking_handler, clock, caplog, monkeypatch):
+        """Проверить: сверх предела очереди самые старые события о папке
+        отбрасываются, а их число указывает следующее записанное.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        monkeypatch.setattr(event_tracking, "PENDING_LIMIT", 2)
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = OSError("full")
+        for _ in range(2):
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            clock.advance(1)
+            event_tracking.directory_ok()
+            flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 1
+        evtlog.ReportEvent.side_effect = None
+        event_tracking.flush()
+        flush_event_logs()
+
+        sent = reported(evtlog)
+        assert [e[0] for e in sent] == [2000, 2000, 2001]
+        assert (
+            ". Более ранних событий о папке не записано в журнал событий: 2, "
+            "они есть в файле журнала\nOSError: [Errno 5] I/O"
+        ) in sent[1][2]
+
+    def test_pending_limit_keeps_dropped_count(
+        self, tracking_handler, clock, caplog, monkeypatch
+    ):
+        """Проверить: отброшенное событие передаёт следующему и число
+        отброшенных до него.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        monkeypatch.setattr(event_tracking, "PENDING_LIMIT", 2)
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = OSError("full")
+        for _ in range(3):
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            clock.advance(1)
+            event_tracking.directory_ok()
+            flush_event_logs()
+        evtlog.ReportEvent.side_effect = None
+        event_tracking.flush()
+        flush_event_logs()
+
+        sent = reported(evtlog)
+        assert [e[0] for e in sent] == [2000, 2000, 2001]
+        assert "не записано в журнал событий: 4," in sent[1][2]
+
+    @pytest.mark.usefixtures("clock")
+    def test_next_waits_for_delayed_result(self, evtlog, caplog):
+        """Проверить: исход 2000 станет известен позже (стартовый
+        буфер) — 2001 ждёт его и после отказа не обгоняет 2000.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            event_tracking.directory_ok()
+            flush_event_logs()
+            handler.send_startup_events()
+            flush_event_logs()
+            assert evtlog.ReportEvent.call_count == 1
+            event_tracking.flush()
+            flush_event_logs()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2000, 2001]
+
+    @pytest.mark.usefixtures("clock")
+    def test_next_sent_after_delayed_success(self, evtlog, caplog):
+        """Проверить: 2000 записано позже (стартовый буфер) — 2001,
+        ждавшее его, пишется сразу после, без такта таймера.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            event_tracking.directory_ok()
+            flush_event_logs()
+            handler.send_startup_events()
+            flush_event_logs()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+
+    def test_writer_outcome_keeps_order(self, tracking_handler, clock, caplog):
+        """Проверить: исход 2000 приходит из потока записи позже — 2001
+        ждёт его, а после отказа 2000 не обгоняет его: такт пишет 2000
+        снова, и только потом 2001.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def report(*args):
+            calls.append(args[3])
+            if len(calls) == 1:
+                entered.set()
+                release.wait(10)
+                failure = "full"
+                raise OSError(failure)
+
+        evtlog.ReportEvent.side_effect = report
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        assert entered.wait(5)
+        event_tracking.directory_ok()
+        event_tracking.tick()
+        # 2000 ещё пишется: 2001 ждёт его исхода
+        assert calls == [2000]
+        release.set()
+        flush_event_logs()
+        # 2000 не записалось: 2001 ждёт его повтора
+        assert calls == [2000]
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.tick()
+        flush_event_logs()
+
+        assert calls == [2000, 2000, 2001]
+
+    @pytest.mark.usefixtures("clock")
+    def test_flush_handlers_waits_for_next_directory_event(
+        self, tracking_handler, caplog, monkeypatch
+    ):
+        """Проверить: сброс перед выходом дожидается 2001, которое пишет
+        обратный вызов об исходе 2000 в потоке записи, — замок
+        обработчика сброс не держит.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        monkeypatch.setattr(logging_setup, "_handlers", [handler])
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            if not entered.is_set():
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        assert entered.wait(5)
+        event_tracking.directory_ok()
+        threading.Timer(0.2, release.set).start()
+        moment = time.monotonic()
+        logging_setup.flush_handlers()
+
+        assert time.monotonic() - moment < 2
+        assert [call.args[3] for call in evtlog.ReportEvent.call_args_list] == [
+            2000,
+            2001,
+        ]
+
+    def test_hung_console_does_not_stop_writer(self, event_logger, monkeypatch):
+        """Проверить: строка об отказе ReportEvent уходит в зависшую
+        консоль — поток записи не встаёт и пишет следующие события.
+        """
+        test_logger, evtlog = event_logger
+        entered, release = threading.Event(), threading.Event()
+
+        class HungConsole(logging.Handler):
+            def emit(self, record):
+                if record.getMessage().startswith("Не удалось записать"):
+                    entered.set()
+                    release.wait(10)
+
+        monkeypatch.setattr(
+            logging.getLogger(logging_setup.__name__), "handlers", [HungConsole()]
+        )
+        evtlog.ReportEvent.side_effect = [OSError("full"), None]
+        try:
+            test_logger.warning("первое", extra={"event_id": 3000})
+            assert entered.wait(5)
+            test_logger.warning("второе", extra={"event_id": 3000})
+            wait_for(lambda: evtlog.ReportEvent.call_count == 2, 5)
+        finally:
+            release.set()
+        flush_event_logs()
+
+    @pytest.mark.usefixtures("clock")
+    def test_hung_diagnostics_do_not_stop_outcomes(
+        self, tracking_handler, monkeypatch, caplog
+    ):
+        """Проверить: строка об отказе ReportEvent зависла в консоли —
+        подтверждения идут: 2001 пишется после подтверждения 2000.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+
+        class HungConsole(logging.Handler):
+            def emit(self, record):
+                if record.getMessage().startswith("Не удалось записать"):
+                    entered.set()
+                    release.wait(10)
+
+        monkeypatch.setattr(
+            logging.getLogger(logging_setup.__name__), "handlers", [HungConsole()]
+        )
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+        try:
+            logging.getLogger("app.test_event_log").warning(
+                "отказ", extra={"event_id": 3000}
+            )
+            assert entered.wait(5)
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            wait_for(lambda: evtlog.ReportEvent.call_count == 2, 5)
+            event_tracking.directory_ok()
+            wait_for(lambda: evtlog.ReportEvent.call_count == 3, 5)
+        finally:
+            release.set()
+        assert [call.args[3] for call in evtlog.ReportEvent.call_args_list] == [
+            3000,
+            2000,
+            2001,
+        ]
+
+    def test_emit_callback_error_stays_in_handler(self, evtlog, caplog):
+        """Проверить: ошибка обратного вызова в emit (запись отброшена
+        после сброса буфера) остаётся в обработчике.
+        """
+        handler = logging_setup.EventLogHandler()
+        try:
+            handler.discard_startup_events()
+            handler.handle(
+                logging.makeLogRecord(
+                    {
+                        "name": "app.t",
+                        "levelno": 30,
+                        "msg": "w",
+                        "event_id": 2000,
+                        "event_unsent": mock.Mock(side_effect=ValueError),
+                    }
+                )
+            )
+        finally:
+            handler.close()
+
+        assert "Ошибка учёта исхода события журнала событий" in caplog.text
+        evtlog.ReportEvent.assert_not_called()
+
+    def test_diagnostics_limit(self, event_logger, monkeypatch, caplog):
+        """Проверить: пока вывод диагностики висит, ждут не больше
+        DIAGNOSTICS_LIMIT строк, остальные отбрасываются.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "DIAGNOSTICS_LIMIT", 2)
+        [handler] = test_logger.handlers
+        entered, release = threading.Event(), threading.Event()
+        handler._diagnostics = logging_setup._Lane(  # noqa: SLF001
+            handler, "event-log-diagnostics", logging_setup.DIAGNOSTICS_LIMIT
+        )
+
+        def hang():
+            entered.set()
+            release.wait(10)
+
+        handler._diagnose(hang)  # noqa: SLF001
+        assert entered.wait(5)
+        for _ in range(5):
+            test_logger.warning(
+                "событие",
+                extra={
+                    "event_id": 2000,
+                    "event_sent": mock.Mock(side_effect=ValueError),
+                },
+            )
+        # Все пять исходов обработаны: строки сверх лимита уже отброшены
+        wait_for(
+            lambda: (
+                evtlog.ReportEvent.call_count == 5
+                and handler._outcomes.idle()  # noqa: SLF001
+                and len(handler._diagnostics._actions) == 2  # noqa: SLF001
+            )
+        )
+        release.set()
+        flush_event_logs()
+
+        errors = [
+            r
+            for r in caplog.records
+            if r.getMessage().startswith("Ошибка учёта исхода")
+        ]
+        assert len(errors) == 2
+
+    @pytest.mark.usefixtures("clock")
+    def test_event_waits_for_running_drain(self, tracking_handler):
+        """Проверить: пока очередь пишет другой поток, новое событие о
+        папке только встаёт в неё.
+        """
+        evtlog = tracking_handler
+        event_tracking._state.draining = True  # noqa: SLF001
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        flush_event_logs()
+        evtlog.ReportEvent.assert_not_called()
+        event_tracking._state.draining = False  # noqa: SLF001
+        event_tracking.tick()
+        flush_event_logs()
+
+        assert [e[0] for e in reported(evtlog)] == [2000]
+
+    @pytest.mark.usefixtures("clock")
+    def test_discarded_directory_events_keep_order(self, evtlog, caplog):
+        """Проверить: 2000 и 2001 отброшены со стартовым буфером —
+        второй экземпляр в журнал событий их не пишет, а в очереди учёта
+        они остаются в том же порядке.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            event_tracking.directory_ok()
+            flush_event_logs()
+            handler.discard_startup_events()
+            flush_event_logs()
+            event_tracking.tick()
+            flush_event_logs()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert reported(evtlog) == []
+        pending = event_tracking._state.pending  # noqa: SLF001
+        assert [item.event_id for item in pending] == [2000, 2001]
+
+    def test_failed_reminder_keeps_unsent(self, tracking_handler, clock):
+        """Проверить: первое событие и напоминание не записались —
+        следующий случай пишется как первый, а не считается повтором.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = OSError("full")
+        for _ in range(2):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+            flush_event_logs()
+        clock.advance(60 * 60)
+        event_tracking.tick()
+        flush_event_logs()
+        evtlog.ReportEvent.side_effect = None
+        evtlog.ReportEvent.reset_mock()
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+        flush_event_logs()
+
+        assert [e[2] for e in reported(evtlog)] == ["app.event_tracking: отказ"]
+
+    @pytest.mark.usefixtures("clock")
+    def test_dropped_over_limit_resends(self, evtlog):
+        """Проверить: 2000, отброшенное сверх лимита буфера, пишется
+        следующим тактом.
+        """
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2004}
+                    )
+                )
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            handler.send_startup_events()
+            flush_event_logs()
+            evtlog.ReportEvent.reset_mock()
+            event_tracking.tick()
+            flush_event_logs()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert [e[0] for e in reported(evtlog)] == [2000]
+
+    def test_report_error_keeps_reminder_count(self, tracking_handler, clock):
+        """Проверить: напоминание и 2002 не записались — их числа уходят
+        следующим напоминанием, а не теряются.
+        """
+        evtlog = tracking_handler
+        for _ in range(3):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+            flush_event_logs()
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+        clock.advance(60 * 60)
+        evtlog.ReportEvent.side_effect = OSError("full")
+        event_tracking.tick()
+        flush_event_logs()
+        evtlog.ReportEvent.side_effect = None
+        event_tracking.flush()
+        flush_event_logs()
+
+        texts = [e[2] for e in reported(evtlog)]
+        assert (
+            "app.event_tracking: Повторялось ещё 2 раз с прошлой записи: отказ" in texts
+        )
+        assert texts[-2].endswith("Ошибочных ответов с прошлой записи: 2")
+        assert texts[-1].endswith("Ошибочных ответов с прошлой записи: 0")
+
+    @pytest.mark.usefixtures("clock")
+    def test_persistent_report_error_counts_repeats(self, tracking_handler):
+        """Проверить: пока журнал событий отказывает, случаи считаются
+        и уходят напоминанием, когда он снова работает.
+        """
+        evtlog = tracking_handler
+        evtlog.ReportEvent.side_effect = OSError("full")
+        for _ in range(3):
+            event_tracking.track(EventId.FILE_ACCESS_ERROR, "key", "отказ")
+            flush_event_logs()
+        evtlog.ReportEvent.side_effect = None
+        event_tracking.flush()
+        flush_event_logs()
+
+        assert [e[2] for e in reported(evtlog)][-1] == (
+            "app.event_tracking: Повторялось ещё 3 раз с прошлой записи: отказ"
+        )
+
+    def test_buffered_report_error_resends_key(self, evtlog, clock):
+        """Проверить: событие из буфера не записалось при отправке —
+        такой же случай через минуту снова даёт событие.
+        """
+        handler = logging_setup.EventLogHandler()
+        test_logger = logging.getLogger("app.test_buffer")
+        test_logger.addHandler(handler)
+        try:
+            test_logger.warning("отказ")
+            flush_event_logs()
+            evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+            handler.send_startup_events()
+            flush_event_logs()
+            clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+            test_logger.warning("отказ")
+            flush_event_logs()
+            test_logger.warning("отказ")
+            flush_event_logs()
+        finally:
+            test_logger.removeHandler(handler)
+            handler.close()
+
+        flush_event_logs()
+        assert evtlog.ReportEvent.call_count == 2
 
     def test_startup_buffer_keeps_text_of_the_moment(self, evtlog):
         """Проверить: текст события — на момент записи, а не отправки
@@ -736,6 +1772,7 @@ class TestEventLogHandler:
         try:
             test_logger.warning("первое")
             test_logger.warning("второе", extra={"event_id": 2004})
+            flush_event_logs()
             evtlog.ReportEvent.assert_not_called()
 
             handler.send_startup_events()
@@ -749,6 +1786,7 @@ class TestEventLogHandler:
             (2004, "app.test_buffer: второе"),
             (4000, "app.test_buffer: после старта"),
         ]
+        flush_event_logs()
         evtlog.DeregisterEventSource.assert_called_once_with("source-handle")
 
     def test_startup_buffer_overflow(self, evtlog):
@@ -758,7 +1796,9 @@ class TestEventLogHandler:
         handler = logging_setup.EventLogHandler()
         for i in range(105):
             handler.handle(
-                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": f"w{i}"})
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": f"w{i}", "event_id": 2000}
+                )
             )
         handler.send_startup_events()
         handler.close()
@@ -796,12 +1836,13 @@ class TestEventLogHandler:
         handler.send_startup_events()
         handler.close()
 
+        flush_event_logs()
         assert evtlog.ReportEvent.call_count == 2
         assert "Не удалось записать событие 2004 в журнал событий: full" in caplog.text
 
     def test_discard_startup_events(self, evtlog):
-        """Проверить: отброшенный буфер не отправляется, дальше
-        события пишутся сразу.
+        """Проверить: отброшенный буфер не отправляется и после
+        send_startup_events, дальше пишутся только записи исхода.
         """
         handler = logging_setup.EventLogHandler()
         for i in range(105):
@@ -812,11 +1853,17 @@ class TestEventLogHandler:
         handler.send_startup_events()
         handler.handle(
             logging.makeLogRecord(
+                {"name": "app.t", "levelno": 30, "msg": "2004", "event_id": 2004}
+            )
+        )
+        handler.handle(
+            logging.makeLogRecord(
                 {
                     "name": "app.t",
                     "levelno": 20,
                     "msg": "уже работает",
                     "event_id": 1005,
+                    "outcome": True,
                 }
             )
         )
@@ -824,7 +1871,230 @@ class TestEventLogHandler:
         handler.close()
 
         assert [e[0] for e in reported(evtlog)] == [1005]
+        flush_event_logs()
         evtlog.DeregisterEventSource.assert_called_once()
+
+    def test_outcome_passes_full_buffer(self, evtlog):
+        """Проверить: запись исхода (1000) встаёт в полный буфер, а не
+        отбрасывается лимитом.
+        """
+        handler = logging_setup.EventLogHandler()
+        for i in range(logging_setup.STARTUP_BUFFER_LIMIT + 5):
+            handler.handle(
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
+                )
+            )
+        handler.handle(
+            logging.makeLogRecord(
+                {
+                    "name": "app.runner",
+                    "levelno": 20,
+                    "msg": "Сервис запущен",
+                    "event_id": 1000,
+                    "outcome": True,
+                }
+            )
+        )
+        handler.send_startup_events()
+        handler.close()
+
+        ids = [e[0] for e in reported(evtlog)]
+        assert ids.count(1000) == 1
+        assert ids.index(1000) == logging_setup.STARTUP_BUFFER_LIMIT
+        # Пометка об отброшенных записях — после буфера
+        assert ids[-1] == 3001
+
+    def test_lost_first_event_not_a_repeat(self, evtlog):
+        """Проверить: запись, не попавшая в журнал событий из-за лимита
+        буфера, не считается потом повтором.
+        """
+        handler = logging_setup.EventLogHandler()
+        warning = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        for i in range(logging_setup.STARTUP_BUFFER_LIMIT):
+            handler.handle(
+                logging.makeLogRecord(
+                    {"name": "app.t", "levelno": 30, "msg": i, "event_id": 2000}
+                )
+            )
+        handler.handle(warning)
+        handler.send_startup_events()
+        flush_event_logs()
+        evtlog.ReportEvent.reset_mock()
+
+        handler.handle(warning)
+        handler.close()
+
+        assert reported(evtlog) == [(3001, 2, "app.t: w")]
+
+    def test_discard_keeps_repeats_and_overflow(self, evtlog, caplog):
+        """Проверить: после сброса буфера журнал событий молчит, а
+        повторы, посчитанные до него, не теряются в файле журнала.
+        """
+        handler = logging_setup.EventLogHandler()
+
+        def warn(msg):
+            handler.handle(
+                logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": msg})
+            )
+
+        warn("w")
+        warn("w")
+        for i in range(event_tracking.MAX_KEYS_PER_EVENT):
+            warn(f"вид {i}")
+        handler.discard_startup_events()
+
+        warn("w")
+        warn("ещё вид")
+        event_tracking.flush()
+        handler.close()
+
+        # Второй экземпляр после сброса буфера в журнал событий не пишет
+        assert reported(evtlog) == []
+        # Отброшенный с буфером случай и повтор до сброса — в итоговом
+        # напоминании
+        assert "Повторялось ещё 2 раз с прошлой записи: app.t: w" in caplog.text
+
+
+class TestConsoleHandler:
+    """Консоль через свой поток."""
+
+    def test_hung_stream_does_not_block(self, monkeypatch):
+        """Проверить: запись в зависшую консоль не держит вызывающий
+        поток; сверх лимита строки отбрасываются, сброс ограничен.
+        """
+        monkeypatch.setattr(logging_setup, "CONSOLE_QUEUE_LIMIT", 2)
+        monkeypatch.setattr(logging_setup, "FLUSH_LOCK_SECONDS", 0.1)
+        entered, release = threading.Event(), threading.Event()
+        written = []
+
+        class HungStream:
+            def write(self, text):
+                entered.set()
+                release.wait(10)
+                written.append(text)
+
+            def flush(self):
+                pass
+
+        handler = logging_setup.ConsoleHandler(HungStream())
+        record = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        try:
+            moment = time.monotonic()
+            handler.handle(record)
+            assert entered.wait(5)
+            for _ in range(5):
+                handler.handle(record)
+            handler.flush()
+            assert time.monotonic() - moment < 2
+        finally:
+            release.set()
+            handler.close()
+        wait_for(lambda: len(written) == 3)
+        assert written == ["w\n"] * 3
+
+    def test_close_with_full_queue(self, monkeypatch):
+        """Проверить: очередь полна, и маркер закрытия в неё не встал —
+        поток консоли всё равно выводит строки и завершается.
+        """
+        monkeypatch.setattr(logging_setup, "CONSOLE_QUEUE_LIMIT", 1)
+        monkeypatch.setattr(logging_setup, "CONSOLE_POLL_SECONDS", 0.05)
+        entered, release = threading.Event(), threading.Event()
+        written = []
+
+        class HungStream:
+            def write(self, text):
+                entered.set()
+                release.wait(10)
+                written.append(text)
+
+            def flush(self):
+                pass
+
+        handler = logging_setup.ConsoleHandler(HungStream())
+        record = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        handler.handle(record)
+        assert entered.wait(5)
+        handler.handle(record)
+        handler.close()
+        release.set()
+        handler._thread.join(5)  # noqa: SLF001
+
+        assert not handler._thread.is_alive()  # noqa: SLF001
+        assert written == ["w\n", "w\n"]
+
+    def test_event_only_and_broken_stream(self):
+        """Проверить: запись «только в журнал событий» в консоль не
+        идёт, ошибка потока консоли не роняет запись.
+        """
+        stream = mock.Mock()
+        stream.write.side_effect = [OSError("broken"), None]
+        handler = logging_setup.ConsoleHandler(stream)
+        try:
+            only = logging.makeLogRecord(
+                {"name": "app.t", "levelno": 30, "msg": "o", "event_only": True}
+            )
+            assert handler.handle(only) is False
+            for message in ("a", "b"):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"name": "app.t", "levelno": 30, "msg": message}
+                    )
+                )
+            handler.flush()
+        finally:
+            handler.close()
+        assert [c.args[0] for c in stream.write.call_args_list] == ["a\n", "b\n"]
+
+    def test_format_error(self, monkeypatch):
+        """Проверить: ошибка форматирования — handleError."""
+        handler = logging_setup.ConsoleHandler(mock.Mock())
+        handle_error = mock.Mock()
+        monkeypatch.setattr(handler, "handleError", handle_error)
+        record = logging.makeLogRecord({"name": "app.t", "msg": "%s %s", "args": (1,)})
+        try:
+            handler.handle(record)
+        finally:
+            handler.close()
+        handle_error.assert_called_once_with(record)
+
+
+class TestFlushHandlers:
+    """Сброс журнала перед os._exit."""
+
+    def test_flushes_handlers(self, monkeypatch):
+        handler = logging.StreamHandler()
+        handler.flush = mock.Mock()
+        monkeypatch.setattr(logging_setup, "_handlers", [handler])
+        logging_setup.flush_handlers()
+        handler.flush.assert_called_once()
+
+    def test_skips_handler_with_held_lock(self, monkeypatch):
+        """Проверить: замок обработчика держит зависший поток — сброс
+        его пропускает, а не ждёт вечно.
+        """
+        held, stuck = logging.StreamHandler(), logging.StreamHandler()
+        held.flush = mock.Mock()
+        stuck.flush = mock.Mock(side_effect=OSError("канал переполнен"))
+        monkeypatch.setattr(logging_setup, "_handlers", [held, stuck])
+        monkeypatch.setattr(logging_setup, "FLUSH_LOCK_SECONDS", 0.1)
+        locked, release = threading.Event(), threading.Event()
+
+        def hold():
+            with held.lock:
+                locked.set()
+                release.wait()
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        locked.wait()
+        try:
+            logging_setup.flush_handlers()
+        finally:
+            release.set()
+            thread.join()
+        held.flush.assert_not_called()
+        stuck.flush.assert_called_once()
 
 
 class TestWindowsLookups:
@@ -905,3 +2175,236 @@ class TestEventIds:
         assert not is_tracked(None)
         mark_tracked(error)
         assert is_tracked(error)
+
+
+class TestHungReportEvent:
+    """Зависший ReportEvent держит один поток, а не всех."""
+
+    def test_other_threads_do_not_wait(self, event_logger, monkeypatch):
+        """Проверить: пока ReportEvent висит в одном потоке, запись из
+        другого не ждёт, сброс ждёт ограниченное время, а после ответа
+        оба события записаны по порядку.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.1)
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            entered.set()
+            release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        thread = threading.Thread(target=test_logger.warning, args=("первое",))
+        thread.start()
+        try:
+            assert entered.wait(5)
+            started = time.monotonic()
+            test_logger.warning("второе")
+            [handler] = test_logger.handlers
+            handler.flush()
+            assert time.monotonic() - started < 2
+            flush_event_logs()
+            assert evtlog.ReportEvent.call_count == 1
+        finally:
+            release.set()
+            thread.join(5)
+        texts = [text for _, _, text in reported(evtlog)]
+        assert texts == ["app.test_event_log: первое", "app.test_event_log: второе"]
+
+    def test_queue_limit(self, event_logger, monkeypatch):
+        """Проверить: очередь при зависшем ReportEvent ограничена, а об
+        отброшенных событиях после ответа пишется одна пометка.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_QUEUE_LIMIT", 2)
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            entered.set()
+            release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("событие 0", extra={"event_id": 2000})
+        assert entered.wait(5)
+        for number in range(1, 5):
+            test_logger.warning("событие %s", number, extra={"event_id": 2000})
+        release.set()
+        assert [text for _, _, text in reported(evtlog)] == [
+            "app.test_event_log: событие 0",
+            "app.test_event_log: событие 1",
+            "app.test_event_log: событие 2",
+            (
+                "app.logging_setup: Отброшено событий, пока журнал событий не "
+                "отвечал: 2, они есть в файле журнала"
+            ),
+        ]
+
+    def test_queue_limit_resends_key(self, event_logger, monkeypatch, clock):
+        """Проверить: событие ключа, не вставшее в полную очередь, через
+        минуту снова даёт событие, а не считается повтором.
+        """
+        test_logger, evtlog = event_logger
+        [handler] = test_logger.handlers
+        monkeypatch.setattr(
+            logging.getLogger("app.event_tracking"), "handlers", [handler]
+        )
+        monkeypatch.setattr(logging_setup, "EVENT_QUEUE_LIMIT", 1)
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def report(*args):
+            calls.append(args[5][0])
+            if len(calls) == 1:
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("занят", extra={"event_id": 2000})
+        assert entered.wait(5)
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "a", "отказ a")
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "b", "отказ b")
+        release.set()
+        flush_event_logs()
+        clock.advance(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.track(EventId.FILE_ACCESS_ERROR, "b", "отказ b")
+        flush_event_logs()
+
+        assert calls[1] == "app.event_tracking: отказ a"
+        assert calls[-1] == "app.event_tracking: отказ b"
+        assert calls.count("app.event_tracking: отказ b") == 1
+
+    def test_flush_handlers_bounded_by_hung_report(self, event_logger, monkeypatch):
+        """Проверить: сброс перед выходом не висит на зависшем
+        ReportEvent — ждёт очередь не дольше EVENT_FLUSH_SECONDS.
+        """
+        test_logger, evtlog = event_logger
+        [handler] = test_logger.handlers
+        monkeypatch.setattr(logging_setup, "_handlers", [handler])
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.2)
+        release = threading.Event()
+        evtlog.ReportEvent.side_effect = lambda *_: release.wait(10)
+        test_logger.warning("событие", extra={"event_id": 2000})
+        moment = time.monotonic()
+        try:
+            logging_setup.flush_handlers()
+            assert time.monotonic() - moment < 2
+        finally:
+            release.set()
+
+    def test_no_writer_without_events(self, evtlog):
+        """Проверить: пустой буфер, запись без события и запись,
+        отклонённая фильтром, не запускают поток записи; emit напрямую
+        пропускает запись без события и пишет запись с событием.
+        """
+        handler = logging_setup.EventLogHandler()
+        try:
+            handler.send_startup_events()
+            record = logging.makeLogRecord({"name": "app.t", "levelno": 20})
+            handler.emit(record)
+            assert handler.handle(record) is False
+            assert handler._writer is None  # noqa: SLF001
+            event = logging.makeLogRecord(
+                {"name": "app.t", "levelno": 30, "msg": "w", "event_id": 2000}
+            )
+            # Фильтр обработчика отклоняет запись: события нет
+            handler.addFilter(lambda _record: False)
+            assert handler.handle(event) is False
+            assert handler._writer is None  # noqa: SLF001
+            # emit напрямую пишет запись с событием
+            handler.emit(event)
+            handler.send_startup_events()
+            handler.flush()
+        finally:
+            handler.close()
+        assert [e[0] for e in reported(evtlog)] == [2000]
+
+    @pytest.mark.usefixtures("evtlog")
+    def test_outcome_after_close(self):
+        """Проверить: действие, отложенное после выхода потока исходов
+        (писатель дописывает очередь после close), всё равно идёт.
+        """
+        handler = logging_setup.EventLogHandler()
+        first = threading.Event()
+        handler._outcomes.put(first.set)  # noqa: SLF001
+        assert first.wait(5)
+        handler.close()
+        wait_for(lambda: handler._outcomes.thread is None)  # noqa: SLF001
+        done = threading.Event()
+        handler._outcomes.put(done.set)  # noqa: SLF001
+        assert done.wait(5)
+
+    def test_service_events_use_reserve(self, event_logger, monkeypatch):
+        """Проверить: очередь полна, пока ReportEvent висит, — событие
+        остановки встаёт в запас, а обычное отбрасывается.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_QUEUE_LIMIT", 1)
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def report(*args):
+            calls.append(args[3])
+            if len(calls) == 1:
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("занят", extra={"event_id": 3000})
+        assert entered.wait(5)
+        test_logger.warning("в очереди", extra={"event_id": 3000})
+        test_logger.warning("сверх лимита", extra={"event_id": 3000})
+        test_logger.info("остановка", extra={"event_id": EventId.SERVICE_STOPPED})
+        release.set()
+        flush_event_logs()
+
+        assert calls[:3] == [3000, 3000, 1001]
+
+    def test_flush_under_handler_lock(self, event_logger, monkeypatch):
+        """Проверить: сброс под замком обработчика (как flush_handlers)
+        дожидается писателя, даже когда тот пишет строку об отказе.
+        """
+        test_logger, evtlog = event_logger
+        [handler] = test_logger.handlers
+        # Строка об отказе ReportEvent доходит и до этого обработчика
+        monkeypatch.setattr(
+            logging.getLogger(logging_setup.__name__), "handlers", [handler]
+        )
+        started = threading.Event()
+
+        def report(*_args):
+            started.wait(5)
+            message = "нет ответа"
+            raise OSError(message)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("первое", extra={"event_id": 2000})
+        test_logger.info("1001", extra={"event_id": 1001})
+        with handler.lock:
+            started.set()
+            moment = time.monotonic()
+            handler.flush()
+            assert time.monotonic() - moment < 2
+        assert [e[0] for e in reported(evtlog)] == [2000, 1001]
+
+    def test_close_waits_for_writer(self, event_logger, monkeypatch):
+        """Проверить: close() дописывает очередь, а источник закрывает
+        писатель после последнего ReportEvent.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.1)
+        [handler] = test_logger.handlers
+        release = threading.Event()
+        calls = []
+
+        def report(*_args):
+            release.wait(10)
+            calls.append(evtlog.DeregisterEventSource.called)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("событие", extra={"event_id": 2000})
+        handler.close()
+        evtlog.DeregisterEventSource.assert_not_called()
+        test_logger.warning("после закрытия", extra={"event_id": 2000})
+        release.set()
+        wait_for(lambda: evtlog.DeregisterEventSource.called)
+        assert calls == [False]
