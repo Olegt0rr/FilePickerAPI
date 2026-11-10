@@ -70,6 +70,8 @@ EVENT_QUEUE_LIMIT = 1000
 EVENT_QUEUE_RESERVE = 10
 # Строки консоли, ждущие вывода; остальные есть в файле журнала
 CONSOLE_QUEUE_LIMIT = 1000
+# Как часто поток консоли без строк проверяет, не закрыт ли обработчик
+CONSOLE_POLL_SECONDS = 1.0
 # Сколько строк диагностики (отказ ReportEvent, ошибка учёта) ждут
 # вывода в файл и консоль, пока они не отвечают; остальные отбрасываются
 DIAGNOSTICS_LIMIT = 100
@@ -530,8 +532,14 @@ class ConsoleHandler(logging.Handler):
         super().__init__()
         self._stream = stream
         self._lines: queue.Queue[str | None] = queue.Queue(CONSOLE_QUEUE_LIMIT)
+        # Признак закрытия отдельно от маркера в очереди: в полную
+        # очередь маркер не встанет, а поток должен выйти и так
+        self._stopping = threading.Event()
         self.addFilter(not_event_only)
-        threading.Thread(target=self._run, name="console-log", daemon=True).start()
+        self._thread = threading.Thread(
+            target=self._run, name="console-log", daemon=True
+        )
+        self._thread.start()
 
     def handle(self, record: logging.LogRecord) -> bool:
         """Принять запись без замка: emit консоль не ждёт."""
@@ -557,14 +565,25 @@ class ConsoleHandler(logging.Handler):
             time.sleep(0.01)
 
     def close(self) -> None:
-        """Остановить поток консоли после уже принятых строк."""
+        """Остановить поток консоли после уже принятых строк.
+
+        Не ждёт поток: маркер будит его, а если очередь полна и маркер
+        не встал, поток выйдет по признаку закрытия, когда выведет
+        очередь.
+        """
+        self._stopping.set()
         with suppress(queue.Full):
             self._lines.put_nowait(None)
         super().close()
 
     def _run(self) -> None:
         while True:
-            line = self._lines.get()
+            try:
+                line = self._lines.get(timeout=CONSOLE_POLL_SECONDS)
+            except queue.Empty:
+                if self._stopping.is_set():
+                    return
+                continue
             try:
                 if line is None:
                     return
