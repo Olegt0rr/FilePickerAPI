@@ -24,7 +24,7 @@ from urllib.parse import quote
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import start_then_stop
+from tests.conftest import child_env, start_then_stop
 from tests.platforms import linux_only, windows_only
 
 
@@ -2600,7 +2600,7 @@ def exec_main(argv):
 def run_python(*args, cwd, timeout=60):
     """Запустить отдельный процесс Python в папке cwd.
 
-    Пакет app берётся из установки (pip install -e), а не из cwd.
+    Пакет app берётся из этого checkout (PYTHONPATH), а не из cwd.
     """
     return subprocess.run(  # noqa: S603 - аргументы задаются тестом
         [sys.executable, *args],
@@ -2609,7 +2609,7 @@ def run_python(*args, cwd, timeout=60):
         text=True,
         encoding="utf-8",
         errors="replace",
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        env=child_env(),
         timeout=timeout,
         check=False,
     )

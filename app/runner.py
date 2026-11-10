@@ -1,7 +1,8 @@
 """Запуск сервиса File Picker API: рабочий поток и исходы процесса.
 
 Главный поток настраивает журнал и обработчики остановки, запускает
-рабочий поток и ждёт исхода без опроса. Рабочий поток проверяет, не
+рабочий поток и ждёт исхода, раз в 0,1 с передавая остановке причину
+пришедшего POSIX-сигнала (см. stop_signals). Рабочий поток проверяет, не
 работает ли сервис уже, создаёт приложение и запускает Uvicorn, а при
 ошибке HTTP-сервера пробует снова через 10, 30 и 60 секунд. Исходов
 три, первый записанный выигрывает: остановка (событие 1001, код 0),
@@ -316,9 +317,10 @@ class Service:
     def __init__(self, *, console: bool) -> None:
         """Создать состояние до запуска потоков."""
         self.console = console
-        # RLock: request_stop вызывается из обработчика сигнала, который
-        # может прервать главный поток внутри того же request_stop
-        self.lock = threading.RLock()
+        # request_stop вызывают главный поток (причина сигнала), поток
+        # срочной остановки и консольный обработчик Windows в своём
+        # потоке; повторного входа под замком нет
+        self.lock = threading.Lock()
         # Будит финализацию: поток завершился или срок сократился
         self.changed = threading.Condition(self.lock)
         # decided — исход занят (с этого момента идёт срок сторожа),
@@ -350,6 +352,8 @@ class Service:
         # ждёт уже начатую запись
         self.events_closed = False
         self.events_lock = threading.Lock()
+        # Поток записи 1002 перед повтором: может не уложиться в срок
+        self.report_thread: threading.Thread | None = None
         # Текст 1000; собирается в рабочем потоке до запуска Uvicorn
         self.start_message = f"Сервис запущен: версия {__version__}, порт {PORT}"
 
@@ -505,8 +509,15 @@ class Service:
         """
         if self.stop_requested.is_set():
             return
+        message = self.start_message
+        if self.report_thread is not None and self.report_thread.is_alive():
+            # Зависшее 1002 прошлой попытки может лечь после этого 1000
+            message += (
+                ". Запись о прошлой неудачной попытке (1002) ещё не "
+                "завершена и может появиться в журнале позже"
+            )
         logger.info(
-            self.start_message,
+            message,
             extra={"event_id": EventId.SERVICE_STARTED, "outcome": True},
         )
 
@@ -675,6 +686,7 @@ class Service:
                 errors.append(e)
 
         thread = threading.Thread(target=report, name="report-failure", daemon=True)
+        self.report_thread = thread
         thread.start()
         thread.join(REPORT_WAIT_SECONDS)
         if errors:
