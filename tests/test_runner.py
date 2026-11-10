@@ -709,6 +709,34 @@ class TestFinalEventOrder:
 
         assert slow_first_report == [2000, 2002, 1002]
 
+    @pytest.mark.usefixtures("clock")
+    def test_failed_write_counted_in_summary(self, evtlog):
+        """Проверить: первое 3000 ещё пишется при остановке и не
+        записывается — итог учитывает его случай вместе с повтором, и
+        напоминание ложится раньше 1001.
+        """
+        logging_setup.setup_logging(console=False)
+        logging_setup.send_startup_events()
+        calls = []
+
+        def report(*args):
+            calls.append((args[3], args[5][0]))
+            if len(calls) == 1:
+                time.sleep(0.3)
+                failure = "full"
+                raise OSError(failure)
+
+        evtlog.ReportEvent.side_effect = report
+        for _ in range(2):
+            event_tracking.track(event_tracking.EventId.FILE_ACCESS_ERROR, "k", "отказ")
+        service = runner.Service(console=False)
+        service.stop_reason = "тест"
+        service.finalize()
+        flush_event_logs()
+
+        assert [event_id for event_id, _ in calls] == [3000, 3000, 1001]
+        assert calls[1][1].endswith("Повторялось ещё 2 раз с прошлой записи: отказ")
+
     def test_wait_leaves_exit_reserve(self, monkeypatch):
         """Проверить: ожидание журнала событий оставляет запас срока
         сторожа на сброс журнала.

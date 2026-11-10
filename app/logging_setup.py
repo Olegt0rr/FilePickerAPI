@@ -7,6 +7,7 @@
 
 import functools
 import logging
+import queue
 import sys
 import threading
 import time
@@ -15,6 +16,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import TextIO
 
 from app.event_tracking import (
     CURRENT_ATTRIBUTE,
@@ -63,6 +65,11 @@ EVENT_FLUSH_SECONDS = 3.0
 # Сколько событий держать в очереди, пока ReportEvent не отвечает;
 # остальные есть в файле журнала
 EVENT_QUEUE_LIMIT = 1000
+# Запас очереди для событий запуска и остановки (1000–1006): их не
+# вытесняют накопленные события, пока журнал событий не отвечает
+EVENT_QUEUE_RESERVE = 10
+# Строки консоли, ждущие вывода; остальные есть в файле журнала
+CONSOLE_QUEUE_LIMIT = 1000
 # Сколько строк диагностики (отказ ReportEvent, ошибка учёта) ждут
 # вывода в файл и консоль, пока они не отвечают; остальные отбрасываются
 DIAGNOSTICS_LIMIT = 100
@@ -350,12 +357,21 @@ class EventLogHandler(logging.Handler):
         Событие, не вставшее в очередь (она полна или обработчик
         закрыт), не записано, как при отказе ReportEvent: очередь полна,
         только пока журнал событий не отвечает. Его on_unsent
-        вызывается с UNSENT_RETRY_SECONDS, вне замка очереди.
+        вызывается с UNSENT_RETRY_SECONDS, вне замка очереди. Событиям
+        запуска и остановки (1000–1006) сверх лимита оставлен запас
+        EVENT_QUEUE_RESERVE: причина завершения процесса не теряется
+        за накопленными событиями.
         """
         with self._ready:
-            free = 0 if self._closing else EVENT_QUEUE_LIMIT - len(self._pending)
-            rejected = items[max(free, 0) :]
-            self._pending.extend(items[: max(free, 0)])
+            rejected = []
+            for item in items:
+                limit = EVENT_QUEUE_LIMIT
+                if item[1] in _SERVICE_EVENTS:
+                    limit += EVENT_QUEUE_RESERVE
+                if self._closing or len(self._pending) >= limit:
+                    rejected.append(item)
+                else:
+                    self._pending.append(item)
             if not self._closing:
                 self._lost += len(rejected)
             if self._writer is None and items and not self._closing:
@@ -493,6 +509,81 @@ class EventLogHandler(logging.Handler):
         source, self._source = self._source, None
         if source is not None:
             self._win32evtlog.DeregisterEventSource(source)
+
+
+# События запуска и остановки сервиса: им оставлен запас очереди
+_SERVICE_EVENTS = frozenset(
+    {
+        EventId.SERVICE_STARTED,
+        EventId.SERVICE_STOPPED,
+        EventId.SERVICE_FAILED,
+        EventId.BUILD_FOLDER_PERMISSIONS,
+        EventId.LOG_FILE_UNAVAILABLE,
+        EventId.ALREADY_RUNNING,
+        EventId.OTHER_VERSION_RUNNING,
+    }
+)
+
+
+class ConsoleHandler(logging.Handler):
+    """Консоль (stderr) через свой поток.
+
+    Строка форматируется в вызывающем потоке, а пишет её поток
+    консоли: заполненный канал или консоль Windows, где выделен текст
+    (QuickEdit), задерживают только его, а не цикл событий Uvicorn,
+    запросы и повторные попытки запуска. Пока консоль не отвечает, ждут
+    не больше CONSOLE_QUEUE_LIMIT строк, остальные есть в файле журнала.
+    Записи «только в журнал событий» сюда не попадают.
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        """Запустить поток консоли для stream."""
+        super().__init__()
+        self._stream = stream
+        self._lines: queue.Queue[str | None] = queue.Queue(CONSOLE_QUEUE_LIMIT)
+        self.addFilter(not_event_only)
+        threading.Thread(target=self._run, name="console-log", daemon=True).start()
+
+    def handle(self, record: logging.LogRecord) -> bool:
+        """Принять запись без замка: emit консоль не ждёт."""
+        if not self.filter(record):
+            return False
+        self.emit(record)
+        return True
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Поставить строку в очередь консоли; полная — строки нет."""
+        try:
+            line = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        with suppress(queue.Full):
+            self._lines.put_nowait(line)
+
+    def flush(self) -> None:
+        """Дождаться вывода очереди не дольше FLUSH_LOCK_SECONDS."""
+        deadline = time.monotonic() + FLUSH_LOCK_SECONDS
+        while self._lines.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        """Остановить поток консоли после уже принятых строк."""
+        with suppress(queue.Full):
+            self._lines.put_nowait(None)
+        super().close()
+
+    def _run(self) -> None:
+        while True:
+            line = self._lines.get()
+            try:
+                if line is None:
+                    return
+                with suppress(Exception):
+                    self._stream.write(line + "\n")
+                    self._stream.flush()
+            finally:
+                self._lines.task_done()
 
 
 class _Lane:
@@ -775,9 +866,7 @@ def setup_logging(*, console: bool) -> None:
     formatter = logging.Formatter(LOG_FORMAT)
 
     if console:
-        stream = _add(logging.StreamHandler(sys.stderr))
-        stream.setFormatter(formatter)
-        stream.addFilter(not_event_only)
+        _add(ConsoleHandler(sys.stderr)).setFormatter(formatter)
     if not _windows():
         return
     # Журнал событий раньше файла: 1004 о недоступном файле попадает в

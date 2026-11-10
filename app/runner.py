@@ -670,9 +670,7 @@ class Service:
 
     def _report_failure(self, message: str, error: BaseException | None) -> None:
         """Напоминания о повторах, буфер стартовых событий и 1002."""
-        event_tracking.flush()
-        send_startup_events()
-        self._wait_event_log()
+        self._final_summary()
         logger.error(
             message,
             exc_info=None if isinstance(error, SystemExit) else error,
@@ -752,15 +750,8 @@ class Service:
             self.directory_thread is not None and not self.directory_finished
         )
         self._close_events()
-        # Повторы во время мягкой остановки тоже попадают в итог. При
-        # срочной такт не ждём: на всё у Windows 5 секунд
-        if self.urgent:
-            event_tracking.flush(wait=0)
-        else:
-            event_tracking.flush()
-        # Остановка до старта слушателя: накопленное — перед 1001
-        send_startup_events()
-        self._wait_event_log()
+        # Повторы во время мягкой остановки тоже попадают в итог
+        self._final_summary()
         message = f"Сервис остановлен: {self.stop_reason}"
         if hung:
             message += (
@@ -772,6 +763,25 @@ class Service:
                 f". Ошибка при остановке HTTP-сервера: {_describe(self.stop_error)}"
             )
         logger.info(message, extra={"event_id": EventId.SERVICE_STOPPED})
+
+    def _final_summary(self) -> None:
+        """Итог учёта перед 1001 или 1002.
+
+        Сначала — буфер стартовых событий (остановка до старта
+        слушателя) и исходы уже отправленных событий: отказ записи
+        возвращает случай в счётчик, и итог его учтёт. Потом итог
+        учёта и снова ожидание: итоговые 2002 и напоминания ложатся
+        раньше завершающего события. При срочной остановке такт и журнал
+        событий не ждём.
+        """
+        send_startup_events()
+        self._wait_event_log()
+        # При срочной остановке такт не ждём: на всё у Windows 5 секунд
+        if self.urgent:
+            event_tracking.flush(wait=0)
+        else:
+            event_tracking.flush()
+        self._wait_event_log()
 
     def _wait_event_log(self) -> None:
         """Дождаться журнала событий перед 1001 или 1002.
