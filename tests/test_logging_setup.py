@@ -949,7 +949,7 @@ class TestEventLogHandler:
         event_tracking.tick()
         flush_event_logs()
         # Исход первой попытки — уже после повтора
-        *_, on_sent = report.call_args.args
+        *_, on_sent, _is_current = report.call_args.args[0]
         on_sent()
         flush_event_logs()
         event_tracking.directory_ok()
@@ -957,6 +957,163 @@ class TestEventLogHandler:
 
         assert [e[0] for e in reported(evtlog)] == [2000, 2001]
         assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_in_startup_buffer_not_written(self, evtlog, clock, caplog):
+        """Проверить: 2000 дольше срока ожидания в стартовом буфере —
+        повтор не даёт копии после 2001 (порядок 2000, 2001).
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            event_tracking.directory_ok()
+            clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+            event_tracking.tick()
+            handler.send_startup_events()
+            flush_event_logs()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_waiting_event_keeps_no_exception(self, evtlog, caplog):
+        """Проверить: 2000 ждёт отправки стартового буфера — исключение
+        запроса с кадрами стека не держится, трассировка — текстом.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            [item] = event_tracking._state.pending  # noqa: SLF001
+            assert item.exc is None
+            assert item.traceback.endswith("OSError: [Errno 5] I/O")
+            handler.send_startup_events()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        [(event_id, _, text)] = reported(evtlog)
+        assert event_id == 2000
+        assert text.endswith("OSError: [Errno 5] I/O")
+
+    @pytest.mark.usefixtures("clock")
+    def test_writer_queue_keeps_no_exception(self, tracking_handler, caplog):
+        """Проверить: 2000 ждёт в очереди потока записи — ни очередь, ни
+        событие учёта не держат исключение запроса; исход из потока
+        записи (_pending_sent) не мешает отвязке трассировки.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            if not entered.is_set():
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        logging.getLogger("app.test_event_log").warning(
+            "занят", extra={"event_id": 3001}
+        )
+        assert entered.wait(5)
+        error = OSError(5, "I/O")
+        event_tracking.directory_error("/srv", error, 500)
+        [item] = event_tracking._state.pending  # noqa: SLF001
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        queued = list(handler._pending)  # noqa: SLF001 - очередь потока записи
+        release.set()
+        flush_event_logs()
+
+        assert item.exc is None
+        assert item.traceback.endswith("OSError: [Errno 5] I/O")
+        assert all(error not in event for event in queued)
+        assert [e[0] for e in reported(evtlog)] == [3001, 2000]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_failure_ignored(self, tracking_handler, clock, caplog):
+        """Проверить: исход прежней попытки 2000 после повтора не
+        сбивает ожидание исхода новой.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        with mock.patch.object(handler, "_report") as report:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            flush_event_logs()
+            clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+            event_tracking.tick()
+            flush_event_logs()
+        [first], [second] = (call.args for call in report.call_args_list)
+        _, _, _, first_unsent, first_sent, _ = first
+        first_unsent(event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.directory_ok()
+        flush_event_logs()
+        evtlog.ReportEvent.assert_not_called()
+        # Записалась и прежняя попытка: 2001 по-прежнему ждёт последнюю
+        first_sent()
+        flush_event_logs()
+        evtlog.ReportEvent.assert_not_called()
+        _, _, _, _, second_sent, _ = second
+        second_sent()
+
+        assert [e[0] for e in reported(evtlog)] == [2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_in_writer_queue_not_written(
+        self, tracking_handler, clock, caplog
+    ):
+        """Проверить: 2000 ждёт в очереди потока записи дольше срока
+        ожидания исхода, такт пишет повтор — поток проверяет попытку
+        прямо перед ReportEvent, и в журнале событий 2000, 2001 без
+        второй копии 2000.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def report(*args):
+            calls.append(args[3])
+            if len(calls) == 1:
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        # Поток записи занят чужим событием: 2000 ждёт за ним в очереди
+        logging.getLogger("app.test_event_log").warning(
+            "занят", extra={"event_id": 3001}
+        )
+        assert entered.wait(5)
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+        event_tracking.tick()
+        release.set()
+        flush_event_logs()
+        event_tracking.directory_ok()
+        flush_event_logs()
+
+        assert calls == [3001, 2000, 2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_current_check_error_still_writes(self, event_logger, caplog):
+        """Проверить: ошибка проверки «нужно ли событие» — пишется."""
+        test_logger, evtlog = event_logger
+        test_logger.warning(
+            "событие",
+            extra={
+                "event_id": 2000,
+                "event_current": mock.Mock(side_effect=ValueError),
+            },
+        )
+
+        assert [e[0] for e in reported(evtlog)] == [2000]
+        assert "Ошибка учёта исхода события журнала событий" in caplog.text
 
     def test_outcome_callback_error_stays_in_handler(self, event_logger, caplog):
         """Проверить: ошибка обратного вызова учёта остаётся в emit."""
@@ -1878,6 +2035,24 @@ class TestHungReportEvent:
         assert calls[1] == "app.event_tracking: отказ a"
         assert calls[-1] == "app.event_tracking: отказ b"
         assert calls.count("app.event_tracking: отказ b") == 1
+
+    def test_flush_handlers_bounded_by_hung_report(self, event_logger, monkeypatch):
+        """Проверить: сброс перед выходом не висит на зависшем
+        ReportEvent — ждёт очередь не дольше EVENT_FLUSH_SECONDS.
+        """
+        test_logger, evtlog = event_logger
+        [handler] = test_logger.handlers
+        monkeypatch.setattr(logging_setup, "_handlers", [handler])
+        monkeypatch.setattr(logging_setup, "EVENT_FLUSH_SECONDS", 0.2)
+        release = threading.Event()
+        evtlog.ReportEvent.side_effect = lambda *_: release.wait(10)
+        test_logger.warning("событие", extra={"event_id": 2000})
+        moment = time.monotonic()
+        try:
+            logging_setup.flush_handlers()
+            assert time.monotonic() - moment < 2
+        finally:
+            release.set()
 
     def test_flush_under_handler_lock(self, event_logger, monkeypatch):
         """Проверить: сброс под замком обработчика (как flush_handlers)
