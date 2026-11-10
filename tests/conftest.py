@@ -75,8 +75,9 @@ def flush_event_logs() -> None:
 def service_env(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     """runner.run() без выхода процесса и без обработчиков сигналов.
 
-    exits — коды, с которыми процесс завершился бы; stop(reason) —
-    функция остановки, которую получили бы обработчики сигналов.
+    exits — коды, с которыми процесс завершился бы; stop(reason) и
+    urgent(reason) — функции обычной и срочной остановки, которые
+    получили бы обработчики сигналов.
     """
     from app import instance_check, runner, stop_signals
 
@@ -89,7 +90,10 @@ def service_env(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     def stop(reason: str = "тест") -> None:
         install.call_args.args[0](reason)
 
-    return types.SimpleNamespace(exits=exits, stop=stop, install=install)
+    def urgent(reason: str) -> None:
+        install.call_args.args[1](reason)
+
+    return types.SimpleNamespace(exits=exits, stop=stop, urgent=urgent, install=install)
 
 
 def start_then_stop(server: object, sockets: object = None) -> None:  # noqa: ARG001 - подпись Server.run

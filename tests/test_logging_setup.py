@@ -633,6 +633,7 @@ class TestEventLogHandler:
             ("app.test_event_log", logging.INFO, {}),
             ("app.test_event_log", logging.WARNING, {"event_log": False}),
             ("app.test_event_log", logging.ERROR, {"event_log": False}),
+            ("app.test_event_log", logging.WARNING, {"event_log": lambda: False}),
         ],
     )
     def test_not_in_event_log(self, event_logger, name, level, extra):
@@ -647,6 +648,33 @@ class TestEventLogHandler:
         handler.handle(record)
         flush_event_logs()
         evtlog.ReportEvent.assert_not_called()
+
+    def test_flag_checked_on_emit(self, event_logger):
+        """Проверить: флаг-функция вызывается при обработке записи."""
+        test_logger, evtlog = event_logger
+        allowed = []
+        test_logger.warning("m", extra={"event_log": lambda: bool(allowed)})
+        allowed.append(True)
+        test_logger.warning("m", extra={"event_log": lambda: bool(allowed)})
+        assert [event_id for event_id, *_ in reported(evtlog)] == [3001]
+
+    def test_flag_closed_after_filter(self, event_logger):
+        """Проверить: флаг-функция закрылась между фильтром обработчика
+        и emit — события нет, и это не отказ записи.
+        """
+        test_logger, evtlog = event_logger
+        answers = iter([True, False])
+        on_unsent = mock.Mock()
+        test_logger.warning(
+            "m",
+            extra={
+                "event_id": 1003,
+                "event_log": lambda: next(answers),
+                logging_setup.UNSENT_ATTRIBUTE: on_unsent,
+            },
+        )
+        assert reported(evtlog) == []
+        on_unsent.assert_not_called()
 
     def test_traceback_in_text(self, event_logger):
         """Проверить: трассировка исключения — в тексте события."""

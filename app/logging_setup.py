@@ -87,8 +87,13 @@ def event_id_for(record: logging.LogRecord) -> int | None:
     (extra={"event_log": False}) и записи с уже учтённым исключением
     событий не дают. Код берётся из extra={"event_id": …}; без него —
     4000 для ERROR и выше, 3001 для WARNING, INFO без кода не идёт.
+    Флаг может быть функцией: она вызывается при обработке записи, а не
+    при её создании, и ещё раз под замком обработчика журнала событий.
     """
-    if record.name == "uvicorn.access" or getattr(record, "event_log", True) is False:
+    event_log = getattr(record, "event_log", True)
+    if callable(event_log):
+        event_log = event_log()
+    if record.name == "uvicorn.access" or event_log is False:
         return None
     if record.exc_info and is_tracked(record.exc_info[1]):
         return None
@@ -234,6 +239,12 @@ class EventLogHandler(logging.Handler):
         каждом некорректном HTTP-запросе из сети, давал бы событие на
         каждое соединение сканера портов.
         """
+        # Флаг-функцию handle() вычислил до замка, а журнал событий мог
+        # закрыться после этого: под замком она проверяется ещё раз.
+        # Это не отказ, запись уже в файле журнала
+        event_log = getattr(record, "event_log", True)
+        if callable(event_log) and event_log() is False:
+            return
         outcome = getattr(record, "outcome", False)
         on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
         on_sent = getattr(record, SENT_ATTRIBUTE, None)
