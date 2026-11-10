@@ -97,6 +97,12 @@ OnUnsent = Callable[[float], None]
 # Атрибут записи журнала: что сделать, когда её событие записано
 SENT_ATTRIBUTE = "event_sent"
 OnSent = Callable[[], None]
+# Атрибут записи журнала: нужно ли её событие до сих пор. Обработчик
+# спрашивает непосредственно перед ReportEvent, в том потоке, который
+# пишет (не при постановке в буфер или очередь): попытка, которую уже
+# сменил повтор, не пишется
+CURRENT_ATTRIBUTE = "event_current"
+IsCurrent = Callable[[], bool]
 # Атрибут записи журнала: только в журнал событий — строка о ней в
 # файле журнала и консоли уже есть
 EVENT_ONLY_ATTRIBUTE = "event_only"
@@ -193,6 +199,8 @@ class _Pending:
     sent_at: float = 0.0
     # Сколько более ранних событий отброшено сверх PENDING_LIMIT
     dropped_before: int = 0
+    # Номер последней попытки: исход и запись прежней не учитываются
+    attempt: int = 0
 
     def detach_exc(self) -> None:
         """Заменить исключение текстом трассировки."""
@@ -256,9 +264,28 @@ def _enqueue(item: _Pending) -> None:
         following.retry_at = max(following.retry_at, dropped.retry_at)
 
 
-def _pending_sent(item: _Pending) -> None:
-    """Событие о папке записано: передать обработчику следующее."""
+def _pending_current(item: _Pending, attempt: int) -> bool:
+    """Нужна ли ещё эта попытка записи события о папке.
+
+    Попытку сменяет повтор после OUTCOME_TIMEOUT_SECONDS: если обе
+    дождутся записи (например, в стартовом буфере), прежняя не пишется,
+    иначе её копия легла бы после следующего события.
+    """
     with _access_lock:
+        return item.attempt == attempt and item in _state.pending
+
+
+def _pending_sent(item: _Pending, attempt: int) -> None:
+    """Событие о папке записано: передать обработчику следующее.
+
+    Засчитывается только последняя попытка: иначе следующее событие
+    могло бы записаться раньше неё, если она уже прошла проверку
+    _pending_current в другом потоке. Если записалась и прежняя, 2000
+    будет в журнале событий дважды подряд, но порядок не нарушится.
+    """
+    with _access_lock:
+        if item.attempt != attempt:
+            return
         item.exc = None
         if item in _state.pending:
             _state.pending.remove(item)
@@ -270,11 +297,16 @@ def _pending_sent(item: _Pending) -> None:
         _drain(clock(), force=False)
 
 
-def _pending_unsent(item: _Pending, retry_after: float) -> None:
-    """Событие о папке не записалось: первое в очереди до повтора."""
+def _pending_unsent(item: _Pending, attempt: int, retry_after: float) -> None:
+    """Событие о папке не записалось: первое в очереди до повтора.
+
+    Отказ прежней попытки не учитывается: идёт уже новая.
+    """
     retry_at = clock() + retry_after
     item.detach_exc()
     with _access_lock:
+        if item.attempt != attempt:
+            return
         item.retry_at = retry_at
         if _state.in_flight is item:
             _state.in_flight = None
@@ -294,6 +326,7 @@ def _next_pending(now: float, *, force: bool) -> _Pending | None:
         return None
     head = _state.in_flight = pending[0]
     head.sent_at = now
+    head.attempt += 1
     return head
 
 
@@ -317,6 +350,11 @@ def _drain(now: float, *, force: bool) -> None:
                 return
             first_attempt = not head.logged
             head.logged = True
+            outcome = {
+                "on_unsent": functools.partial(_pending_unsent, head, head.attempt),
+                "on_sent": functools.partial(_pending_sent, head, head.attempt),
+                "is_current": functools.partial(_pending_current, head, head.attempt),
+            }
         if first_attempt:
             # Одна запись: файл журнала, консоль и журнал событий
             _log(
@@ -324,8 +362,7 @@ def _drain(now: float, *, force: bool) -> None:
                 head.event_id,
                 head.text(),
                 head.exc,
-                on_unsent=functools.partial(_pending_unsent, head),
-                on_sent=functools.partial(_pending_sent, head),
+                **outcome,
             )
         else:
             head.detach_exc()
@@ -336,8 +373,7 @@ def _drain(now: float, *, force: bool) -> None:
                 head.level,
                 head.event_id,
                 text,
-                on_unsent=functools.partial(_pending_unsent, head),
-                on_sent=functools.partial(_pending_sent, head),
+                **outcome,
                 event_only=True,
             )
         with _access_lock:
@@ -505,6 +541,7 @@ def _log(  # noqa: PLR0913 - поля одной записи
     *,
     on_unsent: OnUnsent | None = None,
     on_sent: OnSent | None = None,
+    is_current: IsCurrent | None = None,
     event_only: bool = False,
 ) -> None:
     """Записать строку; без кода — только в файл журнала.
@@ -514,6 +551,8 @@ def _log(  # noqa: PLR0913 - поля одной записи
     так первое событие ключа, событие о папке или число повторов не
     теряются; on_sent — когда событие записано. event_only — только в
     журнал событий: строка в файле журнала и консоли уже есть.
+    is_current — нужно ли событие до сих пор (спрашивается перед
+    ReportEvent).
     """
     extra: dict[str, object] = (
         {"event_log": False} if event_id is None else {"event_id": event_id}
@@ -522,6 +561,8 @@ def _log(  # noqa: PLR0913 - поля одной записи
         extra[UNSENT_ATTRIBUTE] = on_unsent
     if event_id is not None and on_sent is not None:
         extra[SENT_ATTRIBUTE] = on_sent
+    if event_id is not None and is_current is not None:
+        extra[CURRENT_ATTRIBUTE] = is_current
     if event_only:
         extra[EVENT_ONLY_ATTRIBUTE] = True
     logger.log(level, "%s", message, exc_info=exc, extra=extra)
@@ -897,7 +938,10 @@ def flush(*, wait: float = REMIND_WAIT_SECONDS) -> None:
     Вызывается перед событием остановки (1001) или ошибки (1002), в
     том числе перед повтором запуска, поэтому таймер не
     останавливает. Идущий такт ждёт не дольше wait секунд: при срочной
-    остановке, когда процесс вот-вот завершат, — wait=0.
+    остановке, когда процесс вот-вот завершат, — wait=0. Запись в
+    журнал событий здесь синхронна: зависший ReportEvent задержит любую
+    запись (и итог, и следующую за ним 1001), и wait этого не
+    ограничивает.
     """
     acquired = _state.remind_lock.acquire(timeout=wait)
     try:
