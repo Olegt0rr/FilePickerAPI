@@ -612,3 +612,39 @@ class TestTimer:
         finally:
             lock.release()
         assert events(records)[1][1].startswith("Повторялось ещё 1 раз")
+
+    def test_flush_wait_limits_directory_event(self, monkeypatch, clock, records):
+        """Такт задержался внутри записи 2002: flush(wait) не ждёт его
+        дольше wait, а 2002 и счётчик остаются такту.
+        """
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        clock.advance(60 * 60)
+        entered, release = threading.Event(), threading.Event()
+        log = event_tracking._log  # noqa: SLF001 - запись учёта
+
+        def slow_log(level, event_id, *args, **kwargs):
+            if event_id == EventId.DIRECTORY_STILL_UNAVAILABLE and not entered.is_set():
+                entered.set()
+                release.wait(5)
+            log(level, event_id, *args, **kwargs)
+
+        monkeypatch.setattr(event_tracking, "_log", slow_log)
+        timer = threading.Thread(target=event_tracking.tick)
+        timer.start()
+        try:
+            assert entered.wait(5)
+            started = time.monotonic()
+            event_tracking.flush(wait=0.1)
+            assert time.monotonic() - started < 1
+        finally:
+            release.set()
+            timer.join(5)
+
+        still = [t for e, t in events(records) if e == 2002]
+        assert len(still) == 1
+        assert still[0].endswith("Ошибочных ответов с прошлой записи: 1")
+        assert (
+            None,
+            "Итог о папке с файлами не записан: другой поток пишет событие о ней",
+        ) in records()

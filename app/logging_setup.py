@@ -14,11 +14,13 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from app.event_tracking import (
+    CURRENT_ATTRIBUTE,
     EVENT_ONLY_ATTRIBUTE,
     SENT_ATTRIBUTE,
     UNSENT_ATTRIBUTE,
     UNSENT_RETRY_SECONDS,
     EventId,
+    IsCurrent,
     OnSent,
     OnUnsent,
     admit,
@@ -53,7 +55,7 @@ STARTUP_BUFFER_LIMIT = 100
 
 # Событие в буфере: уровень, код, текст и что сделать, если оно не
 # записалось или записано
-_Event = tuple[int, int, str, OnUnsent | None, OnSent | None]
+_Event = tuple[int, int, str, OnUnsent | None, OnSent | None, IsCurrent | None]
 
 # Обработчики, добавленные setup_logging: повторная настройка их снимает
 _handlers: list[logging.Handler] = []
@@ -155,6 +157,7 @@ class EventLogHandler(logging.Handler):
         # должна занять ключ, иначе её первое событие не придёт никогда
         on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
         on_sent = getattr(record, SENT_ATTRIBUTE, None)
+        is_current = getattr(record, CURRENT_ATTRIBUTE, None)
         try:
             message = record.getMessage()
         except Exception:
@@ -188,9 +191,9 @@ class EventLogHandler(logging.Handler):
             _notify(on_unsent, UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
-        event = (record.levelno, event_id, text, on_unsent, on_sent)
+        event = (record.levelno, event_id, text, on_unsent, on_sent, is_current)
         if self._buffer is None:
-            self._report(*event)
+            self._report(event)
         else:
             self._buffer.append(event)
 
@@ -204,28 +207,28 @@ class EventLogHandler(logging.Handler):
                     "они есть в файле журнала"
                 )
                 buffered.append(
-                    (note.levelno, EventId.OTHER_WARNING, self.format(note), None, None)
+                    (
+                        note.levelno,
+                        EventId.OTHER_WARNING,
+                        self.format(note),
+                        None,
+                        None,
+                        None,
+                    )
                 )
                 self._dropped = 0
             for event in buffered:
-                self._report(*event)
+                self._report(event)
 
     def discard_startup_events(self) -> None:
         """Отбросить буфер; дальше события пишутся сразу."""
         with self.lock:
             buffered, self._buffer = self._buffer or [], None
             self._dropped = 0
-            for *_, on_unsent, _on_sent in buffered:
+            for _level, _id, _text, on_unsent, _on_sent, _current in buffered:
                 _notify(on_unsent, 0)
 
-    def _report(
-        self,
-        levelno: int,
-        event_id: int,
-        text: str,
-        on_unsent: OnUnsent | None,
-        on_sent: OnSent | None,
-    ) -> None:
+    def _report(self, event: _Event) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
 
         Вместо трассировки handleError в stderr на каждое событие —
@@ -233,8 +236,12 @@ class EventLogHandler(logging.Handler):
         журнал событий), сама запись в файле журнала уже есть. Для
         незаписанного события вызывается on_unsent: следующий такой же
         случай снова даст событие, а число повторов не потеряется. Для
-        записанного — on_sent.
+        записанного — on_sent. Если is_current говорит, что событие
+        уже не нужно (его попытку сменил повтор), оно не пишется.
         """
+        levelno, event_id, text, on_unsent, on_sent, is_current = event
+        if not _still_current(is_current):
+            return
         if levelno >= logging.ERROR:
             event_type = self._win32evtlog.EVENTLOG_ERROR_TYPE
         elif levelno >= logging.WARNING:
@@ -272,6 +279,19 @@ class EventLogHandler(logging.Handler):
         if source is not None:
             self._win32evtlog.DeregisterEventSource(source)
         super().close()
+
+
+def _still_current(is_current: IsCurrent | None) -> bool:
+    """Нужно ли событие; ошибка учёта — писать, как и без проверки."""
+    if is_current is None:
+        return True
+    try:
+        return is_current()
+    except Exception:
+        logger.exception(
+            "Ошибка учёта исхода события журнала событий", extra={"event_log": False}
+        )
+        return True
 
 
 def _notify(callback: Callable[..., None] | None, *args: float) -> None:

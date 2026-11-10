@@ -886,12 +886,67 @@ class TestEventLogHandler:
         clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
         event_tracking.tick()
         # Исход первой попытки — уже после повтора
-        *_, on_sent = report.call_args.args
+        on_sent = report.call_args.args[0][4]
         on_sent()
         event_tracking.directory_ok()
 
         assert [e[0] for e in reported(evtlog)] == [2000, 2001]
         assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_in_startup_buffer_not_written(self, evtlog, clock, caplog):
+        """Проверить: 2000 дольше срока ожидания в стартовом буфере —
+        повтор не даёт копии после 2001 (порядок 2000, 2001).
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            event_tracking.directory_ok()
+            clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+            event_tracking.tick()
+            handler.send_startup_events()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        assert [e[0] for e in reported(evtlog)] == [2000, 2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_stale_attempt_failure_ignored(self, tracking_handler, clock, caplog):
+        """Проверить: отказ прежней попытки 2000 после повтора не
+        сбивает ожидание исхода новой.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        with mock.patch.object(handler, "_report") as report:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
+            event_tracking.tick()
+        first, second = report.call_args_list
+        first.args[0][3](event_tracking.UNSENT_RETRY_SECONDS)
+        event_tracking.directory_ok()
+        evtlog.ReportEvent.assert_not_called()
+        second.args[0][4]()
+
+        assert [e[0] for e in reported(evtlog)] == [2001]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
+    def test_current_check_error_still_writes(self, event_logger, caplog):
+        """Проверить: ошибка проверки «нужно ли событие» — пишется."""
+        test_logger, evtlog = event_logger
+        test_logger.warning(
+            "событие",
+            extra={
+                "event_id": 2000,
+                "event_current": mock.Mock(side_effect=ValueError),
+            },
+        )
+
+        assert [e[0] for e in reported(evtlog)] == [2000]
+        assert "Ошибка учёта исхода события журнала событий" in caplog.text
 
     def test_outcome_callback_error_stays_in_handler(self, event_logger, caplog):
         """Проверить: ошибка обратного вызова учёта остаётся в emit."""
