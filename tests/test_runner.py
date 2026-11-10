@@ -752,17 +752,21 @@ class TestFinalEventOrder:
 
         assert waits == [1, 0]
 
-    def test_urgent_does_not_wait(self, monkeypatch):
-        """Проверить: при срочной остановке журнал событий не ждём —
-        у Windows на всё 5 секунд.
+    def test_urgent_waits_until_stop_deadline(self, monkeypatch):
+        """Проверить: при срочной остановке журнал событий ждём не
+        дольше срока ожидания потоков — у Windows на всё 5 секунд.
         """
         waits = []
         monkeypatch.setattr(runner, "wait_event_log", waits.append)
+        monkeypatch.setattr(runner, "clock", lambda: 100.0)
         service = runner.Service(console=False)
         service.urgent = True
+        service.stop_deadline = 101.0
+        service._wait_event_log()  # noqa: SLF001
+        service.stop_deadline = 99.0
         service._wait_event_log()  # noqa: SLF001
 
-        assert waits == []
+        assert waits == [1, 0]
 
 
 class TestStop:
@@ -1127,6 +1131,10 @@ class TestUrgentStop:
             server.service.on_started()
             for _ in range(6):
                 event_tracking.track(3000, "k", "ошибка доступа к файлу")
+            # Срочная остановка поток директории не ждёт, а только
+            # проверяет: без этого 1001 изредка получает пометку о
+            # зависшем обращении
+            wait_for(lambda: server.service.directory_finished)
             handler["thread"], handler["exits"] = urgent_in_thread(service_env, reason)
             wait_for(server.service.stop_requested.is_set)
 

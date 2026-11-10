@@ -774,8 +774,8 @@ class Service:
         слушателя) и исходы уже отправленных событий: отказ записи
         возвращает случай в счётчик, и итог его учтёт. Потом итог
         учёта и снова ожидание: итоговые 2002 и напоминания ложатся
-        раньше завершающего события. При срочной остановке такт и журнал
-        событий не ждём.
+        раньше завершающего события. При срочной остановке такт не ждём,
+        а журнал событий — только до срока ожидания потоков.
         """
         send_startup_events()
         self._wait_event_log()
@@ -792,13 +792,14 @@ class Service:
         Итоговое 2002 (или 2001), которое ждёт подтверждения 2000, иначе
         легло бы после завершающего события. Ожидание ограничено и
         оставляет запас срока сторожа на сброс журнала. При срочной
-        остановке не ждём: на всё у Windows 5 секунд.
+        остановке — не дольше срока ожидания потоков
+        (URGENT_WAIT_SECONDS от сигнала): у Windows на всё 5 секунд.
         """
-        if self.urgent:
-            return
         timeout: float = EVENT_LOG_WAIT_SECONDS
         if self.exit_deadline is not None:
             timeout = min(timeout, self.exit_deadline - EXIT_RESERVE_SECONDS - clock())
+        if self.urgent:
+            timeout = min(timeout, self.stop_deadline - clock())
         wait_event_log(max(timeout, 0))
 
 
