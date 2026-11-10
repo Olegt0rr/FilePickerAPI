@@ -974,6 +974,40 @@ class TestEventLogHandler:
         assert event_id == 2000
         assert text.endswith("OSError: [Errno 5] I/O")
 
+    @pytest.mark.usefixtures("clock")
+    def test_writer_queue_keeps_no_exception(self, tracking_handler, caplog):
+        """Проверить: 2000 ждёт в очереди потока записи — ни очередь, ни
+        событие учёта не держат исключение запроса; исход из потока
+        записи (_pending_sent) не мешает отвязке трассировки.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+
+        def report(*_args):
+            if not entered.is_set():
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        logging.getLogger("app.test_event_log").warning(
+            "занят", extra={"event_id": 3001}
+        )
+        assert entered.wait(5)
+        error = OSError(5, "I/O")
+        event_tracking.directory_error("/srv", error, 500)
+        [item] = event_tracking._state.pending  # noqa: SLF001
+        handler = logging.getLogger("app.event_tracking").handlers[0]
+        queued = list(handler._pending)  # noqa: SLF001 - очередь потока записи
+        release.set()
+        flush_event_logs()
+
+        assert item.exc is None
+        assert item.traceback.endswith("OSError: [Errno 5] I/O")
+        assert all(error not in event for event in queued)
+        assert [e[0] for e in reported(evtlog)] == [3001, 2000]
+        assert not event_tracking._state.pending  # noqa: SLF001
+
     def test_stale_attempt_failure_ignored(self, tracking_handler, clock, caplog):
         """Проверить: исход прежней попытки 2000 после повтора не
         сбивает ожидание исхода новой.
