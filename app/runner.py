@@ -44,6 +44,7 @@ from app.logging_setup import (
     flush_handlers,
     send_startup_events,
     setup_logging,
+    wait_event_log,
 )
 from app.stdio import ensure_std_streams
 
@@ -82,6 +83,12 @@ EXIT_DEADLINE_SECONDS = 28
 # Сколько ждать записи 1002 перед повтором: зависшая запись в журнал
 # не должна останавливать повторы
 REPORT_WAIT_SECONDS = 5
+# Сколько ждать журнал событий перед 1001 и 1002: события о папке,
+# ждущие подтверждения, ложатся раньше них
+EVENT_LOG_WAIT_SECONDS = 3
+# Запас срока сторожа на сброс журнала перед выходом (flush_handlers:
+# замки консоли и файла по секунде, очередь журнала событий 3 секунды)
+EXIT_RESERVE_SECONDS = 6
 # Как часто главный поток, ожидая исход, передаёт остановке причину
 # сигнала: её запоминает обработчик в stop_signals
 SIGNAL_POLL_SECONDS = 0.1
@@ -354,6 +361,8 @@ class Service:
         self.events_lock = threading.Lock()
         # Поток записи 1002 перед повтором: может не уложиться в срок
         self.report_thread: threading.Thread | None = None
+        # Срок сторожа (по clock); задаёт run(), когда исход занят
+        self.exit_deadline: float | None = None
         # Текст 1000; собирается в рабочем потоке до запуска Uvicorn
         self.start_message = f"Сервис запущен: версия {__version__}, порт {PORT}"
 
@@ -663,6 +672,7 @@ class Service:
         """Напоминания о повторах, буфер стартовых событий и 1002."""
         event_tracking.flush()
         send_startup_events()
+        self._wait_event_log()
         logger.error(
             message,
             exc_info=None if isinstance(error, SystemExit) else error,
@@ -726,9 +736,11 @@ class Service:
         отличает зависший mkdir от только что начатого. При срочной
         остановке его не ждём, а только проверяем: у Windows срок 5 с.
         Вместе с ожиданием такта учёта повторов (event_tracking.flush,
-        до секунды, при срочной — без ожидания) и сбросом журнала
-        (flush_handlers, до 1 + 3 секунд) — в пределах срока сторожа;
-        при срочной остановке процесс в срок завершает обработчик.
+        до секунды), журнала событий (не позже чем за
+        EXIT_RESERVE_SECONDS до срока) и сбросом журнала
+        (flush_handlers) — в пределах срока сторожа. При срочной
+        остановке такт и журнал событий не ждём, а процесс в срок
+        завершает обработчик.
         """
         if self.worker is not None:
             self._wait_for(lambda: self.worker_finished, STOP_WAIT_SECONDS)
@@ -748,6 +760,7 @@ class Service:
             event_tracking.flush()
         # Остановка до старта слушателя: накопленное — перед 1001
         send_startup_events()
+        self._wait_event_log()
         message = f"Сервис остановлен: {self.stop_reason}"
         if hung:
             message += (
@@ -759,6 +772,21 @@ class Service:
                 f". Ошибка при остановке HTTP-сервера: {_describe(self.stop_error)}"
             )
         logger.info(message, extra={"event_id": EventId.SERVICE_STOPPED})
+
+    def _wait_event_log(self) -> None:
+        """Дождаться журнала событий перед 1001 или 1002.
+
+        Итоговое 2002 (или 2001), которое ждёт подтверждения 2000, иначе
+        легло бы после завершающего события. Ожидание ограничено и
+        оставляет запас срока сторожа на сброс журнала. При срочной
+        остановке не ждём: на всё у Windows 5 секунд.
+        """
+        if self.urgent:
+            return
+        timeout: float = EVENT_LOG_WAIT_SECONDS
+        if self.exit_deadline is not None:
+            timeout = min(timeout, self.exit_deadline - EXIT_RESERVE_SECONDS - clock())
+        wait_event_log(max(timeout, 0))
 
 
 def _describe(error: BaseException) -> str:
@@ -800,6 +828,7 @@ def run() -> int:
         stop_signals.deliver()
 
     outcome = service.outcome
+    service.exit_deadline = clock() + EXIT_DEADLINE_SECONDS
     # Сторож: запись в журнал может зависнуть на замке обработчика
     # (поток, застрявший на записи в канал консоли), а процесс должен
     # завершиться в срок при любом исходе. Поэтому срок идёт с момента,

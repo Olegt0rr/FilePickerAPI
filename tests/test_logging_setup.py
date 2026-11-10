@@ -1471,6 +1471,112 @@ class TestEventLogHandler:
         flush_event_logs()
 
     @pytest.mark.usefixtures("clock")
+    def test_hung_diagnostics_do_not_stop_outcomes(
+        self, tracking_handler, monkeypatch, caplog
+    ):
+        """Проверить: строка об отказе ReportEvent зависла в консоли —
+        подтверждения идут: 2001 пишется после подтверждения 2000.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        evtlog = tracking_handler
+        entered, release = threading.Event(), threading.Event()
+
+        class HungConsole(logging.Handler):
+            def emit(self, record):
+                if record.getMessage().startswith("Не удалось записать"):
+                    entered.set()
+                    release.wait(10)
+
+        monkeypatch.setattr(
+            logging.getLogger(logging_setup.__name__), "handlers", [HungConsole()]
+        )
+        evtlog.ReportEvent.side_effect = [OSError("full"), None, None]
+        try:
+            logging.getLogger("app.test_event_log").warning(
+                "отказ", extra={"event_id": 3000}
+            )
+            assert entered.wait(5)
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            wait_for(lambda: evtlog.ReportEvent.call_count == 2, 5)
+            event_tracking.directory_ok()
+            wait_for(lambda: evtlog.ReportEvent.call_count == 3, 5)
+        finally:
+            release.set()
+        assert [call.args[3] for call in evtlog.ReportEvent.call_args_list] == [
+            3000,
+            2000,
+            2001,
+        ]
+
+    def test_emit_callback_error_stays_in_handler(self, evtlog, caplog):
+        """Проверить: ошибка обратного вызова в emit (запись отброшена
+        после сброса буфера) остаётся в обработчике.
+        """
+        handler = logging_setup.EventLogHandler()
+        try:
+            handler.discard_startup_events()
+            handler.handle(
+                logging.makeLogRecord(
+                    {
+                        "name": "app.t",
+                        "levelno": 30,
+                        "msg": "w",
+                        "event_id": 2000,
+                        "event_unsent": mock.Mock(side_effect=ValueError),
+                    }
+                )
+            )
+        finally:
+            handler.close()
+
+        assert "Ошибка учёта исхода события журнала событий" in caplog.text
+        evtlog.ReportEvent.assert_not_called()
+
+    def test_diagnostics_limit(self, event_logger, monkeypatch, caplog):
+        """Проверить: пока вывод диагностики висит, ждут не больше
+        DIAGNOSTICS_LIMIT строк, остальные отбрасываются.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "DIAGNOSTICS_LIMIT", 2)
+        [handler] = test_logger.handlers
+        entered, release = threading.Event(), threading.Event()
+        handler._diagnostics = logging_setup._Lane(  # noqa: SLF001
+            handler, "event-log-diagnostics", logging_setup.DIAGNOSTICS_LIMIT
+        )
+
+        def hang():
+            entered.set()
+            release.wait(10)
+
+        handler._diagnose(hang)  # noqa: SLF001
+        assert entered.wait(5)
+        for _ in range(5):
+            test_logger.warning(
+                "событие",
+                extra={
+                    "event_id": 2000,
+                    "event_sent": mock.Mock(side_effect=ValueError),
+                },
+            )
+        # Все пять исходов обработаны: строки сверх лимита уже отброшены
+        wait_for(
+            lambda: (
+                evtlog.ReportEvent.call_count == 5
+                and handler._outcomes.idle()  # noqa: SLF001
+                and len(handler._diagnostics._actions) == 2  # noqa: SLF001
+            )
+        )
+        release.set()
+        flush_event_logs()
+
+        errors = [
+            r
+            for r in caplog.records
+            if r.getMessage().startswith("Ошибка учёта исхода")
+        ]
+        assert len(errors) == 2
+
+    @pytest.mark.usefixtures("clock")
     def test_event_waits_for_running_drain(self, tracking_handler):
         """Проверить: пока очередь пишет другой поток, новое событие о
         папке только встаёт в неё.
@@ -2114,12 +2220,12 @@ class TestHungReportEvent:
         """
         handler = logging_setup.EventLogHandler()
         first = threading.Event()
-        handler._defer(first.set)  # noqa: SLF001
+        handler._outcomes.put(first.set)  # noqa: SLF001
         assert first.wait(5)
         handler.close()
-        wait_for(lambda: handler._outcome_thread is None)  # noqa: SLF001
+        wait_for(lambda: handler._outcomes.thread is None)  # noqa: SLF001
         done = threading.Event()
-        handler._defer(done.set)  # noqa: SLF001
+        handler._outcomes.put(done.set)  # noqa: SLF001
         assert done.wait(5)
 
     def test_flush_under_handler_lock(self, event_logger, monkeypatch):
