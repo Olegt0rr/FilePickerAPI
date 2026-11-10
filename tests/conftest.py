@@ -2,8 +2,12 @@
 
 import errno
 import logging
-from collections.abc import Iterator
+import os
+import time
+import types
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -33,6 +37,66 @@ def win_error(
     error = cls(errno.EIO, "system message", filename)
     error.winerror = winerror
     return error
+
+
+def wait_for(condition: Callable[[], object], timeout: float = 10) -> None:
+    """Дождаться истинного condition() или провалить тест по сроку."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail("условие не выполнилось за отведённое время")
+        time.sleep(0.05)
+
+
+# Корень проверяемого checkout: в worktree установка pip install -e
+# указывает на другой checkout
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def child_env() -> dict[str, str]:
+    """Окружение отдельного процесса Python: app из этого checkout."""
+    paths = [str(ROOT), os.environ.get("PYTHONPATH", "")]
+    return {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": os.pathsep.join(path for path in paths if path),
+    }
+
+
+def flush_event_logs() -> None:
+    """Дождаться писателей журнала событий: ReportEvent в их потоке."""
+    for ref in list(logging._handlerList):  # noqa: SLF001 - все обработчики
+        handler = ref()
+        if isinstance(handler, logging_setup.EventLogHandler):
+            handler.flush()
+
+
+@pytest.fixture
+def service_env(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
+    """runner.run() без выхода процесса и без обработчиков сигналов.
+
+    exits — коды, с которыми процесс завершился бы; stop(reason) —
+    функция остановки, которую получили бы обработчики сигналов.
+    """
+    from app import instance_check, runner, stop_signals
+
+    exits: list[int] = []
+    install = mock.Mock()
+    monkeypatch.setattr(runner, "_exit", exits.append)
+    monkeypatch.setattr(stop_signals, "install", install)
+    monkeypatch.setattr(instance_check, "PROBE_INTERVAL", 0.01)
+
+    def stop(reason: str = "тест") -> None:
+        install.call_args.args[0](reason)
+
+    return types.SimpleNamespace(exits=exits, stop=stop, install=install)
+
+
+def start_then_stop(server: object, sockets: object = None) -> None:  # noqa: ARG001 - подпись Server.run
+    """InstanceServer.run без Uvicorn: старт, затем остановка."""
+    server.started = True
+    server.service.on_started()
+    server.service.request_stop("тест")
 
 
 @pytest.fixture
