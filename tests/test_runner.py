@@ -700,6 +700,19 @@ class TestFinalEventOrder:
         assert slow_first_report == [2000, 2002, 1001]
 
     @pytest.mark.usefixtures("clock")
+    def test_urgent_stop_after_delayed_ack(self, slow_first_report):
+        """Проверить: при срочной остановке итоговое 2002 тоже ложится
+        раньше 1001, пока срок срочной остановки не исчерпан.
+        """
+        event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+        service = runner.Service(console=False)
+        service.request_stop("закрытие консоли", urgent=True)
+        service.finalize()
+        flush_event_logs()
+
+        assert slow_first_report == [2000, 2002, 1001]
+
+    @pytest.mark.usefixtures("clock")
     def test_failure_after_delayed_ack(self, slow_first_report):
         """Проверить: то же перед 1002."""
         event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
