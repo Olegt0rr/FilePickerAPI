@@ -203,9 +203,14 @@ class _Pending:
     attempt: int = 0
 
     def detach_exc(self) -> None:
-        """Заменить исключение текстом трассировки."""
-        if self.exc is not None:
-            self.traceback = _format_traceback(self.exc)
+        """Заменить исключение текстом трассировки.
+
+        Исход может прийти из другого потока и обнулить exc: исключение
+        читается один раз.
+        """
+        exc = self.exc
+        if exc is not None:
+            self.traceback = _format_traceback(exc)
             self.exc = None
 
     def text(self) -> str:
@@ -364,6 +369,10 @@ def _drain(now: float, *, force: bool) -> None:
                 head.exc,
                 **outcome,
             )
+            # Обработчики уже взяли текст из записи: пока исход не
+            # известен (стартовый буфер, ожидание до 5 минут), кадры
+            # стека запроса в памяти не держатся
+            head.detach_exc()
         else:
             head.detach_exc()
             text = head.text()

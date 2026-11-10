@@ -914,6 +914,28 @@ class TestEventLogHandler:
         assert [e[0] for e in reported(evtlog)] == [2000, 2001]
         assert not event_tracking._state.pending  # noqa: SLF001
 
+    def test_waiting_event_keeps_no_exception(self, evtlog, caplog):
+        """Проверить: 2000 ждёт отправки стартового буфера — исключение
+        запроса с кадрами стека не держится, трассировка — текстом.
+        """
+        caplog.set_level(logging.INFO, logger="app.event_tracking")
+        handler = logging_setup.EventLogHandler()
+        tracking_logger = logging.getLogger("app.event_tracking")
+        tracking_logger.addHandler(handler)
+        try:
+            event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
+            [item] = event_tracking._state.pending  # noqa: SLF001
+            assert item.exc is None
+            assert item.traceback.endswith("OSError: [Errno 5] I/O")
+            handler.send_startup_events()
+        finally:
+            tracking_logger.removeHandler(handler)
+            handler.close()
+
+        [(event_id, _, text)] = reported(evtlog)
+        assert event_id == 2000
+        assert text.endswith("OSError: [Errno 5] I/O")
+
     def test_stale_attempt_failure_ignored(self, tracking_handler, clock, caplog):
         """Проверить: исход прежней попытки 2000 после повтора не
         сбивает ожидание исхода новой.
