@@ -615,7 +615,7 @@ class TestTimer:
 
     def test_flush_wait_limits_directory_event(self, monkeypatch, clock, records):
         """Такт задержался внутри записи 2002: flush(wait) не ждёт его
-        дольше wait, а 2002 и счётчик остаются такту.
+        дольше wait и пишет итоговое 2002 без блокировки.
         """
         event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
         event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
@@ -642,9 +642,5 @@ class TestTimer:
             timer.join(5)
 
         still = [t for e, t in events(records) if e == 2002]
-        assert len(still) == 1
-        assert still[0].endswith("Ошибочных ответов с прошлой записи: 1")
-        assert (
-            None,
-            "Итог о папке с файлами не записан: другой поток пишет событие о ней",
-        ) in records()
+        # Итог flush (пока такт стоит), затем запись такта
+        assert [t.rsplit(": ", 1)[1] for t in still] == ["0", "1"]

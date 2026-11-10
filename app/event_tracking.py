@@ -98,8 +98,9 @@ OnUnsent = Callable[[float], None]
 SENT_ATTRIBUTE = "event_sent"
 OnSent = Callable[[], None]
 # Атрибут записи журнала: нужно ли её событие до сих пор. Обработчик
-# спрашивает перед самой записью: попытка, которую уже сменил повтор,
-# не пишется
+# спрашивает непосредственно перед ReportEvent, в том потоке, который
+# пишет (не при постановке в буфер или очередь): попытка, которую уже
+# сменил повтор, не пишется
 CURRENT_ATTRIBUTE = "event_current"
 IsCurrent = Callable[[], bool]
 # Атрибут записи журнала: только в журнал событий — строка о ней в
@@ -274,13 +275,17 @@ def _pending_current(item: _Pending, attempt: int) -> bool:
         return item.attempt == attempt and item in _state.pending
 
 
-def _pending_sent(item: _Pending, _attempt: int) -> None:
+def _pending_sent(item: _Pending, attempt: int) -> None:
     """Событие о папке записано: передать обработчику следующее.
 
-    Записанное засчитывается и от прежней попытки: тогда новая уже не
-    нужна (_pending_current) и не пишется.
+    Засчитывается только последняя попытка: иначе следующее событие
+    могло бы записаться раньше неё, если она уже прошла проверку
+    _pending_current в другом потоке. Если записалась и прежняя, 2000
+    будет в журнале событий дважды подряд, но порядок не нарушится.
     """
     with _access_lock:
+        if item.attempt != attempt:
+            return
         item.exc = None
         if item in _state.pending:
             _state.pending.remove(item)
@@ -874,13 +879,23 @@ def _remind_or_close(
     return not final
 
 
+def _still_unavailable(state: _Unavailable, now: float, count: int) -> str:
+    """Текст 2002 о недоступной папке."""
+    return (
+        f"Папка с файлами {state.path} по-прежнему недоступна "
+        f"({format_duration(now - state.since)}): {state.description}. "
+        f"Ошибочных ответов с прошлой записи: {count}"
+    )
+
+
 def _remind(*, final: bool, wait: float | None = None) -> None:
     """Напоминания по ключам и 2002 о недоступной папке.
 
     wait — сколько ждать состояние папки, если его держит другой поток
     (такт, запрос), который пишет событие о ней; None — без предела.
-    Не дождались — итог о папке не пишется, а его счётчик и очередь
-    остаются тому потоку и следующим тактам.
+    Не дождались при остановке — итоговое 2002 пишется по состоянию без
+    блокировки и мимо очереди: дописать его будет уже некому. Ждущие в
+    очереди события о папке тогда остаются только в файле журнала.
     """
     now = clock()
     reminders: list[tuple[int, int, str, OnUnsent]] = []
@@ -903,11 +918,15 @@ def _remind(*, final: bool, wait: float | None = None) -> None:
     for level, event_id, message, on_unsent in reminders:
         _log(level, event_id, message, on_unsent=on_unsent)
     if not _state.directory_lock.acquire(timeout=-1 if wait is None else wait):
-        _log(
-            logging.WARNING,
-            None,
-            "Итог о папке с файлами не записан: другой поток пишет событие о ней",
-        )
+        # Чтение без блокировки: процесс останавливается, а поток,
+        # который её держит, только пишет событие о той же папке
+        state = _state.directory
+        if final and state is not None:
+            _log(
+                logging.WARNING,
+                EventId.DIRECTORY_STILL_UNAVAILABLE,
+                _still_unavailable(state, now, state.errors_since_write),
+            )
         return
     try:
         # Незаписанные события о папке — после срока повтора, при
@@ -923,10 +942,7 @@ def _remind(*, final: bool, wait: float | None = None) -> None:
             _directory_event(
                 logging.WARNING,
                 EventId.DIRECTORY_STILL_UNAVAILABLE,
-                f"Папка с файлами {state.path} по-прежнему недоступна "
-                f"({format_duration(now - state.since)}): "
-                f"{state.description}. Ошибочных ответов с прошлой "
-                f"записи: {count}",
+                _still_unavailable(state, now, count),
             )
     finally:
         _state.directory_lock.release()
@@ -947,9 +963,11 @@ def flush(*, wait: float = REMIND_WAIT_SECONDS) -> None:
 
     Вызывается перед событием остановки (1001) или ошибки (1002), в
     том числе перед повтором запуска, поэтому таймер не
-    останавливает. Идущий такт и запись события о папке в целом ждёт
-    не дольше wait секунд: при срочной остановке, когда процесс вот-вот
-    завершат, — wait=0.
+    останавливает. Идущий такт и запись события о папке другим потоком
+    в целом ждёт не дольше wait секунд: при срочной остановке, когда
+    процесс вот-вот завершат, — wait=0. Сам EventLogHandler здесь пишет
+    синхронно под своей блокировкой: зависший ReportEvent задержит
+    любую запись, и flush, и следующую за ним 1001.
     """
     deadline = time.monotonic() + wait
     acquired = _state.remind_lock.acquire(timeout=wait)

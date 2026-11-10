@@ -886,7 +886,7 @@ class TestEventLogHandler:
         clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
         event_tracking.tick()
         # Исход первой попытки — уже после повтора
-        on_sent = report.call_args.args[0][4]
+        *_, on_sent, _is_current = report.call_args.args[0]
         on_sent()
         event_tracking.directory_ok()
 
@@ -915,7 +915,7 @@ class TestEventLogHandler:
         assert not event_tracking._state.pending  # noqa: SLF001
 
     def test_stale_attempt_failure_ignored(self, tracking_handler, clock, caplog):
-        """Проверить: отказ прежней попытки 2000 после повтора не
+        """Проверить: исход прежней попытки 2000 после повтора не
         сбивает ожидание исхода новой.
         """
         caplog.set_level(logging.INFO, logger="app.event_tracking")
@@ -925,11 +925,16 @@ class TestEventLogHandler:
             event_tracking.directory_error("/srv", OSError(5, "I/O"), 500)
             clock.advance(event_tracking.OUTCOME_TIMEOUT_SECONDS)
             event_tracking.tick()
-        first, second = report.call_args_list
-        first.args[0][3](event_tracking.UNSENT_RETRY_SECONDS)
+        [first], [second] = (call.args for call in report.call_args_list)
+        _, _, _, first_unsent, first_sent, _ = first
+        first_unsent(event_tracking.UNSENT_RETRY_SECONDS)
         event_tracking.directory_ok()
         evtlog.ReportEvent.assert_not_called()
-        second.args[0][4]()
+        # Записалась и прежняя попытка: 2001 по-прежнему ждёт последнюю
+        first_sent()
+        evtlog.ReportEvent.assert_not_called()
+        _, _, _, _, second_sent, _ = second
+        second_sent()
 
         assert [e[0] for e in reported(evtlog)] == [2001]
         assert not event_tracking._state.pending  # noqa: SLF001
