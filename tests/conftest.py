@@ -2,6 +2,7 @@
 
 import errno
 import logging
+import os
 import time
 import types
 from collections.abc import Callable, Iterator
@@ -45,6 +46,21 @@ def wait_for(condition: Callable[[], object], timeout: float = 10) -> None:
         if time.monotonic() > deadline:
             pytest.fail("условие не выполнилось за отведённое время")
         time.sleep(0.05)
+
+
+# Корень проверяемого checkout: в worktree установка pip install -e
+# указывает на другой checkout
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def child_env() -> dict[str, str]:
+    """Окружение отдельного процесса Python: app из этого checkout."""
+    paths = [str(ROOT), os.environ.get("PYTHONPATH", "")]
+    return {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": os.pathsep.join(path for path in paths if path),
+    }
 
 
 def flush_event_logs() -> None:

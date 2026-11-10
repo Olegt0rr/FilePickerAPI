@@ -1416,6 +1416,32 @@ class TestEventLogHandler:
             2001,
         ]
 
+    def test_hung_console_does_not_stop_writer(self, event_logger, monkeypatch):
+        """Проверить: строка об отказе ReportEvent уходит в зависшую
+        консоль — поток записи не встаёт и пишет следующие события.
+        """
+        test_logger, evtlog = event_logger
+        entered, release = threading.Event(), threading.Event()
+
+        class HungConsole(logging.Handler):
+            def emit(self, record):
+                if record.getMessage().startswith("Не удалось записать"):
+                    entered.set()
+                    release.wait(10)
+
+        monkeypatch.setattr(
+            logging.getLogger(logging_setup.__name__), "handlers", [HungConsole()]
+        )
+        evtlog.ReportEvent.side_effect = [OSError("full"), None]
+        try:
+            test_logger.warning("первое", extra={"event_id": 3000})
+            assert entered.wait(5)
+            test_logger.warning("второе", extra={"event_id": 3000})
+            wait_for(lambda: evtlog.ReportEvent.call_count == 2, 5)
+        finally:
+            release.set()
+        flush_event_logs()
+
     @pytest.mark.usefixtures("clock")
     def test_event_waits_for_running_drain(self, tracking_handler):
         """Проверить: пока очередь пишет другой поток, новое событие о
@@ -2025,6 +2051,48 @@ class TestHungReportEvent:
             assert time.monotonic() - moment < 2
         finally:
             release.set()
+
+    def test_no_writer_without_events(self, evtlog):
+        """Проверить: пустой буфер, запись без события и запись,
+        отклонённая фильтром, не запускают поток записи; emit напрямую
+        пропускает запись без события и пишет запись с событием.
+        """
+        handler = logging_setup.EventLogHandler()
+        try:
+            handler.send_startup_events()
+            record = logging.makeLogRecord({"name": "app.t", "levelno": 20})
+            handler.emit(record)
+            assert handler.handle(record) is False
+            assert handler._writer is None  # noqa: SLF001
+            event = logging.makeLogRecord(
+                {"name": "app.t", "levelno": 30, "msg": "w", "event_id": 2000}
+            )
+            # Фильтр обработчика отклоняет запись: события нет
+            handler.addFilter(lambda _record: False)
+            assert handler.handle(event) is False
+            assert handler._writer is None  # noqa: SLF001
+            # emit напрямую пишет запись с событием
+            handler.emit(event)
+            handler.send_startup_events()
+            handler.flush()
+        finally:
+            handler.close()
+        assert [e[0] for e in reported(evtlog)] == [2000]
+
+    @pytest.mark.usefixtures("evtlog")
+    def test_outcome_after_close(self):
+        """Проверить: действие, отложенное после выхода потока исходов
+        (писатель дописывает очередь после close), всё равно идёт.
+        """
+        handler = logging_setup.EventLogHandler()
+        first = threading.Event()
+        handler._defer(first.set)  # noqa: SLF001
+        assert first.wait(5)
+        handler.close()
+        wait_for(lambda: handler._outcome_thread is None)  # noqa: SLF001
+        done = threading.Event()
+        handler._defer(done.set)  # noqa: SLF001
+        assert done.wait(5)
 
     def test_flush_under_handler_lock(self, event_logger, monkeypatch):
         """Проверить: сброс под замком обработчика (как flush_handlers)

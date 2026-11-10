@@ -27,7 +27,7 @@ from fastapi import FastAPI
 import app
 from app import event_tracking, instance_check, logging_setup, runner, stop_signals
 from app.instance_check import Probe, ProbeResult
-from tests.conftest import flush_event_logs, start_then_stop, wait_for
+from tests.conftest import child_env, flush_event_logs, start_then_stop, wait_for
 from tests.platforms import linux_only, windows_only
 from tests.test_main import reload_app, run_python
 
@@ -788,6 +788,39 @@ class TestStop:
             release.set()
         assert len(attempts) == 2
 
+    @pytest.mark.usefixtures("port")
+    def test_hung_retry_report_noted_in_start(self, monkeypatch, caplog):
+        """Проверить: 1002 прошлой попытки ещё пишется — в 1000 пометка,
+        что оно может появиться в журнале позже.
+        """
+        monkeypatch.setattr(runner, "REPORT_WAIT_SECONDS", 0.1)
+        release = threading.Event()
+        attempts = []
+
+        def serve(server, _sockets=None):
+            attempts.append(server)
+            if len(attempts) == 1:
+                raise SystemExit(1)
+            start_then_stop(server)
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        monkeypatch.setattr(
+            runner.Service, "_report_failure", lambda *_: release.wait(10)
+        )
+        try:
+            assert runner.run() == 0
+        finally:
+            release.set()
+        [started] = [
+            r.getMessage()
+            for r in caplog.records
+            if getattr(r, "event_id", None) == event_tracking.EventId.SERVICE_STARTED
+        ]
+        assert started.endswith(
+            "Запись о прошлой неудачной попытке (1002) ещё не завершена и "
+            "может появиться в журнале позже"
+        )
+
     def test_retry_report_error(self, monkeypatch):
         """Проверить: ошибка записи 1002 перед повтором — сбой запуска
         с кодом 1, как и раньше, а не трассировка в stderr из потока.
@@ -1403,7 +1436,7 @@ def start_service(tmp_path, **kwargs):
         text=True,
         encoding="utf-8",
         errors="replace",
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        env=child_env(),
         **kwargs,
     )
 
