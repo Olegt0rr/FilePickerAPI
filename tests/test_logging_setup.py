@@ -107,8 +107,8 @@ class TestSetupLogging:
         assert len(handlers) == int(console)
         if console:
             [handler] = handlers
-            assert type(handler) is logging.StreamHandler
-            assert handler.stream is sys.stderr
+            assert type(handler) is logging_setup.ConsoleHandler
+            assert handler._stream is sys.stderr  # noqa: SLF001
             assert handler.formatter._fmt == logging_setup.LOG_FORMAT  # noqa: SLF001
         assert logging.getLogger().level == logging.WARNING
         for name in ("app", "uvicorn.error", "uvicorn.access"):
@@ -154,6 +154,8 @@ class TestSetupLogging:
             h for h in our_handlers() if isinstance(h, logging_setup.LogFileHandler)
         ]
         file_handler.flush()
+        for handler in our_handlers():
+            handler.flush()
         text = (log_dir(tmp_path) / "FilePickerAPI.log").read_text(encoding="utf-8")
         err = capsys.readouterr().err
         assert "строка" in text
@@ -1926,6 +1928,79 @@ class TestEventLogHandler:
         assert "Повторялось ещё 2 раз с прошлой записи: app.t: w" in caplog.text
 
 
+class TestConsoleHandler:
+    """Консоль через свой поток."""
+
+    def test_hung_stream_does_not_block(self, monkeypatch):
+        """Проверить: запись в зависшую консоль не держит вызывающий
+        поток; сверх лимита строки отбрасываются, сброс ограничен.
+        """
+        monkeypatch.setattr(logging_setup, "CONSOLE_QUEUE_LIMIT", 2)
+        monkeypatch.setattr(logging_setup, "FLUSH_LOCK_SECONDS", 0.1)
+        entered, release = threading.Event(), threading.Event()
+        written = []
+
+        class HungStream:
+            def write(self, text):
+                entered.set()
+                release.wait(10)
+                written.append(text)
+
+            def flush(self):
+                pass
+
+        handler = logging_setup.ConsoleHandler(HungStream())
+        record = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        try:
+            moment = time.monotonic()
+            handler.handle(record)
+            assert entered.wait(5)
+            for _ in range(5):
+                handler.handle(record)
+            handler.flush()
+            assert time.monotonic() - moment < 2
+        finally:
+            release.set()
+            handler.close()
+        wait_for(lambda: len(written) == 3)
+        assert written == ["w\n"] * 3
+
+    def test_event_only_and_broken_stream(self):
+        """Проверить: запись «только в журнал событий» в консоль не
+        идёт, ошибка потока консоли не роняет запись.
+        """
+        stream = mock.Mock()
+        stream.write.side_effect = [OSError("broken"), None]
+        handler = logging_setup.ConsoleHandler(stream)
+        try:
+            only = logging.makeLogRecord(
+                {"name": "app.t", "levelno": 30, "msg": "o", "event_only": True}
+            )
+            assert handler.handle(only) is False
+            for message in ("a", "b"):
+                handler.handle(
+                    logging.makeLogRecord(
+                        {"name": "app.t", "levelno": 30, "msg": message}
+                    )
+                )
+            handler.flush()
+        finally:
+            handler.close()
+        assert [c.args[0] for c in stream.write.call_args_list] == ["a\n", "b\n"]
+
+    def test_format_error(self, monkeypatch):
+        """Проверить: ошибка форматирования — handleError."""
+        handler = logging_setup.ConsoleHandler(mock.Mock())
+        handle_error = mock.Mock()
+        monkeypatch.setattr(handler, "handleError", handle_error)
+        record = logging.makeLogRecord({"name": "app.t", "msg": "%s %s", "args": (1,)})
+        try:
+            handler.handle(record)
+        finally:
+            handler.close()
+        handle_error.assert_called_once_with(record)
+
+
 class TestFlushHandlers:
     """Сброс журнала перед os._exit."""
 
@@ -2199,6 +2274,32 @@ class TestHungReportEvent:
         done = threading.Event()
         handler._outcomes.put(done.set)  # noqa: SLF001
         assert done.wait(5)
+
+    def test_service_events_use_reserve(self, event_logger, monkeypatch):
+        """Проверить: очередь полна, пока ReportEvent висит, — событие
+        остановки встаёт в запас, а обычное отбрасывается.
+        """
+        test_logger, evtlog = event_logger
+        monkeypatch.setattr(logging_setup, "EVENT_QUEUE_LIMIT", 1)
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def report(*args):
+            calls.append(args[3])
+            if len(calls) == 1:
+                entered.set()
+                release.wait(10)
+
+        evtlog.ReportEvent.side_effect = report
+        test_logger.warning("занят", extra={"event_id": 3000})
+        assert entered.wait(5)
+        test_logger.warning("в очереди", extra={"event_id": 3000})
+        test_logger.warning("сверх лимита", extra={"event_id": 3000})
+        test_logger.info("остановка", extra={"event_id": EventId.SERVICE_STOPPED})
+        release.set()
+        flush_event_logs()
+
+        assert calls[:3] == [3000, 3000, 1001]
 
     def test_flush_under_handler_lock(self, event_logger, monkeypatch):
         """Проверить: сброс под замком обработчика (как flush_handlers)
