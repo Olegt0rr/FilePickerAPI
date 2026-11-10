@@ -1993,6 +1993,36 @@ class TestConsoleHandler:
         wait_for(lambda: len(written) == 3)
         assert written == ["w\n"] * 3
 
+    def test_close_with_full_queue(self, monkeypatch):
+        """Проверить: очередь полна, и маркер закрытия в неё не встал —
+        поток консоли всё равно выводит строки и завершается.
+        """
+        monkeypatch.setattr(logging_setup, "CONSOLE_QUEUE_LIMIT", 1)
+        monkeypatch.setattr(logging_setup, "CONSOLE_POLL_SECONDS", 0.05)
+        entered, release = threading.Event(), threading.Event()
+        written = []
+
+        class HungStream:
+            def write(self, text):
+                entered.set()
+                release.wait(10)
+                written.append(text)
+
+            def flush(self):
+                pass
+
+        handler = logging_setup.ConsoleHandler(HungStream())
+        record = logging.makeLogRecord({"name": "app.t", "levelno": 30, "msg": "w"})
+        handler.handle(record)
+        assert entered.wait(5)
+        handler.handle(record)
+        handler.close()
+        release.set()
+        handler._thread.join(5)  # noqa: SLF001
+
+        assert not handler._thread.is_alive()  # noqa: SLF001
+        assert written == ["w\n", "w\n"]
+
     def test_event_only_and_broken_stream(self):
         """Проверить: запись «только в журнал событий» в консоль не
         идёт, ошибка потока консоли не роняет запись.

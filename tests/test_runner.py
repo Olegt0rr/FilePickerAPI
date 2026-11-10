@@ -863,6 +863,48 @@ class TestStop:
         assert exits == [1, 1]
 
     @pytest.mark.usefixtures("port", "service_env")
+    def test_retry_delay_includes_report(self, monkeypatch):
+        """Проверить: время записи 1002 входит в паузу перед повтором,
+        а не удлиняет её.
+        """
+        now = [0.0]
+        monkeypatch.setattr(runner, "clock", lambda: now[0])
+        monkeypatch.setattr(runner, "RETRY_DELAYS", (10, 30, 60))
+        attempts, waits = [], []
+
+        def serve(server, _sockets=None):
+            attempts.append(server)
+            if len(attempts) == 1:
+                raise SystemExit(1)
+            start_then_stop(server)
+
+        def report(*_args):
+            # Запись 1002 заняла 4 секунды
+            now[0] += 4
+
+        class PauseEvent(threading.Event):
+            """stop_requested: пауза перед повтором записывается."""
+
+            def wait(self, timeout=None):
+                if timeout is not None and not self.is_set():
+                    waits.append(timeout)
+                    return False
+                return super().wait(timeout)
+
+        real_init = runner.Service.__init__
+
+        def init(service, **kwargs):
+            real_init(service, **kwargs)
+            service.stop_requested = PauseEvent()
+
+        monkeypatch.setattr(runner.InstanceServer, "run", serve)
+        monkeypatch.setattr(runner.Service, "_report_failure", report)
+        monkeypatch.setattr(runner.Service, "__init__", init)
+
+        assert runner.run() == 0
+        assert waits == [6]
+
+    @pytest.mark.usefixtures("port", "service_env")
     def test_hung_retry_report(self, monkeypatch):
         """Проверить: зависшая запись 1002 перед повтором не мешает
         следующей попытке.
