@@ -8,11 +8,25 @@
 import logging
 import sys
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
-from app.event_tracking import EventId, is_tracked
+from app.event_tracking import (
+    CURRENT_ATTRIBUTE,
+    EVENT_ONLY_ATTRIBUTE,
+    SENT_ATTRIBUTE,
+    UNSENT_ATTRIBUTE,
+    UNSENT_RETRY_SECONDS,
+    EventId,
+    IsCurrent,
+    OnSent,
+    OnUnsent,
+    admit,
+    is_tracked,
+    unsent_callback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +52,10 @@ EVENT_SOURCE_KEY = (
 MAX_EVENT_TEXT = 31_839
 TRUNCATED_NOTE = "\n… (обрезано, полный текст в FilePickerAPI.log)"
 STARTUP_BUFFER_LIMIT = 100
+
+# Событие в буфере: уровень, код, текст и что сделать, если оно не
+# записалось или записано
+_Event = tuple[int, int, str, OnUnsent | None, OnSent | None, IsCurrent | None]
 
 # Обработчики, добавленные setup_logging: повторная настройка их снимает
 _handlers: list[logging.Handler] = []
@@ -102,6 +120,9 @@ class EventLogHandler(logging.Handler):
     строка в файл журнала, а сами записи в нём уже есть.
     """
 
+    # Сообщает об исходе записи: события о папке ждут его ответа
+    confirms_event_log = True  # event_tracking.CONFIRMS_ATTRIBUTE
+
     def __init__(self) -> None:
         """Открыть источник событий FilePickerAPI."""
         super().__init__()
@@ -110,8 +131,11 @@ class EventLogHandler(logging.Handler):
         self._win32evtlog = win32evtlog
         self._source = win32evtlog.RegisterEventSource(None, EVENT_SOURCE)
         # Текст форматируется при записи: буфер не держит ни аргументы,
-        # ни трассировки с кадрами стека
-        self._buffer: list[tuple[int, int, str]] | None = []
+        # ни трассировки с кадрами стека. У записи — что сделать, если
+        # событие отброшено или не записалось (см. event_tracking._log):
+        # тогда первое событие придёт при следующем случае, а
+        # посчитанные повторы сохранятся
+        self._buffer: list[_Event] | None = []
         self._dropped = 0
         # Идёт серия отказов ReportEvent: строка о ней уже в журнале
         self._report_failing = False
@@ -119,22 +143,59 @@ class EventLogHandler(logging.Handler):
         self.setFormatter(logging.Formatter("%(name)s: %(message)s"))
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Записать событие или отложить его в буфер."""
+        """Записать событие или отложить его в буфер.
+
+        Запись без явного кода идёт через учёт повторов с ключом
+        «логгер + шаблон сообщения»: иначе Uvicorn, который пишет о
+        каждом некорректном HTTP-запросе из сети, давал бы событие на
+        каждое соединение сканера портов.
+        """
         event_id = event_id_for(record)
         if event_id is None:
             return
-        if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
-            self._dropped += 1
-            return
+        # Лимит буфера — до учёта повторов: отброшенная запись не
+        # должна занять ключ, иначе её первое событие не придёт никогда
+        on_unsent = getattr(record, UNSENT_ATTRIBUTE, None)
+        on_sent = getattr(record, SENT_ATTRIBUTE, None)
+        is_current = getattr(record, CURRENT_ATTRIBUTE, None)
         try:
-            text = self.format(record)
+            message = record.getMessage()
         except Exception:
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             self.handleError(record)
             return
+        if self._buffer is not None and len(self._buffer) >= STARTUP_BUFFER_LIMIT:
+            self._dropped += 1
+            # Повторы этой записи учтены ещё в event_tracking (track,
+            # 2000): без пометки её событие не пришло бы никогда
+            _notify(on_unsent, 0)
+            return
+        note = ""
+        if getattr(record, "event_id", None) is None:
+            reason = (record.name, str(record.msg))
+            note = admit(
+                event_id,
+                reason,
+                # Ключ — шаблон, а текст напоминания — первая запись
+                f"{record.name}: {message}",
+                record.levelno,
+            )
+            if note is None:
+                return
+            on_unsent = unsent_callback(event_id, reason, note)
+        try:
+            text = self.format(record) + note
+        except Exception:
+            # Ключ уже занят: без пометки следующий случай считался бы
+            # повтором уже записанного события
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
+            self.handleError(record)
+            return
+        event = (record.levelno, event_id, text, on_unsent, on_sent, is_current)
         if self._buffer is None:
-            self._report(record.levelno, event_id, text)
+            self._report(event)
         else:
-            self._buffer.append((record.levelno, event_id, text))
+            self._buffer.append(event)
 
     def send_startup_events(self) -> None:
         """Отправить буфер; дальше события пишутся сразу."""
@@ -146,25 +207,41 @@ class EventLogHandler(logging.Handler):
                     "они есть в файле журнала"
                 )
                 buffered.append(
-                    (note.levelno, EventId.OTHER_WARNING, self.format(note))
+                    (
+                        note.levelno,
+                        EventId.OTHER_WARNING,
+                        self.format(note),
+                        None,
+                        None,
+                        None,
+                    )
                 )
                 self._dropped = 0
-            for levelno, event_id, text in buffered:
-                self._report(levelno, event_id, text)
+            for event in buffered:
+                self._report(event)
 
     def discard_startup_events(self) -> None:
         """Отбросить буфер; дальше события пишутся сразу."""
         with self.lock:
-            self._buffer = None
+            buffered, self._buffer = self._buffer or [], None
             self._dropped = 0
+            for _level, _id, _text, on_unsent, _on_sent, _current in buffered:
+                _notify(on_unsent, 0)
 
-    def _report(self, levelno: int, event_id: int, text: str) -> None:
+    def _report(self, event: _Event) -> None:
         """Записать событие; отказ ReportEvent запрос не роняет.
 
         Вместо трассировки handleError в stderr на каждое событие —
         одна строка на серию отказов в файл журнала и консоль (не в
-        журнал событий), сама запись в файле журнала уже есть.
+        журнал событий), сама запись в файле журнала уже есть. Для
+        незаписанного события вызывается on_unsent: следующий такой же
+        случай снова даст событие, а число повторов не потеряется. Для
+        записанного — on_sent. Если is_current говорит, что событие
+        уже не нужно (его попытку сменил повтор), оно не пишется.
         """
+        levelno, event_id, text, on_unsent, on_sent, is_current = event
+        if not _still_current(is_current):
+            return
         if levelno >= logging.ERROR:
             event_type = self._win32evtlog.EVENTLOG_ERROR_TYPE
         elif levelno >= logging.WARNING:
@@ -183,6 +260,7 @@ class EventLogHandler(logging.Handler):
                 None,
             )
         except Exception as e:
+            _notify(on_unsent, UNSENT_RETRY_SECONDS)
             if not self._report_failing:
                 self._report_failing = True
                 logger.warning(
@@ -193,6 +271,7 @@ class EventLogHandler(logging.Handler):
                 )
             return
         self._report_failing = False
+        _notify(on_sent)
 
     def close(self) -> None:
         """Закрыть источник событий."""
@@ -200,6 +279,35 @@ class EventLogHandler(logging.Handler):
         if source is not None:
             self._win32evtlog.DeregisterEventSource(source)
         super().close()
+
+
+def _still_current(is_current: IsCurrent | None) -> bool:
+    """Нужно ли событие; ошибка учёта — писать, как и без проверки."""
+    if is_current is None:
+        return True
+    try:
+        return is_current()
+    except Exception:
+        logger.exception(
+            "Ошибка учёта исхода события журнала событий", extra={"event_log": False}
+        )
+        return True
+
+
+def _notify(callback: Callable[..., None] | None, *args: float) -> None:
+    """Сообщить учёту об исходе события.
+
+    Ошибка учёта не выходит из emit: иначе она дошла бы до кода, который
+    просто писал в журнал (обработчик запроса, отправка буфера).
+    """
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        logger.exception(
+            "Ошибка учёта исхода события журнала событий", extra={"event_log": False}
+        )
 
 
 class LogFileHandler(TimedRotatingFileHandler):
@@ -228,9 +336,10 @@ class LogFileHandler(TimedRotatingFileHandler):
         Если файл не открылся при ротации, FileHandler.emit пытался бы
         открыть его на каждой записи. До следующей попытки ротации
         записи в файл не идут, консоль и журнал событий их получают.
-        Запись о самом отказе файла (file_log=False) сюда не пишется.
+        Запись о самом отказе файла (file_log=False) и запись «только в
+        журнал событий» сюда не пишутся.
         """
-        if getattr(record, "file_log", True) is False:
+        if getattr(record, "file_log", True) is False or not not_event_only(record):
             return
         if self.stream is None and time.time() < self.rolloverAt:
             return
@@ -361,6 +470,11 @@ def event_source_registered() -> bool:
     return True
 
 
+def not_event_only(record: logging.LogRecord) -> bool:
+    """Фильтр файла и консоли: без записей «только в журнал событий»."""
+    return not getattr(record, EVENT_ONLY_ATTRIBUTE, False)
+
+
 def _add(handler: logging.Handler) -> logging.Handler:
     logging.getLogger().addHandler(handler)
     _handlers.append(handler)
@@ -386,7 +500,9 @@ def setup_logging(*, console: bool) -> None:
     formatter = logging.Formatter(LOG_FORMAT)
 
     if console:
-        _add(logging.StreamHandler(sys.stderr)).setFormatter(formatter)
+        console = _add(logging.StreamHandler(sys.stderr))
+        console.setFormatter(formatter)
+        console.addFilter(not_event_only)
     if not _windows():
         return
     # Журнал событий раньше файла: 1004 о недоступном файле попадает в

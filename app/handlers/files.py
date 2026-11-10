@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from pathlib import Path, PureWindowsPath
 from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Annotated
@@ -18,12 +19,19 @@ from fastapi import Path as PathParam
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
+from starlette.types import Message, Receive, Scope, Send
+from uvicorn.protocols.utils import ClientDisconnected
 
+from app import event_tracking
+from app.event_tracking import EventId
 from app.settings import get_settings
 
-logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/files", tags=["files"])
+
+# Маршруты в событиях о медленной папке (2003): ключ повторов — маршрут,
+# а не конкретный fileId
+LIST_ROUTE = "GET /files"
+DOWNLOAD_ROUTE = "GET /files/{fileId}"
 
 # Максимальный размер файла для импорта (10 МБ)
 MAX_AVAILABLE_FILE_SIZE = 10 * 1024 * 1024
@@ -143,6 +151,7 @@ class _Win32FindData(ctypes.Structure):
 # FINDEX_INFO_LEVELS.FindExInfoBasic: без короткого имени 8.3
 _FIND_EX_INFO_BASIC = 1
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_ERROR_FILE_NOT_FOUND = 2
 _ERROR_ACCESS_DENIED = 5
 # Открытие файла только для чтения атрибутов, без перехода по ссылкам
 # (FILE_FLAG_OPEN_REPARSE_POINT); BACKUP_SEMANTICS позволяет открыть и
@@ -359,12 +368,15 @@ def _is_invalid_name_error(error: OSError) -> bool:
 
 
 @contextmanager
-def _directory_errors(*, not_found: bool = False) -> Iterator[None]:
+def _directory_errors(directory: Path, *, not_found: bool = False) -> Iterator[None]:
     """Превратить ошибки ОС при работе с директорией в HTTP-ошибки.
 
-    Текст исходной ошибки попадает в detail.
+    Текст исходной ошибки попадает в detail. Каждая ошибка — это
+    недоступность директории: в файл журнала пишется каждый случай, в
+    журнал событий — переход и смена причины (2000).
 
     Args:
+        directory: Директория из настроек
         not_found: Отвечать 404 «Files directory not found», если
             директория не найдена; иначе это ошибка ввода-вывода
 
@@ -383,27 +395,27 @@ def _directory_errors(*, not_found: bool = False) -> Iterator[None]:
         # winerror здесь нет: на это поведение опирается спецификация
         # (тест test_list_files_network_path_not_found)
         if not_found and isinstance(e, (FileNotFoundError, NotADirectoryError)):
-            msg = "Files directory not found"
-            raise HTTPException(status_code=404, detail=msg) from e
-        if isinstance(e, PermissionError):
-            msg = f"Permission denied when reading directory: {e!s}"
-            raise HTTPException(status_code=403, detail=msg) from e
-        # 500 означает сбой, который надо разбирать по журналу, а не
-        # только по detail ответа, который фронтенд не показывает
-        logger.warning("Ошибка при чтении директории с файлами: %s", e)
-        msg = f"OS error when reading directory: {e!s}"
-        raise HTTPException(status_code=500, detail=msg) from e
+            status, msg = 404, "Files directory not found"
+        elif isinstance(e, PermissionError):
+            status, msg = 403, f"Permission denied when reading directory: {e!s}"
+        else:
+            status, msg = 500, f"OS error when reading directory: {e!s}"
+        event_tracking.directory_error(directory, e, status)
+        raise HTTPException(status_code=status, detail=msg) from e
 
 
 @contextmanager
-def _file_errors(file_id: str) -> Iterator[None]:
+def _file_errors(file_id: str, directory: Path) -> Iterator[None]:
     """Превратить ошибки при поиске запрошенного файла в HTTP-ошибки.
 
     Текст исходной ошибки в detail не попадает: в нём полный путь к
-    сетевой папке. Он пишется в лог.
+    сетевой папке. Он пишется в журнал: сетевой код Windows — как
+    недоступность директории (2000), прочие ошибки доступа — 3000.
+    Отсутствующий файл при доступной папке — обычный 404 без события.
 
     Args:
         file_id: Запрошенный идентификатор файла
+        directory: Директория из настроек
 
     Raises:
         HTTPException: 400 при недопустимом имени, 404 если файла нет,
@@ -419,15 +431,24 @@ def _file_errors(file_id: str) -> Iterator[None]:
     except OSError as e:
         if _is_invalid_name_error(e):
             raise _invalid_filename() from e
-        if isinstance(e, (FileNotFoundError, NotADirectoryError)):
-            msg = "File not found"
-            raise HTTPException(status_code=404, detail=msg) from e
-        logger.warning("Ошибка при чтении файла %r: %s", file_id, e)
-        if isinstance(e, PermissionError):
-            msg = "Permission denied when reading file"
-            raise HTTPException(status_code=403, detail=msg) from e
-        msg = "OS error when reading file"
-        raise HTTPException(status_code=500, detail=msg) from e
+        missing = isinstance(e, (FileNotFoundError, NotADirectoryError))
+        if missing:
+            status, msg = 404, "File not found"
+        elif isinstance(e, PermissionError):
+            status, msg = 403, "Permission denied when reading file"
+        else:
+            status, msg = 500, "OS error when reading file"
+        # «Сетевой путь не найден» и ERROR_PATH_NOT_FOUND (пропала сама
+        # папка, отключён диск) на Windows — тоже FileNotFoundError, но
+        # это недоступность папки (2000), а не отсутствующий файл
+        if not missing or event_tracking.is_directory_error(e):
+            event_tracking.file_error(directory, file_id, e, status)
+        elif getattr(e, "winerror", None) == _ERROR_FILE_NOT_FOUND:
+            # Файла нет, но папка ответила: она доступна. Только по
+            # этому коду: на других ОС ENOENT не отличает пропавшую
+            # папку от пропавшего файла
+            event_tracking.directory_ok()
+        raise HTTPException(status_code=status, detail=msg) from e
 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -537,14 +558,17 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
         # обращения к ФС, и прочие элементы не держатся в памяти. Не
         # показываем и файлы, которые get_file не отдаст из-за имени,
         # как nul.txt на Windows 11
-        with _directory_errors(not_found=True), os.scandir(files_path) as it:
+        with (
+            _directory_errors(files_path, not_found=True),
+            os.scandir(files_path) as it,
+        ):
             entries = [
                 entry
                 for entry in it
                 if Path(entry.name).suffix.lower() == ".txt"
                 and not _is_invalid_windows_name(entry.name)
             ]
-        with _directory_errors():
+        with _directory_errors(files_path):
             for entry in entries:
                 file_stat, missing = _stat_listed_item(entry, base_dir)
                 skipped_missing |= missing
@@ -562,13 +586,22 @@ def _collect_file_info(files_path: Path) -> list[FileInfo]:
             # Пропавшие файлы могут означать, что пропала вся директория
             # (например, отвалилась сетевая папка): тогда это 404, а не
             # пустой список
-            with _directory_errors(not_found=True):
+            with _directory_errors(files_path, not_found=True):
                 files_path.stat()
     except HTTPException:
         raise
     except Exception as e:
-        # С трассировкой: непредвиденную ошибку иначе не разобрать
-        logger.exception("Непредвиденная ошибка при чтении директории")
+        # С трассировкой: непредвиденную ошибку иначе не разобрать.
+        # Исключение помечается учтённым, и обработчик HTTPException не
+        # даст второго события
+        event_tracking.track(
+            EventId.UNEXPECTED_ERROR,
+            (LIST_ROUTE, type(e).__name__),
+            f"Непредвиденная ошибка при чтении директории {files_path}: "
+            f"{event_tracking.describe_error(e)}",
+            level=logging.ERROR,
+            exc=e,
+        )
         msg = f"Unexpected error when reading directory: {e!s}"
         raise HTTPException(status_code=500, detail=msg) from e
 
@@ -615,18 +648,23 @@ def list_files() -> FileListResponse:
 
     """
     files_path = Path(get_settings().files_directory)
+    # Замер без дополнительных обращений к ФС: время самого обработчика
+    started = event_tracking.clock()
+    try:
+        # Один stat() вместо exists() + is_dir(): меньше обращений к
+        # сетевой папке и одинаковое поведение на всех версиях Python
+        with _directory_errors(files_path, not_found=True):
+            dir_stat = files_path.stat()
 
-    # Один stat() вместо exists() + is_dir(): меньше обращений к
-    # сетевой папке и одинаковое поведение на всех версиях Python
-    with _directory_errors(not_found=True):
-        dir_stat = files_path.stat()
+        if not S_ISDIR(dir_stat.st_mode):
+            msg = "Files path is not a directory"
+            raise HTTPException(status_code=400, detail=msg)
 
-    if not S_ISDIR(dir_stat.st_mode):
-        msg = "Files path is not a directory"
-        raise HTTPException(status_code=400, detail=msg)
-
-    # Собрать информацию о всех .txt файлах
-    file_list = _collect_file_info(files_path)
+        # Собрать информацию о всех .txt файлах
+        file_list = _collect_file_info(files_path)
+    finally:
+        event_tracking.check_slow(LIST_ROUTE, started)
+    event_tracking.directory_ok()
 
     # Сортировка файлов по createdAt (новые первыми)
     file_list.sort(key=lambda x: x.created_at, reverse=True)
@@ -676,8 +714,8 @@ def _resolve_files_directory(files_directory: Path, *, refresh: bool = False) ->
             return files_directory.resolve()
     except (OSError, RuntimeError, ValueError) as e:
         _real_path_cache.pop(files_directory, None)
-        logger.warning("Не удалось разрешить путь к директории с файлами: %s", e)
         msg = "OS error when reading file"
+        event_tracking.directory_error(files_directory, e, 500)
         raise HTTPException(status_code=500, detail=msg) from e
     _real_path_cache[files_directory] = real_path
     return real_path
@@ -711,7 +749,7 @@ def _resolve_in_directory(candidate: Path, files_directory: Path, file_id: str) 
         else _resolve_files_directory(files_directory)
     )
 
-    with _file_errors(file_id):
+    with _file_errors(file_id, files_directory):
         file_path = candidate.resolve()
 
     # Отдаём только файлы непосредственно из директории, как и в
@@ -728,11 +766,133 @@ def _resolve_in_directory(candidate: Path, files_directory: Path, file_id: str) 
     return file_path
 
 
+class TrackedFileResponse(FileResponse):
+    """Ответ с файлом, учитывающий чтение тела.
+
+    FileResponse открывает и читает файл уже после обработчика, поэтому
+    замер идёт до конца отправки тела: открытие и чтение файла по SMB
+    плюс передача клиенту (поэтому в 2003 указан размер файла). Ошибка
+    ОС при открытии или чтении учитывается, как ошибки обработчика, и
+    пробрасывается дальше: заголовки уже отправлены, ответ обрывается.
+    Новых обращений к ФС обёртка не делает.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        file_id: str,
+        directory: Path,
+        started: float,
+        **kwargs: object,
+    ) -> None:
+        """Запомнить, что и с какого момента замерять."""
+        super().__init__(*args, **kwargs)
+        self._file_id = file_id
+        self._directory = directory
+        self._started = started
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Отправить файл с замером и учётом ошибок чтения."""
+        # Тело читается уже после обработчика: своё обращение к папке
+        event_tracking.begin_access()
+        status: int | None = None
+        sent = False
+        client_error: OSError | None = None
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal status, sent, client_error
+            try:
+                await send(message)
+            except OSError as e:
+                # Ошибка отправки клиенту, а не чтения файла
+                client_error = e
+                raise
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            # Тело отправлено целиком: последний кусок или pathsend.
+            # Клиент мог отключиться раньше (http.disconnect), и тогда
+            # Starlette возвращается без исключения, не дочитав файл
+            sent = message["type"] == "http.response.pathsend" or (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            )
+
+        try:
+            await super().__call__(scope, receive, tracked_send)
+        except OSError as e:
+            if isinstance(e, ClientDisconnected) or e is client_error:
+                # Клиент закрыл соединение: с папкой всё в порядке.
+                # Пометка «учтено» убирает событие и у обработчика
+                # Exception, и у записи uvicorn.error об этом исключении
+                # (в файле она есть)
+                event_tracking.mark_tracked(e)
+                raise
+            # Заголовки уже ушли — ответ оборван с их кодом (200 или
+            # 206), иначе Starlette ответит 500
+            reported: int | str = (
+                HTTPStatus.INTERNAL_SERVER_ERROR.value
+                if status is None
+                else f"{status}, ответ оборван"
+            )
+            if not event_tracking.is_directory_error(e):
+                # Ошибка самого файла (например, его ещё пишут): папка
+                # ответила, как и при ответе 400/403 по атрибутам
+                event_tracking.directory_ok()
+            event_tracking.file_error(self._directory, self._file_id, e, reported)
+            raise
+        else:
+            # Тело отправлено целиком — папка доступна. Не раньше: при
+            # стабильном сбое чтения 2001 по атрибутам файла давало бы
+            # пару 2001/2000 на каждый запрос
+            if sent:
+                event_tracking.directory_ok()
+        finally:
+            # 206 — отправлена часть файла (Range), и его размер в
+            # событии сбил бы с толку
+            partial = status == HTTPStatus.PARTIAL_CONTENT
+            size = None if partial else self.stat_result.st_size
+            event_tracking.check_slow(DOWNLOAD_ROUTE, self._started, size=size)
+
+
 @router.get("/{fileId}")
 def get_file(
     file_id: Annotated[str, PathParam(alias="fileId")],
 ) -> FileResponse:
     """Скачать определенный файл из настроенной директории.
+
+    Время замеряется до конца отправки тела (TrackedFileResponse), а
+    если обработчик ответил ошибкой — до неё.
+
+    Args:
+        file_id: ID файла для загрузки (имя файла)
+
+    Returns:
+        Ответ с запрашиваемым файлом
+
+    Raises:
+        HTTPException: см. _find_download
+
+    """
+    files_directory = Path(get_settings().files_directory)
+    started = event_tracking.clock()
+    try:
+        file_path, file_stat = _find_download(file_id, files_directory)
+    except BaseException:
+        event_tracking.check_slow(DOWNLOAD_ROUTE, started)
+        raise
+    return TrackedFileResponse(
+        path=file_path,
+        filename=file_path.name,
+        media_type="application/octet-stream",
+        stat_result=file_stat,
+        file_id=file_id,
+        directory=files_directory,
+        started=started,
+    )
+
+
+def _find_download(file_id: str, files_directory: Path) -> tuple[Path, os.stat_result]:
+    """Найти файл для скачивания и проверить его.
 
     Обращения к файловой системе ограничены настроенной директорией:
     fileId проверяется как имя до любого обращения к ней, а на Windows
@@ -742,9 +902,10 @@ def get_file(
 
     Args:
         file_id: ID файла для загрузки (имя файла)
+        files_directory: Директория из настроек
 
     Returns:
-        Ответ с запрашиваемым файлом
+        Путь к файлу и его атрибуты для ответа
 
     Raises:
         HTTPException: 400 «Invalid filename», если fileId — не имя
@@ -759,8 +920,6 @@ def get_file(
             директории (кроме Windows)
 
     """
-    files_directory = Path(get_settings().files_directory)
-
     # Безопасность: fileId должен быть просто именем, и проверяется это
     # до любого обращения к ФС. Абсолютный путь (на Windows и
     # UNC-путь \\host\share) заменил бы директорию при склейке, и
@@ -785,7 +944,7 @@ def get_file(
         # ссылка, файл лежит прямо в директории: resolve() и сверка с
         # директорией не нужны, а атрибуты для проверок и ответа уже
         # получены
-        with _file_errors(file_id):
+        with _file_errors(file_id, files_directory):
             file_stat = candidate.lstat()
         if S_ISLNK(file_stat.st_mode):
             raise _invalid_filename()
@@ -794,28 +953,27 @@ def get_file(
         # проверки расширения. Проверки и имя в ответе — по настоящему
         # имени, как в списке. Второе и последнее обращение к сетевой
         # папке до чтения файла
-        with _file_errors(file_id):
+        with _file_errors(file_id, files_directory):
             real_name = _real_file_name(candidate)
         if _is_invalid_windows_name(real_name):
             raise _invalid_filename()
         file_path = candidate.with_name(real_name)
     else:
         file_path = _resolve_in_directory(candidate, files_directory, file_id)
-        with _file_errors(file_id):
+        with _file_errors(file_id, files_directory):
             file_stat = file_path.stat()
-
+    # Атрибуты файла получены — для ответа 400 или 403 папка доступна.
+    # Скачивание подтверждает это само, отправив тело целиком: так
+    # делает TrackedFileResponse
     if not S_ISREG(file_stat.st_mode):
+        event_tracking.directory_ok()
         msg = "Path is not a file"
         raise HTTPException(status_code=400, detail=msg)
 
     # Проверяем, что файл доступен для загрузки
     if not check_file_availability(file_path, file_stat.st_size):
+        event_tracking.directory_ok()
         msg = "File is not available for download"
         raise HTTPException(status_code=403, detail=msg)
 
-    return FileResponse(
-        path=file_path,
-        filename=file_path.name,
-        media_type="application/octet-stream",
-        stat_result=file_stat,
-    )
+    return file_path, file_stat
