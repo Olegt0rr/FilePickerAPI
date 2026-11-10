@@ -879,24 +879,8 @@ def _remind_or_close(
     return not final
 
 
-def _still_unavailable(state: _Unavailable, now: float, count: int) -> str:
-    """Текст 2002 о недоступной папке."""
-    return (
-        f"Папка с файлами {state.path} по-прежнему недоступна "
-        f"({format_duration(now - state.since)}): {state.description}. "
-        f"Ошибочных ответов с прошлой записи: {count}"
-    )
-
-
-def _remind(*, final: bool, wait: float | None = None) -> None:
-    """Напоминания по ключам и 2002 о недоступной папке.
-
-    wait — сколько ждать состояние папки, если его держит другой поток
-    (такт, запрос), который пишет событие о ней; None — без предела.
-    Не дождались при остановке — итоговое 2002 пишется по состоянию без
-    блокировки и мимо очереди: дописать его будет уже некому. Ждущие в
-    очереди события о папке тогда остаются только в файле журнала.
-    """
+def _remind(*, final: bool) -> None:
+    """Напоминания по ключам и 2002 о недоступной папке."""
     now = clock()
     reminders: list[tuple[int, int, str, OnUnsent]] = []
     with _state.lock:
@@ -917,18 +901,7 @@ def _remind(*, final: bool, wait: float | None = None) -> None:
             del _state.overflow[event_id]
     for level, event_id, message, on_unsent in reminders:
         _log(level, event_id, message, on_unsent=on_unsent)
-    if not _state.directory_lock.acquire(timeout=-1 if wait is None else wait):
-        # Чтение без блокировки: процесс останавливается, а поток,
-        # который её держит, только пишет событие о той же папке
-        state = _state.directory
-        if final and state is not None:
-            _log(
-                logging.WARNING,
-                EventId.DIRECTORY_STILL_UNAVAILABLE,
-                _still_unavailable(state, now, state.errors_since_write),
-            )
-        return
-    try:
+    with _state.directory_lock:
         # Незаписанные события о папке — после срока повтора, при
         # остановке все сразу
         _drain(now, force=final)
@@ -942,10 +915,11 @@ def _remind(*, final: bool, wait: float | None = None) -> None:
             _directory_event(
                 logging.WARNING,
                 EventId.DIRECTORY_STILL_UNAVAILABLE,
-                _still_unavailable(state, now, count),
+                f"Папка с файлами {state.path} по-прежнему недоступна "
+                f"({format_duration(now - state.since)}): "
+                f"{state.description}. Ошибочных ответов с прошлой "
+                f"записи: {count}",
             )
-    finally:
-        _state.directory_lock.release()
 
 
 def tick() -> None:
@@ -963,16 +937,15 @@ def flush(*, wait: float = REMIND_WAIT_SECONDS) -> None:
 
     Вызывается перед событием остановки (1001) или ошибки (1002), в
     том числе перед повтором запуска, поэтому таймер не
-    останавливает. Идущий такт и запись события о папке другим потоком
-    в целом ждёт не дольше wait секунд: при срочной остановке, когда
-    процесс вот-вот завершат, — wait=0. Сам EventLogHandler здесь пишет
-    синхронно под своей блокировкой: зависший ReportEvent задержит
-    любую запись, и flush, и следующую за ним 1001.
+    останавливает. Идущий такт ждёт не дольше wait секунд: при срочной
+    остановке, когда процесс вот-вот завершат, — wait=0. Запись в
+    журнал событий здесь синхронна: зависший ReportEvent задержит любую
+    запись (и итог, и следующую за ним 1001), и wait этого не
+    ограничивает.
     """
-    deadline = time.monotonic() + wait
     acquired = _state.remind_lock.acquire(timeout=wait)
     try:
-        _remind(final=True, wait=max(0.0, deadline - time.monotonic()))
+        _remind(final=True)
     finally:
         if acquired:
             _state.remind_lock.release()
