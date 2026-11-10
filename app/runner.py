@@ -433,12 +433,15 @@ class Service:
                 )
                 return
             delay = RETRY_DELAYS[attempt - 1]
+            reported_at = clock()
             self._report_retry(
                 f"HTTP-сервер не работает (попытка {attempt} из {MAX_ATTEMPTS}, "
                 f"следующая через {delay} с): {reason}",
                 error,
             )
-            if self.stop_requested.wait(delay):
+            # Пауза считается от отказа: запись 1002 (не дольше
+            # REPORT_WAIT_SECONDS) входит в неё, а не удлиняет её
+            if self.stop_requested.wait(max(delay - (clock() - reported_at), 0)):
                 return
 
     def _run_server(self, server: InstanceServer) -> BaseException | None:
