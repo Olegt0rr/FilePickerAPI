@@ -1439,6 +1439,8 @@ def compiled_exe(monkeypatch, tmp_path):
         check=mock.Mock(return_value=[violation]),
     )
     monkeypatch.setattr(winapi, "register_application_restart", fake.restart)
+    # Exe при входе пользователя: окна консоли нет
+    monkeypatch.setattr(winapi, "has_console_window", lambda: False)
     monkeypatch.setattr(permissions, "check_build_folder", fake.check)
     monkeypatch.setattr(permissions, "format_violations", lambda v: f"нарушения: {v}")
     return fake

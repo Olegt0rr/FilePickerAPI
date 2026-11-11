@@ -61,9 +61,11 @@ def clear_libraries():
     """Сбросить кэш загруженных библиотек до и после теста."""
     winapi._iphlpapi.cache_clear()  # noqa: SLF001 - кэш модуля
     winapi._kernel32.cache_clear()  # noqa: SLF001 - кэш модуля
+    winapi._ntdll.cache_clear()  # noqa: SLF001 - кэш модуля
     yield
     winapi._iphlpapi.cache_clear()  # noqa: SLF001 - кэш модуля
     winapi._kernel32.cache_clear()  # noqa: SLF001 - кэш модуля
+    winapi._ntdll.cache_clear()  # noqa: SLF001 - кэш модуля
 
 
 class TestParseTcpTable:
@@ -351,24 +353,29 @@ class TestConsole:
         assert kernel32.GetConsoleWindow.restype is ctypes.c_void_p
 
     @pytest.mark.parametrize(
-        ("file_type", "console_mode", "null"),
+        ("status", "device_type", "null"),
         [
-            # Файл или канал: не NUL
-            (1, 0, False),
-            # Символьное устройство с режимом консоли: консоль
-            (winapi.FILE_TYPE_CHAR, 1, False),
-            # Символьное устройство без режима консоли: NUL
-            (winapi.FILE_TYPE_CHAR, 0, True),
+            # Не NUL: файл на диске и консоль
+            (0, 0x07, False),
+            (0, 0x50, False),
+            (0, winapi.FILE_DEVICE_NULL, True),
+            # Тип узнать не удалось (STATUS_INVALID_HANDLE): не NUL
+            (-1073741816, winapi.FILE_DEVICE_NULL, False),
         ],
     )
     @pytest.mark.usefixtures("msvcrt")
-    def test_is_null_device(self, kernel32, file_type, console_mode, null):
-        kernel32.GetFileType.return_value = file_type
-        kernel32.GetConsoleMode.return_value = console_mode
+    def test_is_null_device(self, kernel32, status, device_type, null):
+        def query(handle, _io_status, info, size, info_class):
+            device = info._obj  # noqa: SLF001 - структура за ctypes.byref
+            assert (handle, info_class) == (1002, 4)
+            assert size == ctypes.sizeof(device)
+            device.device_type = device_type
+            return status
+
+        kernel32.NtQueryVolumeInformationFile.side_effect = query
         assert winapi.is_null_device(2) is null
-        kernel32.GetFileType.assert_called_once_with(1002)
-        assert kernel32.GetFileType.argtypes == (ctypes.c_void_p,)
-        assert kernel32.GetConsoleMode.argtypes[0] is ctypes.c_void_p
+        kernel32.win_dll.assert_called_once_with("ntdll")
+        assert kernel32.NtQueryVolumeInformationFile.restype is ctypes.c_long
 
 
 @windows_only

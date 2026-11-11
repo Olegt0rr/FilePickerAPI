@@ -91,6 +91,10 @@ result = {
     "usable": ensure_std_streams(),
     "window": winapi.has_console_window(),
 }
+if result["window"]:
+    # Консоль, открытая только на запись, как её открывает Nuitka
+    with open("CONOUT$", "w") as console:
+        result["console_null"] = winapi.is_null_device(console.fileno())
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(result, f)
 """
@@ -144,7 +148,8 @@ class TestChildProcess:
         assert result == {"usable": True, "window": False}
 
     def test_console_window(self, tmp_path):
-        """Проверить: в своём окне консоли — из консоли.
+        """Проверить: в своём окне консоли — из консоли, а консоль,
+        открытая только на запись, не принимается за NUL.
 
         Окно скрыто (SW_HIDE), чтобы тест ничего не показывал. Окно
         есть и у скрытой консоли, и на рабочем столе службы (раннер
@@ -163,3 +168,4 @@ class TestChildProcess:
         )
 
         assert result["window"] is True
+        assert result["console_null"] is False

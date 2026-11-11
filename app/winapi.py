@@ -20,8 +20,10 @@ RESTART_NO_HANG = 0x2
 RESTART_NO_REBOOT = 0x8
 RESTART_FLAGS = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT
 
-# GetFileType: символьное устройство (консоль, NUL, COM-порт)
-FILE_TYPE_CHAR = 0x0002
+# NtQueryVolumeInformationFile: класс FileFsDeviceInformation и тип
+# устройства NUL (ntifs.h, devioctl.h)
+_FILE_FS_DEVICE_INFORMATION = 4
+FILE_DEVICE_NULL = 0x15
 
 AF_INET = 2
 AF_INET6 = 23
@@ -126,14 +128,34 @@ def _kernel32() -> ctypes.CDLL:
     kernel32.RegisterApplicationRestart.restype = ctypes.c_long
     kernel32.GetConsoleWindow.argtypes = ()
     kernel32.GetConsoleWindow.restype = ctypes.c_void_p
-    kernel32.GetFileType.argtypes = (ctypes.c_void_p,)
-    kernel32.GetFileType.restype = ctypes.c_uint32
-    kernel32.GetConsoleMode.argtypes = (
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_uint32),
-    )
-    kernel32.GetConsoleMode.restype = ctypes.c_int
     return kernel32
+
+
+class _IoStatusBlock(ctypes.Structure):
+    """IO_STATUS_BLOCK: состояние (объединение с указателем) и число."""
+
+    _fields_ = (("status", ctypes.c_void_p), ("information", ctypes.c_size_t))
+
+
+class _DeviceInformation(ctypes.Structure):
+    """FILE_FS_DEVICE_INFORMATION: тип устройства и его свойства."""
+
+    _fields_ = (("device_type", ctypes.c_uint32), ("characteristics", ctypes.c_uint32))
+
+
+@functools.cache
+def _ntdll() -> ctypes.CDLL:
+    """Загрузить ntdll, описать NtQueryVolumeInformationFile."""
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtQueryVolumeInformationFile.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    )
+    ntdll.NtQueryVolumeInformationFile.restype = ctypes.c_long
+    return ntdll
 
 
 def tcp_listeners() -> list[TcpRow]:
@@ -259,14 +281,21 @@ def has_console_window() -> bool:
 def is_null_device(fd: int) -> bool:
     """Проверить: дескриптор ведёт на устройство NUL.
 
-    У NUL, как и у консоли, тип символьного устройства, но
-    GetConsoleMode на нём не срабатывает.
+    По типу устройства (FileFsDeviceInformation): у NUL он
+    FILE_DEVICE_NULL, у консоли — FILE_DEVICE_CONSOLE. Запрос не требует
+    прав на чтение, поэтому консоль, открытая только на запись, за NUL
+    не принимается. Если тип узнать не удалось — не NUL: поток лучше
+    оставить, чем потерять вывод.
     """
     import msvcrt
 
-    handle = msvcrt.get_osfhandle(fd)
-    kernel32 = _kernel32()
-    if kernel32.GetFileType(handle) != FILE_TYPE_CHAR:
-        return False
-    mode = ctypes.c_uint32()
-    return not kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+    io_status = _IoStatusBlock()
+    info = _DeviceInformation()
+    status = _ntdll().NtQueryVolumeInformationFile(
+        msvcrt.get_osfhandle(fd),
+        ctypes.byref(io_status),
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+        _FILE_FS_DEVICE_INFORMATION,
+    )
+    return status == 0 and info.device_type == FILE_DEVICE_NULL
