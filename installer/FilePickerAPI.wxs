@@ -56,6 +56,21 @@
     <Launch Condition="Installed OR NOT SAMEVERSIONFOUND"
             Message="Эта версия File Picker API уже установлена: сначала удалите её." />
 
+    <!-- Путь к зарегистрированному файлу сообщений, если его версия
+         больше X.Y.Z.0 этого пакета (у DLL сообщений четвёртое число
+         всегда 0, build-msi.ps1 это проверяет). Имя FileSearch при
+         поиске по пути из реестра не сверяется, но столбец FileName
+         таблицы Signature обязателен. AppSearch пишет только
+         в публичные свойства -->
+    <Property Id="NEWERMESSAGEFILE" Secure="yes">
+      <RegistrySearch Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\FilePickerAPI"
+                      Name="EventMessageFile" Type="file" Bitness="always64">
+        <FileSearch Name="FilePickerAPI.messages.dll"
+                    MinVersion="$(var.Version).1" />
+      </RegistrySearch>
+    </Property>
+
     <!-- Идентификатор с маленькими буквами — не публичное свойство:
          папку нельзя задать в командной строке msiexec, сборка всегда
          там, куда пишут только администраторы -->
@@ -86,17 +101,26 @@
       </Component>
 
       <!-- Файл сообщений и источник событий постоянные: текст прошлых
-           событий читается и после удаления продукта. DLL с ресурсом
-           VERSIONINFO заменяется только более новой версией, поэтому
-           после отката остаётся новейшая таблица -->
+           событий читается и после удаления продукта. Файл ставится
+           под именем с версией пакета: служба журнала событий держит
+           загруженный файл открытым, и его замена заставила бы Restart
+           Manager перезапустить EventLog и зависимые службы. Новая
+           версия добавляет свой файл и не трогает прежние. GUID
+           компонента WiX выводит из пути, у каждой версии он свой
+           (изменение msi-message-file-in-use) -->
       <Component Id="MessageFile" Permanent="yes">
         <File Id="MessageDll"
               Source="$(var.Dist)\FilePickerAPI.messages.dll"
+              Name="FilePickerAPI.messages.$(var.Version).dll"
               KeyPath="yes" />
       </Component>
 
+      <!-- Источник регистрируется на файл своей версии, только если
+           зарегистрированный файл не новее (NEWERMESSAGEFILE ниже):
+           после отката остаётся новейшая таблица -->
       <Component Id="EventSource" Permanent="yes"
-                 Guid="82C55A39-C543-4374-8E78-21C79823EEE4">
+                 Guid="82C55A39-C543-4374-8E78-21C79823EEE4"
+                 Condition="NOT NEWERMESSAGEFILE">
         <util:EventSource Log="Application" Name="FilePickerAPI"
                           EventMessageFile="[#MessageDll]"
                           SupportsErrors="yes" SupportsWarnings="yes"

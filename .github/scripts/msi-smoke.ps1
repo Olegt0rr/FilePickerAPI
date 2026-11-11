@@ -51,7 +51,15 @@ $LogDir = (Resolve-Path $LogDir).Path
 $installDir = Join-Path $env:ProgramFiles 'FilePickerAPI'
 $exe = Join-Path $installDir 'FilePickerAPI.exe'
 $envFile = Join-Path $installDir '.env'
-$messageDll = 'FilePickerAPI.messages.dll'
+# Файл сообщений в папке сборки и под именем с версией пакета в папке
+# установки: обновление добавляет файл, а не заменяет тот, что держит
+# служба журнала событий (изменение msi-message-file-in-use). Файлы обеих
+# версий постоянные, поэтому сверка знает оба и их источники
+$buildMessageDll = 'FilePickerAPI.messages.dll'
+$messageFiles = @{
+  "FilePickerAPI.messages.$FileVersion1.dll" = Join-Path $Build1 $buildMessageDll
+  "FilePickerAPI.messages.$FileVersion2.dll" = Join-Path $Build2 $buildMessageDll
+}
 $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
 $sourceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\FilePickerAPI'
 $serviceLog = Join-Path $env:LOCALAPPDATA 'FilePickerAPI\logs\FilePickerAPI.log'
@@ -171,6 +179,77 @@ public sealed class Detached {
     get { uint code; GetExitCodeProcess(handle, out code); return (int)code; }
   }
 }
+
+// Кого Restart Manager закрыл бы ради замены файлов: тот же опрос
+// (RmRegisterResources и RmGetList), что делает msiexec в InstallValidate.
+// Имён в журнале msiexec при /qn нет, только «Successfully shut down»
+public static class SmokeRestartManager {
+  [StructLayout(LayoutKind.Sequential)]
+  struct UniqueProcess {
+    public int dwProcessId;
+    public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+  }
+
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct ProcessInfo {
+    public UniqueProcess Process;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+    public int ApplicationType;
+    public uint AppStatus;
+    public uint TSSessionId;
+    [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+  }
+
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  static extern int RmStartSession(out uint session, int flags, StringBuilder key);
+
+  [DllImport("rstrtmgr.dll")]
+  static extern int RmEndSession(uint session);
+
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  static extern int RmRegisterResources(uint session, uint fileCount, string[] files,
+    uint applicationCount, IntPtr applications, uint serviceCount, string[] services);
+
+  [DllImport("rstrtmgr.dll")]
+  static extern int RmGetList(uint session, out uint needed, ref uint count,
+    [In, Out] ProcessInfo[] info, out uint rebootReasons);
+
+  // Строки «PID 123 Windows Event Log: service EventLog (RmService, …)»
+  public static string[] Holders(string[] files) {
+    const int ERROR_MORE_DATA = 234;
+    uint session;
+    int error = RmStartSession(out session, 0, new StringBuilder(33));
+    if (error != 0) throw new System.ComponentModel.Win32Exception(error);
+    try {
+      error = RmRegisterResources(session, (uint)files.Length, files, 0, IntPtr.Zero, 0, null);
+      if (error != 0) throw new System.ComponentModel.Win32Exception(error);
+      uint needed, count = 0, reasons;
+      ProcessInfo[] info = new ProcessInfo[0];
+      error = RmGetList(session, out needed, ref count, null, out reasons);
+      while (error == ERROR_MORE_DATA) {
+        info = new ProcessInfo[needed];
+        count = needed;
+        error = RmGetList(session, out needed, ref count, info, out reasons);
+      }
+      if (error != 0) throw new System.ComponentModel.Win32Exception(error);
+      var result = new List<string>();
+      string[] types = { "RmUnknownApp", "RmMainWindow", "RmOtherWindow", "RmService", "RmExplorer", "RmConsole" };
+      for (int i = 0; i < count; i++) {
+        var p = info[i];
+        string type = p.ApplicationType >= 0 && p.ApplicationType < types.Length
+          ? types[p.ApplicationType] : (p.ApplicationType == 1000 ? "RmCritical" : p.ApplicationType.ToString());
+        result.Add(string.Format("PID {0} {1}{2} ({3}, restartable: {4})", p.Process.dwProcessId, p.strAppName,
+          string.IsNullOrEmpty(p.strServiceShortName) ? "" : ": service " + p.strServiceShortName,
+          type, p.bRestartable));
+      }
+      if (reasons != 0) result.Add(string.Format("reboot reasons: 0x{0:x}", reasons));
+      return result.ToArray();
+    } finally {
+      RmEndSession(session);
+    }
+  }
+}
 '@
 
 function Fail([string]$message) { throw $message }
@@ -191,22 +270,103 @@ function Wait-Until([int]$seconds, [scriptblock]$condition) {
 
 # --- msiexec ---------------------------------------------------------
 
+# Кто держит файлы папки установки, по опросу Restart Manager. Только
+# вывод: держатели — не ошибка (шаг 11 их и проверяет), а сбой опроса
+# не должен ронять проверку. Служба журнала событий в списке ожидаема:
+# она держит файл сообщений, прочитав тексты событий (шаги 4 и 5). Но
+# msiexec этот файл не заменяет (у каждой версии свой, изменение
+# msi-message-file-in-use), и закрывать службу ему незачем: это
+# проверяет Assert-EventLogKept после каждого msiexec
+function Show-FilesInUse([string]$what) {
+  try {
+    if (-not (Test-Path $installDir)) { return }
+    $files = @(Get-ChildItem $installDir -Recurse -File -Force | ForEach-Object FullName)
+    if (-not $files) { return }
+    $holders = @([SmokeRestartManager]::Holders($files))
+    if (-not $holders) { Write-Host "files in use ${what}: none"; return }
+    Write-Host "files in use ${what}:"
+    $holders | ForEach-Object { Write-Host "  $_" }
+  } catch {
+    Write-Host "files in use ${what}: Restart Manager query failed: $_"
+  }
+}
+
+# Последние строки журнала msiexec, пока он пишется: журнал открыт
+# msiexec на запись, поэтому чтение — с FileShare.ReadWrite
+function Get-MsiLogTail([string]$log, [int]$count = 3) {
+  try {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.FileStream]::new($log, 'Open', 'Read', $share)
+    try {
+      $reader = [IO.StreamReader]::new($stream, $true)  # журнал в UTF-16 с BOM
+      return @($reader.ReadToEnd() -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last $count)
+    } finally {
+      $stream.Dispose()
+    }
+  } catch {
+    return @("(log is not readable: $($_.Exception.Message))")
+  }
+}
+
 # Без Start-Process -Wait: он ждёт и дочерние процессы, а Restart
-# Manager запускает exe заново, и ожидание длилось бы, пока exe работает
+# Manager запускает exe заново, и ожидание длилось бы, пока exe работает.
+# Журнал с «!» сбрасывается построчно: при зависании в нём последнее
+# действие, а не буфер. Пока msiexec работает, раз в минуту в вывод
+# шага идёт хвост журнала: если раннер перестанет отвечать и журналы
+# не выгрузятся (так было в прогоне 43027367514), видно, на чём встало
 function Invoke-Msi([string]$action, [string]$package, [string]$label, [int]$seconds = 600) {
   $script:msiCount++
   $log = Join-Path $LogDir ('{0:d2}-{1}.log' -f $script:msiCount, $label)
   $script:lastMsiLog = $log
-  $arguments = @($action, "`"$package`"", '/qn', '/norestart', '/l*v', "`"$log`"")
+  Show-FilesInUse "before msiexec $action ($label)"
+  $eventLog = Get-EventLogService
+  $arguments = @($action, "`"$package`"", '/qn', '/norestart', '/l*v!', "`"$log`"")
+  $started = Get-Date
   $process = Start-Process msiexec.exe -ArgumentList $arguments -PassThru
   $null = $process.Handle  # иначе ExitCode после выхода недоступен
-  if (-not $process.WaitForExit($seconds * 1000)) {
-    Show-MsiLog $log
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-    Fail "msiexec $action $label did not exit in $seconds s"
+  $deadline = $started.AddSeconds($seconds)
+  while (-not $process.WaitForExit([int][Math]::Max(0, [Math]::Min(60000, ($deadline - (Get-Date)).TotalMilliseconds)))) {
+    $elapsed = [int]((Get-Date) - $started).TotalSeconds
+    if ((Get-Date) -ge $deadline) {
+      Write-Host "::error::msiexec $action $label did not exit in $seconds s"
+      Show-FilesInUse "after $elapsed s of msiexec $action ($label)"
+      Show-MsiLog $log
+      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      Fail "msiexec $action $label did not exit in $seconds s"
+    }
+    Write-Host "msiexec $action ($label) still running after $elapsed s, log tail:"
+    Get-MsiLogTail $log | ForEach-Object { Write-Host "  $_" }
   }
-  Write-Host "msiexec $action $(Split-Path -Leaf $package) ($label) -> $($process.ExitCode)"
+  $elapsed = [Math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+  Write-Host "msiexec $action $(Split-Path -Leaf $package) ($label) -> $($process.ExitCode) in $elapsed s"
+  # Закрывал ли Restart Manager приложения: кого — в «files in use» выше
+  Get-Content $log -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match 'RESTART MANAGER: (Successfully|Failed|Did not|Previously)' } |
+    ForEach-Object { $_ -replace '^MSI .*?\]: ', '' } | Select-Object -Unique |
+    ForEach-Object { Write-Host "  $_" }
+  Assert-EventLogKept $eventLog "msiexec $action $label"
   return $process.ExitCode
+}
+
+# Служба журнала событий держит файл сообщений, прочитав тексты событий.
+# Если msiexec заменил бы его, Restart Manager остановил бы EventLog и
+# зависимые службы и запустил снова, и PID службы сменился бы
+function Get-EventLogService {
+  return Get-CimInstance Win32_Service -Filter "Name='EventLog'"
+}
+
+function Assert-EventLogKept($before, [string]$what) {
+  $after = Get-EventLogService
+  if ($after.State -ne 'Running' -or $after.ProcessId -ne $before.ProcessId) {
+    Fail "${what}: EventLog was restarted (PID $($before.ProcessId) -> $($after.ProcessId), $($after.State))"
+  }
+}
+
+# Строки Restart Manager о закрытии приложений. Имён в журнале при /qn
+# нет, поэтому проверяется сам факт закрытия
+function Get-RestartManagerShutdowns([string]$log) {
+  return @(Get-Content $log -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match 'RESTART MANAGER: (Successfully shut down|Previously shut down)' })
 }
 
 # Причина отказа — в подробном журнале msiexec: строки перед первым
@@ -244,15 +404,18 @@ function Uninstall-Msi([string]$package, [string]$label) {
 
 # Расхождения папки установки с папкой сборки, из которой собран MSI:
 # SHA-256 каждого файла, кроме bat-скриптов (их нет в пакете), и лишние
-# файлы, кроме .env
-function Compare-Install([string]$build, [string[]]$exclude = @()) {
+# файлы, кроме .env. Файл сообщений сборки ожидается под именем с версией
+# её MSI ($version); файл сообщений другой версии — не лишний: он
+# постоянный и должен совпадать с DLL сообщений своей сборки
+function Compare-Install([string]$build, [string]$version) {
   $expected = @{}
   # -Force: скрытые файлы WiX тоже включает в пакет
   Get-ChildItem $build -Recurse -File -Force | Where-Object Extension -ne '.bat' | ForEach-Object {
-    $expected[$_.FullName.Substring($build.Length + 1)] = $_.FullName
+    $relative = $_.FullName.Substring($build.Length + 1)
+    if ($relative -eq $buildMessageDll) { $relative = "FilePickerAPI.messages.$version.dll" }
+    $expected[$relative] = $_.FullName
   }
   $diff = foreach ($relative in $expected.Keys) {
-    if ($relative -in $exclude) { continue }
     $target = Join-Path $installDir $relative
     if (-not (Test-Path -LiteralPath $target)) { "missing $relative"; continue }
     if ((Get-FileHash -LiteralPath $target).Hash -ne (Get-FileHash -LiteralPath $expected[$relative]).Hash) {
@@ -261,15 +424,21 @@ function Compare-Install([string]$build, [string[]]$exclude = @()) {
   }
   $extra = Get-ChildItem $installDir -Recurse -File -Force | ForEach-Object {
     $relative = $_.FullName.Substring($installDir.Length + 1)
-    if ($relative -ne '.env' -and -not $expected.ContainsKey($relative)) { "extra $relative" }
+    if ($relative -eq '.env' -or $expected.ContainsKey($relative)) { return }
+    if (-not $messageFiles.ContainsKey($relative)) { "extra $relative"; return }
+    if ((Get-FileHash -LiteralPath $_.FullName).Hash -ne (Get-FileHash -LiteralPath $messageFiles[$relative]).Hash) {
+      "differs $relative"
+    }
   }
   return @($diff) + @($extra)
 }
 
-function Assert-Install([string]$build, [string]$what, [string[]]$exclude = @()) {
-  $diff = Compare-Install $build $exclude
+function Assert-Install([string]$build, [string]$version, [string]$what) {
+  $diff = Compare-Install $build $version
   if ($diff) { Fail "${what}: install folder does not match $(Split-Path -Leaf $build): $($diff -join ', ')" }
-  Pass "${what}: SHA-256 of all files match $(Split-Path -Leaf $build)$(if ($exclude) { " except $($exclude -join ', ')" })"
+  $others = @(Get-ChildItem $installDir -File -Filter 'FilePickerAPI.messages.*.dll' |
+    Where-Object Name -ne "FilePickerAPI.messages.$version.dll" | ForEach-Object Name)
+  Pass "${what}: SHA-256 of all files match $(Split-Path -Leaf $build)$(if ($others) { ", kept $($others -join ', ')" })"
 }
 
 function Get-FileVersion([string]$path) {
@@ -278,14 +447,19 @@ function Get-FileVersion([string]$path) {
   return "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart)"
 }
 
-function Assert-Registration([string]$what) {
+# Источник событий должен указывать на файл сообщений версии $version
+function Assert-MessageFile([string]$version, [string]$what) {
+  $expected = Join-Path $installDir "FilePickerAPI.messages.$version.dll"
+  $messageFile = (Get-ItemProperty $sourceKey -ErrorAction SilentlyContinue).EventMessageFile
+  if ($messageFile -ne $expected) { Fail "${what}: event source EventMessageFile is '$messageFile', expected '$expected'" }
+  if (-not (Test-Path -LiteralPath $expected)) { Fail "${what}: $expected is missing" }
+}
+
+function Assert-Registration([string]$version, [string]$what) {
   $value = (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).FilePickerAPI
   if ($value -ne "`"$exe`"") { Fail "${what}: Run value is '$value', expected '`"$exe`"'" }
-  $messageFile = (Get-ItemProperty $sourceKey -ErrorAction SilentlyContinue).EventMessageFile
-  if ($messageFile -ne (Join-Path $installDir $messageDll)) {
-    Fail "${what}: event source EventMessageFile is '$messageFile'"
-  }
-  Pass "${what}: Run value and event source are registered"
+  Assert-MessageFile $version $what
+  Pass "${what}: Run value is registered, event source points to the $version message file"
 }
 
 function Assert-EnvFile([string]$content, [string]$what) {
@@ -295,18 +469,16 @@ function Assert-EnvFile([string]$content, [string]$what) {
   Pass "${what}: .env is in place"
 }
 
-# Откат: удаление второго MSI и установка первого. Файл сообщений
-# постоянный и остаётся от второго MSI: в нём новейшая таблица
+# Откат: удаление второго MSI и установка первого. Файлы сообщений обеих
+# версий постоянные, а источник остаётся на файле второго MSI: в нём
+# новейшая таблица, и первый MSI регистрацию не переписывает
 function Invoke-Rollback([string]$what) {
   Uninstall-Msi $Msi2 "$what-remove-2"
   Install-Msi $Msi1 "$what-install-1"
   Assert-EnvFile $corsEnv "$what rollback"
-  Assert-Install $Build1 "$what rollback" @($messageDll)
-  $dll = Join-Path $installDir $messageDll
-  if ((Get-FileHash $dll).Hash -ne (Get-FileHash (Join-Path $Build2 $messageDll)).Hash) {
-    Fail "$what rollback: $messageDll is not the newest one"
-  }
-  Pass "$what rollback: $messageDll stays from the second MSI ($(Get-FileVersion $dll))"
+  Assert-Install $Build1 $FileVersion1 "$what rollback"
+  Assert-MessageFile $FileVersion2 "$what rollback"
+  Pass "$what rollback: event source stays on the $FileVersion2 message file"
 }
 
 # --- экземпляры сервиса ----------------------------------------------
@@ -472,9 +644,9 @@ try {
   # 1. Установка: файлы, значение Run, источник событий, без bat-скриптов
   Step '1. install'
   Install-Msi $Msi1 'install-1'
-  Assert-Install $Build1 'install'
+  Assert-Install $Build1 $FileVersion1 'install'
   if (Get-ChildItem $installDir -Recurse -File -Force -Filter *.bat) { Fail 'install: bat scripts are installed' }
-  Assert-Registration 'install'
+  Assert-Registration $FileVersion1 'install'
   if ((Get-FileVersion $exe) -ne $FileVersion1) { Fail "install: FILEVERSION is $(Get-FileVersion $exe), expected $FileVersion1" }
 
   # 2. Запуск без аргументов: версия сборки, папка филиала с раннера недоступна
@@ -523,16 +695,27 @@ try {
   # 6. Обновление остановленного сервиса, отказ той же и старой версии, откат
   Step '6. upgrade a stopped service'
   Set-Content $envFile $corsEnv -Encoding utf8NoBOM
+  # Шаги 2–5 читали тексты событий: служба журнала событий загрузила файл
+  # сообщений первого MSI и держит его. Обновление его не заменяет, а
+  # добавляет файл второй версии, поэтому Restart Manager никого не
+  # закрывает (сервис остановлен), и PID EventLog прежний (Invoke-Msi)
+  $eventLogPid = (Get-EventLogService).ProcessId
   Install-Msi $Msi2 'upgrade-2'
+  $shutdowns = Get-RestartManagerShutdowns $script:lastMsiLog
+  if ($shutdowns) {
+    $shutdowns | ForEach-Object { Write-Host "  $_" }
+    Fail 'upgrade: Restart Manager shut down applications holding files in use'
+  }
+  Pass "upgrade: EventLog keeps PID $eventLogPid, Restart Manager shut nothing down"
   Assert-EnvFile $corsEnv 'upgrade'
-  Assert-Registration 'upgrade'
-  Assert-Install $Build2 'upgrade'
+  Assert-Registration $FileVersion2 'upgrade'
+  Assert-Install $Build2 $FileVersion2 'upgrade'
   if ((Get-FileVersion $exe) -ne $FileVersion2) { Fail "upgrade: FILEVERSION is $(Get-FileVersion $exe), expected $FileVersion2" }
   foreach ($case in @(@($Msi1, 'older'), @($Msi2Rebuilt, 'same-version'))) {
     $code = Invoke-Msi '/i' $case[0] "refuse-$($case[1])"
     # Успех — и 1641, и 3010 (установлено, нужна перезагрузка)
     if ($code -in 0, 1641, 3010) { Fail "$($case[1]) MSI over the second one was installed ($code)" }
-    Assert-Install $Build2 "$($case[1]) MSI refused ($code)"
+    Assert-Install $Build2 $FileVersion2 "$($case[1]) MSI refused ($code)"
   }
   Invoke-Rollback 'stopped service'
   $evt = @(Get-ServiceEvents $startMark @(1001))[-1]
@@ -632,9 +815,9 @@ try {
   $code = Invoke-Msi '/i' $Msi2 'upgrade-running'
   Assert-MsiCode $code @(0, 3010) 'upgrade running'
   Assert-EnvFile $corsEnv 'upgrade running'
-  Assert-Registration 'upgrade running'
+  Assert-Registration $FileVersion2 'upgrade running'
   if ($code -eq 0) {
-    Assert-Install $Build2 'upgrade running'
+    Assert-Install $Build2 $FileVersion2 'upgrade running'
     Assert-EventText (Wait-ServiceEvent $mark 1001 30) @('Сервис остановлен: обновление или удаление программы') 'upgrade running'
     $owner = Wait-Until 60 { $id = Get-PortOwner; if ($id -and $id -ne $old.Id) { $id } }
     if (-not $owner) { Fail 'upgrade running: no new process listens on the port' }
@@ -662,7 +845,8 @@ try {
   $logMark = Get-LogLength
   $log = Join-Path $LogDir 'system-upgrade.log'
   $script:lastMsiLog = $log
-  $action = New-ScheduledTaskAction -Execute msiexec.exe -Argument "/i `"$Msi2`" /qn /norestart /l*v `"$log`""
+  Show-FilesInUse 'before msiexec /i (SYSTEM)'
+  $action = New-ScheduledTaskAction -Execute msiexec.exe -Argument "/i `"$Msi2`" /qn /norestart /l*v! `"$log`""
   Register-ScheduledTask $taskName -Action $action -User SYSTEM -RunLevel Highest -Force | Out-Null
   Start-ScheduledTask $taskName
   # 267009 — задача выполняется, 267011 — ещё не запускалась
@@ -676,11 +860,11 @@ try {
   Write-Host "msiexec /i (SYSTEM) -> $code"
   Assert-MsiCode $code @(0, 3010) 'SYSTEM upgrade'
   if ($code -eq 0) {
-    Assert-Install $Build2 'SYSTEM upgrade'
+    Assert-Install $Build2 $FileVersion2 'SYSTEM upgrade'
   } else {
-    # Сверяются все файлы, и файл сообщений тоже: после отката он от
-    # второго MSI, и фильтр ниже его допускает
-    $diff = @(Compare-Install $Build1) | Where-Object {
+    # Сверяются все файлы. Файлы сообщений обеих версий Compare-Install
+    # сверяет сам, остальные должны совпадать с первым или вторым MSI
+    $diff = @(Compare-Install $Build1 $FileVersion1) | Where-Object {
       $_ -notmatch '^differs (.+)$' -or
         (Get-FileHash (Join-Path $installDir $Matches[1])).Hash -ne (Get-FileHash (Join-Path $Build2 $Matches[1])).Hash
     }
@@ -711,18 +895,18 @@ try {
   Stop-Instance $old.Id 'after SYSTEM upgrade'
   Assert-EventText (Wait-ServiceEvent $mark 1001 15) @('Сервис остановлен: сообщение WM_CLOSE') 'after SYSTEM upgrade'
 
-  # 13. Удаление: значения Run нет, источник и файл сообщений остались
+  # 13. Удаление: значения Run нет, источник и файлы сообщений остались
   Step '13. uninstall'
   $code = Invoke-Msi '/x' $Msi2 'uninstall'
   Assert-MsiCode $code @(0, 3010) 'uninstall'
   if ($null -ne (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).FilePickerAPI) { Fail 'uninstall: Run value remains' }
-  if ((Get-ItemProperty $sourceKey -ErrorAction SilentlyContinue).EventMessageFile -ne (Join-Path $installDir $messageDll)) {
-    Fail 'uninstall: event source registration is removed'
+  Assert-MessageFile $FileVersion2 'uninstall'
+  foreach ($name in $messageFiles.Keys) {
+    if (-not (Test-Path -LiteralPath (Join-Path $installDir $name))) { Fail "uninstall: $name is removed" }
   }
-  if (-not (Test-Path (Join-Path $installDir $messageDll))) { Fail "uninstall: $messageDll is removed" }
   $evt = @(Get-ServiceEvents $startMark @(1000))[0]
   Assert-EventText $evt @("Сервис запущен: версия $AppVersion", $FilesDirectory) 'uninstall'
-  Pass 'uninstall: no Run value; event source and message file remain, 1000 is rendered'
+  Pass 'uninstall: no Run value; event source and message files remain, 1000 is rendered'
 
   # 14. run_test.bat из папки сборки архива
   Step '14. run_test.bat'

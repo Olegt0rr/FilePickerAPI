@@ -108,9 +108,21 @@ foreach ($object in $record, $view, $database, $installer) {
   if ($object) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($object) }
 }
 
+# Файл сообщений ставится под именем с версией пакета, а NEWERMESSAGEFILE
+# в пакете ищет файл версии больше X.Y.Z.0: версия DLL в VS_FIXEDFILEINFO
+# должна быть ровно версией пакета (изменение msi-message-file-in-use)
+$messageDll = Join-Path $Dist 'FilePickerAPI.messages.dll'
+if (-not (Test-Path -LiteralPath $messageDll)) { Fail "$messageDll is missing" }
+$info = (Get-Item -LiteralPath $messageDll).VersionInfo
+$dllVersion = "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart).$($info.FilePrivatePart)"
+if ($dllVersion -ne "$Version.0") { Fail "Message DLL version is $dllVersion, expected $Version.0" }
+
 # -Force: скрытые файлы шаблон Files тоже включает в пакет
 $expected = @(Get-ChildItem $Dist -Recurse -File -Force | Where-Object Extension -ne '.bat' |
-  ForEach-Object { "$($_.Name) $($_.Length)" })
+  ForEach-Object {
+    $name = if ($_.FullName -eq $messageDll) { "FilePickerAPI.messages.$Version.dll" } else { $_.Name }
+    "$name $($_.Length)"
+  })
 if (-not ($packaged -match '^FilePickerAPI\.exe ')) { Fail "FilePickerAPI.exe is missing from $Output" }
 # Сравнение отсортированных списков: имена в подпапках могут повторяться
 $packagedSorted = @($packaged | Sort-Object)
