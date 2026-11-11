@@ -158,10 +158,11 @@ context: |
   ## CI/CD
   - .github/workflows/build-exe.yml: ruff + pytest на Ubuntu и pytest на
     Windows (test-windows: проверки только для Windows, в том числе на
-    отдельном SMB-ресурсе раннера — TestSmbShare), затем сборка
-    Nuitka на Windows под каждый филиал из branches.toml (артефакты
-    FilePickerAPI-<филиал>) и пробная подпись одноразовым сертификатом
-    (sign-smoke, .github/scripts/sign.ps1)
+    отдельном SMB-ресурсе раннера — TestSmbShare), параллельно с ними
+    сборка Nuitka на Windows под каждый филиал из branches.toml
+    (артефакты FilePickerAPI-<филиал>), затем, после тестов и сборок,
+    пробная подпись одноразовым сертификатом (sign-smoke,
+    .github/scripts/sign.ps1)
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
     проверяет зависимости (audit.yml), подписывает в окружении
     code-signing и публикует FilePickerAPI-<филиал>.zip для каждого

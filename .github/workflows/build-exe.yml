@@ -21,41 +21,65 @@ on:
   workflow_call:
 
 jobs:
-  test:
+  # Список филиалов для матрицы сборки. Отдельный короткий джоб, чтобы
+  # сборки не ждали тестов: scripts/branches.py обходится стандартной
+  # библиотекой, зависимости проекта ему не нужны. Вывод сохраняем в
+  # переменную до echo: иначе ошибка в branches.toml потерялась бы в
+  # подстановке.
+  matrix:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
-    
+
     steps:
     - uses: actions/checkout@v7
       with:
-        fetch-depth: 0  # теги нужны setuptools-scm для версии
-    
+        sparse-checkout: |
+          /scripts/
+          /branches.toml
+        sparse-checkout-cone-mode: false
+
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
         python-version: '3.11'
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e .[dev]
-    
-    - name: Run ruff checks
-      run: |
-        ruff check app tests scripts
-        ruff format --check app tests scripts
-    
-    # Список филиалов для матрицы сборки. Вывод сохраняем в переменную
-    # до echo: иначе ошибка в branches.toml потерялась бы в подстановке.
+
     - name: Read branch list from branches.toml
       id: matrix
       run: |
         matrix="$(python scripts/branches.py matrix)"
         echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-    
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0  # теги нужны setuptools-scm для версии
+
+    # Кэш pip: wheel-файлы, скачанные и собранные в прошлых запусках
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.11'
+        cache: pip
+        cache-dependency-path: pyproject.toml
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[dev]
+
+    - name: Run ruff checks
+      run: |
+        ruff check app tests scripts
+        ruff format --check app tests scripts
+
     - name: Run tests with coverage
       run: |
         pytest
@@ -88,6 +112,8 @@ jobs:
       uses: actions/setup-python@v7
       with:
         python-version: '3.11'
+        cache: pip
+        cache-dependency-path: pyproject.toml
 
     - name: Install dependencies
       run: |
@@ -115,28 +141,37 @@ jobs:
         pytest
 
   # Отдельная сборка под каждый филиал из branches.toml: код один и тот
-  # же, отличается только зашитая директория с файлами.
+  # же, отличается только зашитая директория с файлами. Сборка идёт
+  # параллельно с тестами, а не после них: это самая долгая часть
+  # workflow. Без пройденных тестов workflow всё равно не проходит:
+  # sign-smoke ждёт и сборки, и тесты, а release.yml подписывает
+  # сборки, только когда этот workflow завершился целиком.
   build:
     name: build (${{ matrix.name }})
     runs-on: windows-latest
-    needs: [test, test-windows]
+    needs: matrix
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.test.outputs.matrix) }}
-    
+        include: ${{ fromJSON(needs.matrix.outputs.matrix) }}
+
     steps:
     - uses: actions/checkout@v7
       with:
         fetch-depth: 0  # теги нужны setuptools-scm для версии
-    
+
+    # Кэш pip, как в тестах, кроме релизной сборки (по тегу): она идёт на
+    # подпись и, как и без кэша Nuitka ниже, ставит пакеты без файлов из
+    # кэша других запусков (пустое значение cache кэш отключает)
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
         python-version: '3.11'
-    
+        cache: ${{ github.ref_type != 'tag' && 'pip' || '' }}
+        cache-dependency-path: pyproject.toml
+
     # setuptools и wheel обновляем так же, как в audit.yml: иначе в
     # сборке остался бы setuptools из Python 3.11, а аудит проверял бы
     # уже обновлённый.
@@ -398,9 +433,11 @@ jobs:
   # Прогоняет скрипт подписи из release.yml на этой же сборке, но с
   # одноразовым самоподписанным сертификатом: боевой сертификат доступен
   # только релизным тегам, а логику подписи нужно проверять в каждом PR.
+  # Ждёт и тесты: сборка их больше не ждёт, а успех последнего джоба
+  # должен по-прежнему значить, что прошли и тесты, и сборка.
   sign-smoke:
     runs-on: windows-latest
-    needs: build
+    needs: [build, test, test-windows]
     permissions:
       contents: read
 

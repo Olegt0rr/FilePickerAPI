@@ -40,10 +40,14 @@ jobs:
     steps:
     - uses: actions/checkout@v7
 
+    # Кэш pip ускоряет только скачивание: проверяется список
+    # установленных версий, а не то, откуда взяты файлы
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
         python-version: '3.11'
+        cache: pip
+        cache-dependency-path: pyproject.toml
 
     # Ставим все extras: в exe попадают основные зависимости, а dev и
     # build выполняются в CI и на машинах разработчиков. setuptools и
