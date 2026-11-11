@@ -60,9 +60,125 @@ jobs:
         path: dist/
         retention-days: 30
 
+  # MSI собирается из уже подписанных папок (design.md, «Подпись»), в
+  # отдельном джобе без окружения code-signing и без секретов: WiX из
+  # NuGet не работает рядом с сертификатом. Python здесь нет, поэтому
+  # версия MSI — имя тега без «v»: release.yml запускают только теги
+  # vX.Y.Z из цифр, а джоб build уже сверил тег с версией сборки;
+  # ограничения MSI 255.255.65535 проверяет build-msi.ps1.
+  msi:
+    runs-on: windows-latest
+    needs: sign
+    permissions:
+      contents: read
+
+    steps:
+    # Скрипт сборки, описание пакета и закреплённая версия WiX
+    - uses: actions/checkout@v7
+      with:
+        sparse-checkout: |
+          .config
+          installer
+          .github/scripts
+
+    # dist/FilePickerAPI-<филиал>/FilePickerAPI
+    - name: Download signed builds
+      uses: actions/download-artifact@v8
+      with:
+        name: signed-builds
+        path: dist/
+
+    # Тот же скрипт, что и в дымовой проверке build-exe.yml: он падает,
+    # если в пакет попали не все файлы сборки
+    - name: Build MSI packages
+      shell: pwsh
+      run: |
+        $version = $env:GITHUB_REF_NAME -replace '^v', ''
+        $builds = @(Get-ChildItem dist -Directory -Filter 'FilePickerAPI-*')
+        if (-not $builds) {
+          Write-Output '::error::No builds in the signed-builds artifact'
+          exit 1
+        }
+        # WiX ставится один раз на все филиалы
+        $install = $true
+        foreach ($build in $builds) {
+          $branch = $build.Name.Substring('FilePickerAPI-'.Length)
+          ./.github/scripts/build-msi.ps1 -Dist (Join-Path $build.FullName 'FilePickerAPI') `
+            -Branch $branch -Version $version -Output "msi/FilePickerAPI-$branch.msi" `
+            -SkipToolInstall:(-not $install)
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $install = $false
+        }
+        $packages = @(Get-ChildItem msi -File -Filter '*.msi')
+        if ($packages.Count -ne $builds.Count) {
+          Write-Output "::error::$($packages.Count) MSI packages for $($builds.Count) builds"
+          exit 1
+        }
+
+    - name: Upload MSI packages
+      uses: actions/upload-artifact@v7
+      with:
+        name: unsigned-msi
+        path: msi/
+        retention-days: 1
+
+  # Подпись MSI — в окружении code-signing, как и подпись файлов сборки.
+  # Пакеты пришли из джоба без секретов, поэтому сначала проверяем, что
+  # в артефакте только MSI филиалов: sign.ps1 подписал бы и любой
+  # другой exe или dll.
+  sign-msi:
+    runs-on: windows-latest
+    needs: msi
+    environment: code-signing
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        sparse-checkout: .github/scripts
+
+    - name: Download MSI packages
+      uses: actions/download-artifact@v8
+      with:
+        name: unsigned-msi
+        path: msi/
+
+    - name: Check MSI packages
+      shell: pwsh
+      run: |
+        $root = (Resolve-Path msi).Path
+        $files = @(Get-ChildItem $root -Recurse -Force)
+        $other = @($files | Where-Object {
+          $_.PSIsContainer -or $_.DirectoryName -ne $root -or
+            $_.Name -cnotmatch '^FilePickerAPI-[A-Za-z0-9_-]+\.msi$'
+        })
+        if ($other -or -not $files) {
+          $other | ForEach-Object { Write-Output "::error::Unexpected in the MSI artifact: $($_.FullName)" }
+          Write-Output "::error::The MSI artifact must contain only FilePickerAPI-<branch>.msi"
+          exit 1
+        }
+
+    # Подписываются только MSI: файлы внутри подписаны джобом sign
+    - name: Sign MSI packages
+      shell: pwsh
+      env:
+        CERT_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+        CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        TIMESTAMP_URL: http://timestamp.digicert.com
+        SIGN_PATH: msi
+      run: ./.github/scripts/sign.ps1
+
+    - name: Upload signed MSI packages
+      uses: actions/upload-artifact@v7
+      with:
+        name: signed-msi
+        path: msi/
+        retention-days: 30
+
   release:
     runs-on: ubuntu-latest
-    needs: sign
+    needs: [sign, sign-msi]
     permissions:
       contents: write
 
@@ -72,37 +188,75 @@ jobs:
       with:
         name: signed-builds
         path: ./dist/
-    
+
+    - name: Download signed MSI packages
+      uses: actions/download-artifact@v8
+      with:
+        name: signed-msi
+        path: ./msi/
+
     # Архив на каждый филиал: FilePickerAPI-<филиал>.zip с папкой
-    # FilePickerAPI внутри, как и раньше
+    # FilePickerAPI внутри, как и раньше; рядом — MSI того же филиала
     - name: Pack distributions
       run: |
+        set -euo pipefail
         mkdir release
+        count=0
         for dir in dist/FilePickerAPI-*/; do
           name="$(basename "$dir")"
           (cd "$dir" && zip -r "../../release/${name}.zip" FilePickerAPI)
+          if [ ! -f "msi/${name}.msi" ]; then
+            echo "::error::No signed MSI for ${name}"
+            exit 1
+          fi
+          cp "msi/${name}.msi" release/
+          count=$((count + 1))
         done
+        # Лишний MSI без архива — тоже ошибка: релиз должен совпадать
+        # со сборками этого тега
+        packages=$(find msi -type f | wc -l)
+        if [ "$count" -eq 0 ] || [ "$packages" -ne "$count" ]; then
+          echo "::error::$count builds, $packages MSI packages"
+          exit 1
+        fi
         ls -l release
-    
+
     - name: Create Release and Upload Assets
       uses: softprops/action-gh-release@v3
       with:
-        files: ./release/*.zip
+        files: |
+          ./release/*.zip
+          ./release/*.msi
         # Под body — список изменений GitHub с предыдущего релиза. Если
         # релиз уже создан через интерфейс (там нельзя создать только тег),
         # экшен обновляет его, и описание получается таким же
         generate_release_notes: true
         body: |
           ## FilePickerAPI ${{ github.ref_name }}
-          
-          ### Установка
-          
-          #### Windows
-          Для каждого филиала собран свой архив `FilePickerAPI-<код филиала>.zip`: директория с файлами зашита в сборку. Скачайте архив своего филиала и распакуйте его в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`). Все `exe`/`dll`/`pyd` в архиве подписаны.
 
-          Для запуска используйте один из bat-файлов из архива:
+          ### Установка
+
+          #### Windows: MSI
+          Для каждого филиала собран свой пакет `FilePickerAPI-<код филиала>.msi`: директория с файлами зашита в сборку. Пакет и все `exe`/`dll`/`pyd` в нём подписаны.
+
+          Установка — от администратора, на машину целиком:
+          - вручную: двойной щелчок по MSI;
+          - без вопросов: `msiexec /i FilePickerAPI-<код филиала>.msi /qn /norestart` (код 0 — установлено, 3010 — установлено, для завершения нужна перезагрузка);
+          - на много машин: GPO (назначение пакета компьютеру) или SCCM.
+
+          MSI ставит сервис в `C:\Program Files\FilePickerAPI\` и запускает его при входе любого пользователя от его имени, без окна. К сетевой папке филиала сервис обращается с учётными данными этого пользователя, поэтому право на чтение ресурса нужно пользователю. Сразу после установки сервис не запускается: он стартует при следующем входе, или пользователь может запустить `C:\Program Files\FilePickerAPI\FilePickerAPI.exe` сам.
+
+          - **Настройки** (`CORS_ORIGINS`) — в файле `.env` в `C:\Program Files\FilePickerAPI\`, его создаёт администратор; обновление MSI его сохраняет.
+          - **Обновление** — установка MSI новой версии поверх прежней.
+          - **Откат и смена филиала той же версии** — удалите продукт («Программы и компоненты» или `msiexec /x`) и установите нужный MSI: поверх той же или более новой версии MSI не ставится.
+          - **Журнал** — файл `%LOCALAPPDATA%\FilePickerAPI\logs\FilePickerAPI.log` пользователя и журнал Windows «Приложение», источник `FilePickerAPI`.
+
+          При переводе филиала на MSI удалите прежние задачу Планировщика или ярлык с `run_production.bat`.
+
+          #### Windows: архив и bat-скрипты (до перевода филиала на MSI)
+          Архив `FilePickerAPI-<код филиала>.zip` содержит ту же подписанную сборку. Распакуйте его в папку, куда у пользователей нет прав на запись (например, `C:\Program Files\FilePickerAPI`), и запускайте bat-файлы из архива:
           - **`run_test.bat`** - для тестирования (с консольным окном и выводом отладочной информации)
-          - **`run_production.bat`** - для продакшн работы (сервис в свёрнутом окне в фоне; скрипт проверяет, что сервис ответил, и пишет итог в `%LOCALAPPDATA%\FilePickerAPI\startup.log`, код выхода 0 — запущен, 1 — ошибка; нужен системный `curl.exe`, Windows 10 1803+)
+          - **`run_production.bat`** - для продакшн работы (сервис в фоне без окна; скрипт проверяет, что сервис ответил, и пишет итог в `%LOCALAPPDATA%\FilePickerAPI\startup.log`, код выхода 0 — запущен, 1 — ошибка; нужен системный `curl.exe`, Windows 10 1803+)
 
           #### Из исходного кода
           ```bash
