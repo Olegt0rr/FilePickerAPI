@@ -175,9 +175,16 @@ def unreachable_log(monkeypatch):
     )
 
 
+@pytest.fixture
+def console_window(monkeypatch):
+    """Процесс в окне консоли, как exe, запущенный из cmd."""
+    monkeypatch.setattr(runner, "has_console_window", lambda **_: True)
+
+
 class TestStart:
     """Собственный запуск: буфер, 1000, директория."""
 
+    @pytest.mark.usefixtures("console_window")
     def test_start_and_stop(self, service_env, evtlog, port, fake_serve, files_dir):
         """Проверить: 1000 после старта слушателя, 1001 при остановке,
         код 0, директория создана, Uvicorn на заданном адресе.
@@ -200,6 +207,34 @@ class TestStart:
         while not files_dir.is_dir() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert files_dir.is_dir()
+
+    @pytest.mark.usefixtures("service_env", "port", "fake_serve", "files_dir")
+    @pytest.mark.parametrize(
+        ("stderr_usable", "window", "launch"),
+        [
+            (True, True, "запуск из консоли"),
+            # Exe Nuitka без консоли: stderr на NUL, окна нет
+            (False, False, "запуск без окна"),
+            # stderr в канал или файл у процесса без окна
+            (True, False, "запуск без окна"),
+        ],
+    )
+    def test_launch_mode(self, evtlog, monkeypatch, stderr_usable, window, launch):
+        """Проверить: журнал идёт в stderr, если он пригоден, а способ
+        запуска в 1000 — по окну консоли, а не по stderr.
+        """
+        monkeypatch.setattr(runner, "ensure_std_streams", lambda: stderr_usable)
+        has_window = mock.Mock(return_value=window)
+        monkeypatch.setattr(runner, "has_console_window", has_window)
+        setup = mock.Mock(wraps=runner.setup_logging)
+        monkeypatch.setattr(runner, "setup_logging", setup)
+
+        assert runner.run() == 0
+
+        setup.assert_called_once_with(console=stderr_usable)
+        has_window.assert_called_once_with(stderr_usable=stderr_usable)
+        [started] = event_texts(evtlog, 1000)
+        assert launch in started
 
     @pytest.mark.usefixtures("files_dir")
     def test_listens_on_all_interfaces_port_8000(self, fake_serve, monkeypatch):
