@@ -269,6 +269,28 @@ class TestProductVersion:
             msi_version.product_version(version)
 
 
+class TestNextVersion:
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("2.3.1", "2.3.2"),
+            ("2.3.1.dev2+gaa7062aaa", "2.3.2"),
+            ("0.0.0", "0.0.1"),
+            ("255.255.65534", "255.255.65535"),
+        ],
+    )
+    def test_next(self, msi_version, version, expected):
+        assert msi_version.next_version(version) == expected
+
+    def test_out_of_limits(self, msi_version):
+        with pytest.raises(ValueError, match=r"255\.255\.65535"):
+            msi_version.next_version("2.3.65535")
+
+    def test_invalid(self, msi_version):
+        with pytest.raises(ValueError, match="не вида"):
+            msi_version.next_version("2.3")
+
+
 class TestProductVersionCli:
     def test_prints_product_version(self, msi_version, capsys):
         msi_version.main(["2.3.1.dev2+gaa7062aaa"])
@@ -279,7 +301,14 @@ class TestProductVersionCli:
         with pytest.raises(ValueError, match="ограничения"):
             msi_version.main(["256.0.0"])
 
-    @pytest.mark.parametrize("argv", [[], ["2.3.0", "2.4.0"]])
+    def test_prints_next_version(self, msi_version, capsys):
+        msi_version.main(["next", "2.3.1.dev2+gaa7062aaa"])
+
+        assert capsys.readouterr().out == "2.3.2\n"
+
+    @pytest.mark.parametrize(
+        "argv", [[], ["2.3.0", "2.4.0"], ["next", "2.3.0", "2.4.0"]]
+    )
     def test_usage_on_bad_arguments(self, msi_version, capsys, argv):
         with pytest.raises(SystemExit) as exc_info:
             msi_version.main(argv)
