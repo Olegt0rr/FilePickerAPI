@@ -9,6 +9,7 @@ import os
 import socket
 import struct
 import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -331,6 +332,45 @@ class TestRegisterApplicationRestart:
             winapi.register_application_restart()
 
 
+@pytest.fixture
+def msvcrt():
+    """Подменить msvcrt: дескриптор Windows — 1000 + номер fd."""
+    module = mock.Mock()
+    module.get_osfhandle.side_effect = lambda fd: 1000 + fd
+    with mock.patch.dict(sys.modules, {"msvcrt": module}):
+        yield module
+
+
+class TestConsole:
+    @pytest.mark.parametrize(
+        ("window", "expected"), [(0, False), (None, False), (0x1234, True)]
+    )
+    def test_has_console_window(self, kernel32, window, expected):
+        kernel32.GetConsoleWindow.return_value = window
+        assert winapi.has_console_window() is expected
+        assert kernel32.GetConsoleWindow.restype is ctypes.c_void_p
+
+    @pytest.mark.parametrize(
+        ("file_type", "console_mode", "null"),
+        [
+            # Файл или канал: не NUL
+            (1, 0, False),
+            # Символьное устройство с режимом консоли: консоль
+            (winapi.FILE_TYPE_CHAR, 1, False),
+            # Символьное устройство без режима консоли: NUL
+            (winapi.FILE_TYPE_CHAR, 0, True),
+        ],
+    )
+    @pytest.mark.usefixtures("msvcrt")
+    def test_is_null_device(self, kernel32, file_type, console_mode, null):
+        kernel32.GetFileType.return_value = file_type
+        kernel32.GetConsoleMode.return_value = console_mode
+        assert winapi.is_null_device(2) is null
+        kernel32.GetFileType.assert_called_once_with(1002)
+        assert kernel32.GetFileType.argtypes == (ctypes.c_void_p,)
+        assert kernel32.GetConsoleMode.argtypes[0] is ctypes.c_void_p
+
+
 @windows_only
 class TestWindows:
     def test_listener_pid(self):
@@ -373,3 +413,9 @@ class TestWindows:
         assert result == 0
         assert command_line.value == ""
         assert flags.value == winapi.RESTART_FLAGS
+
+    def test_null_device(self, tmp_path):
+        with Path(os.devnull).open("w", encoding="utf-8") as null:
+            assert winapi.is_null_device(null.fileno()) is True
+        with (tmp_path / "log.txt").open("w", encoding="utf-8") as file:
+            assert winapi.is_null_device(file.fileno()) is False

@@ -46,7 +46,7 @@ from app.logging_setup import (
     setup_logging,
     wait_event_log,
 )
-from app.stdio import ensure_std_streams, has_console_window
+from app.stdio import ensure_std_streams
 
 logger = logging.getLogger(__name__)
 
@@ -823,11 +823,15 @@ def run() -> int:
 
     Возвращает код выхода, только если _exit подменён (тесты).
     """
-    # Журнал в stderr — если он пригоден; способ запуска в 1000 — по
-    # окну консоли: без консоли Nuitka открывает stderr на NUL
     stderr_usable = ensure_std_streams()
     setup_logging(console=stderr_usable)
-    console = has_console_window(stderr_usable=stderr_usable)
+    # Способ запуска в 1000 — по окну консоли, а не по stderr: он бывает
+    # в канал или файл и у процесса без окна. Вне Windows — по stderr
+    console = stderr_usable
+    if _windows():
+        from app import winapi
+
+        console = winapi.has_console_window()
     # Напоминания о повторах приходят и без новых запросов
     event_tracking.start_timer()
 

@@ -20,6 +20,9 @@ RESTART_NO_HANG = 0x2
 RESTART_NO_REBOOT = 0x8
 RESTART_FLAGS = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT
 
+# GetFileType: символьное устройство (консоль, NUL, COM-порт)
+FILE_TYPE_CHAR = 0x0002
+
 AF_INET = 2
 AF_INET6 = 23
 # TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER: только слушающие сокеты
@@ -112,7 +115,7 @@ def _iphlpapi() -> ctypes.CDLL:
 
 @functools.cache
 def _kernel32() -> ctypes.CDLL:
-    """Загрузить kernel32, описать сигнатуру RegisterApplicationRestart.
+    """Загрузить kernel32 и описать сигнатуры нужных функций.
 
     Отдельный объект библиотеки, а не _kernel32() из
     app/handlers/files.py: сигнатуры — состояние объекта, и модули не
@@ -121,6 +124,15 @@ def _kernel32() -> ctypes.CDLL:
     kernel32 = ctypes.WinDLL("kernel32")
     kernel32.RegisterApplicationRestart.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32)
     kernel32.RegisterApplicationRestart.restype = ctypes.c_long
+    kernel32.GetConsoleWindow.argtypes = ()
+    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+    kernel32.GetFileType.argtypes = (ctypes.c_void_p,)
+    kernel32.GetFileType.restype = ctypes.c_uint32
+    kernel32.GetConsoleMode.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    kernel32.GetConsoleMode.restype = ctypes.c_int
     return kernel32
 
 
@@ -230,3 +242,31 @@ def register_application_restart() -> None:
     if result:
         msg = f"RegisterApplicationRestart failed: HRESULT 0x{result & 0xFFFFFFFF:08X}"
         raise OSError(None, msg)
+
+
+def has_console_window() -> bool:
+    """Проверить: у процесса есть окно консоли (GetConsoleWindow).
+
+    В сборке Nuitka с --windows-console-mode=attach окно есть, если exe
+    присоединился к консоли родителя: запущен из cmd, PowerShell,
+    Windows Terminal или bat-файла. При входе пользователя и двойным
+    щелчком консоли нет. Консоль, созданная без окна (CREATE_NO_WINDOW),
+    окна тоже не даёт.
+    """
+    return bool(_kernel32().GetConsoleWindow())
+
+
+def is_null_device(fd: int) -> bool:
+    """Проверить: дескриптор ведёт на устройство NUL.
+
+    У NUL, как и у консоли, тип символьного устройства, но
+    GetConsoleMode на нём не срабатывает.
+    """
+    import msvcrt
+
+    handle = msvcrt.get_osfhandle(fd)
+    kernel32 = _kernel32()
+    if kernel32.GetFileType(handle) != FILE_TYPE_CHAR:
+        return False
+    mode = ctypes.c_uint32()
+    return not kernel32.GetConsoleMode(handle, ctypes.byref(mode))

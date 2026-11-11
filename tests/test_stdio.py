@@ -1,111 +1,69 @@
-"""Тесты стандартных потоков и определения консоли (app/stdio.py)."""
+"""Тесты стандартных потоков и определения консоли.
 
-import ctypes
+Функции WinAPI проверяются в tests/test_winapi.py; здесь — что из них
+следует для потоков, и отдельные процессы без консоли и с ней.
+"""
+
 import json
 import os
 import subprocess
 import sys
-import types
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from app import stdio
+from app import stdio, winapi
 from tests.conftest import ROOT, child_env
 from tests.platforms import linux_only, windows_only
-
-# Тип файла «диск» в GetFileType
-FILE_TYPE_DISK = 0x0001
-
-
-class FakeKernel32:
-    """Поддельный kernel32: тип файла, режим консоли, окно консоли."""
-
-    def __init__(self, *, file_type=FILE_TYPE_DISK, console_mode=False, window=0):
-        self.file_type = file_type
-        self.console_mode = console_mode
-        self.window = window
-        self.handles = []
-
-    def GetFileType(self, handle):  # noqa: N802 - имя функции WinAPI
-        self.handles.append(handle)
-        return self.file_type
-
-    def GetConsoleMode(self, handle, _mode):  # noqa: N802 - имя функции WinAPI
-        self.handles.append(handle)
-        return int(self.console_mode)
-
-    def GetConsoleWindow(self):  # noqa: N802 - имя функции WinAPI
-        return self.window
-
-
-@pytest.fixture
-def fake_windows(monkeypatch):
-    """Windows с поддельными kernel32 и msvcrt; даёт установщик."""
-    monkeypatch.setattr(sys, "platform", "win32")
-    msvcrt = types.ModuleType("msvcrt")
-    msvcrt.get_osfhandle = lambda fd: 1000 + fd
-    monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
-
-    def install(**kwargs):
-        kernel32 = FakeKernel32(**kwargs)
-        monkeypatch.setattr(stdio, "_kernel32", lambda: kernel32)
-        return kernel32
-
-    return install
 
 
 class TestNullDevice:
     """Поток на устройстве NUL непригоден на Windows."""
 
-    @pytest.mark.parametrize(
-        ("file_type", "console_mode", "null"),
-        [
-            # Файл или канал: не NUL
-            (FILE_TYPE_DISK, False, False),
-            # Символьное устройство с режимом консоли: консоль
-            (stdio.FILE_TYPE_CHAR, True, False),
-            # Символьное устройство без режима консоли: NUL
-            (stdio.FILE_TYPE_CHAR, False, True),
-        ],
-    )
-    def test_null_device_detection(self, fake_windows, file_type, console_mode, null):
-        """Проверить: NUL — символьное устройство без режима консоли;
-        дескриптор передаётся в WinAPI через get_osfhandle.
+    @pytest.mark.parametrize("null", [False, True])
+    def test_windows(self, monkeypatch, tmp_path, null):
+        """Проверить: на Windows пригодность потока зависит от
+        is_null_device с его дескриптором.
         """
-        kernel32 = fake_windows(file_type=file_type, console_mode=console_mode)
+        monkeypatch.setattr(sys, "platform", "win32")
+        is_null = mock.Mock(return_value=null)
+        monkeypatch.setattr(winapi, "is_null_device", is_null)
 
-        assert stdio._is_null_device(2) is null  # noqa: SLF001
+        with (tmp_path / "log.txt").open("w", encoding="utf-8") as stream:
+            assert stdio._stream_is_unusable(stream) is null  # noqa: SLF001
+            is_null.assert_called_once_with(stream.fileno())
 
-        assert set(kernel32.handles) == {1002}
+    def test_not_windows(self, monkeypatch, tmp_path):
+        """Проверить: вне Windows NUL не проверяется."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(
+            winapi, "is_null_device", mock.Mock(side_effect=AssertionError)
+        )
 
-    def test_null_stream_replaced(self, fake_windows, monkeypatch, tmp_path):
+        with (tmp_path / "log.txt").open("w", encoding="utf-8") as stream:
+            assert stdio._stream_is_unusable(stream) is False  # noqa: SLF001
+
+    def test_null_stderr_replaced(self, monkeypatch, tmp_path):
         """Проверить: stderr на NUL (exe Nuitka без консоли) заменяется
         на os.devnull, и ensure_std_streams() сообщает, что он
-        непригоден.
+        непригоден; пригодный stdout остаётся.
         """
-        fake_windows(file_type=stdio.FILE_TYPE_CHAR)
         null = (tmp_path / "nul").open("w", encoding="utf-8")
+        stdout = (tmp_path / "out").open("w", encoding="utf-8")
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(winapi, "is_null_device", lambda fd: fd == null.fileno())
         monkeypatch.setattr(sys, "stderr", null)
-        monkeypatch.setattr(sys, "stdout", null)
+        monkeypatch.setattr(sys, "stdout", stdout)
 
         try:
             assert stdio.ensure_std_streams() is False
-            assert sys.stderr is not null
+            assert sys.stdout is stdout
             assert sys.stderr.name == os.devnull
-            assert sys.stdout.name == os.devnull
         finally:
             sys.stderr.close()
-            sys.stdout.close()
+            stdout.close()
             null.close()
-
-    def test_not_windows(self, monkeypatch):
-        """Проверить: вне Windows NUL не проверяется."""
-        monkeypatch.setattr(sys, "platform", "linux")
-        monkeypatch.setattr(stdio, "_kernel32", mock.Mock(side_effect=AssertionError))
-
-        assert stdio._is_null_device(2) is False  # noqa: SLF001
 
     @windows_only
     def test_real_null_device(self, tmp_path):
@@ -124,52 +82,14 @@ class TestNullDevice:
             assert stdio._stream_is_unusable(null) is False  # noqa: SLF001
 
 
-class TestConsoleWindow:
-    """Способ запуска: по окну консоли, а не по stderr."""
-
-    @pytest.mark.parametrize(
-        ("window", "expected"), [(0, False), (None, False), (0x1234, True)]
-    )
-    @pytest.mark.parametrize("stderr_usable", [False, True])
-    def test_windows(self, fake_windows, window, expected, stderr_usable):
-        """Проверить: на Windows признак — GetConsoleWindow(),
-        пригодность stderr не важна.
-        """
-        fake_windows(window=window)
-
-        assert stdio.has_console_window(stderr_usable=stderr_usable) is expected
-
-    @pytest.mark.parametrize("stderr_usable", [False, True])
-    def test_not_windows(self, monkeypatch, stderr_usable):
-        """Проверить: вне Windows признак — пригодность stderr."""
-        monkeypatch.setattr(sys, "platform", "linux")
-        monkeypatch.setattr(stdio, "_kernel32", mock.Mock(side_effect=AssertionError))
-
-        assert stdio.has_console_window(stderr_usable=stderr_usable) is stderr_usable
-
-    def test_kernel32_signatures(self, monkeypatch):
-        """Проверить: у функций kernel32 объявлены типы (дескрипторы —
-        указатели, а не int).
-        """
-        win_dll = mock.Mock()
-        monkeypatch.setattr(ctypes, "WinDLL", win_dll, raising=False)
-
-        kernel32 = stdio._kernel32()  # noqa: SLF001
-
-        win_dll.assert_called_once_with("kernel32", use_last_error=True)
-        assert kernel32.GetConsoleWindow.restype is ctypes.c_void_p
-        assert kernel32.GetFileType.argtypes == (ctypes.c_void_p,)
-        assert kernel32.GetConsoleMode.argtypes[0] is ctypes.c_void_p
-
-
 # Дочерний процесс сообщает, что увидел, через файл: его потоков нет
 CHILD_SCRIPT = """
 import json, sys
-from app.stdio import ensure_std_streams, has_console_window
-usable = ensure_std_streams()
+from app import winapi
+from app.stdio import ensure_std_streams
 result = {
-    "usable": usable,
-    "window": has_console_window(stderr_usable=usable),
+    "usable": ensure_std_streams(),
+    "window": winapi.has_console_window(),
 }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     json.dump(result, f)
@@ -200,7 +120,7 @@ class TestChildProcess:
 
     def test_detached_without_streams(self, tmp_path):
         """Проверить: без консоли и с потоками на NUL (так exe Nuitka
-        запускается при входе) — «без окна», журнал в stderr не идёт.
+        запускается при входе) — без окна, журнал в stderr не идёт.
         """
         result = run_child(tmp_path, creationflags=subprocess.DETACHED_PROCESS)
 
@@ -214,7 +134,7 @@ class TestChildProcess:
 
     def test_detached_with_redirected_stderr(self, tmp_path):
         """Проверить: stderr в файл у процесса без консоли — журнал в
-        него идёт, но запуск всё равно «без окна».
+        него идёт, но запуск всё равно без окна.
         """
         with (tmp_path / "stderr.txt").open("w", encoding="utf-8") as stderr:
             result = run_child(
@@ -224,7 +144,13 @@ class TestChildProcess:
         assert result == {"usable": True, "window": False}
 
     def test_console_window(self, tmp_path):
-        """Проверить: в своём (скрытом) окне консоли — «из консоли»."""
+        """Проверить: в своём окне консоли — из консоли.
+
+        Окно скрыто (SW_HIDE), чтобы тест ничего не показывал. Окно
+        есть и у скрытой консоли, и на рабочем столе службы (раннер
+        CI), а при терминале по умолчанию Windows Terminal — его
+        псевдоокно; GetConsoleWindow() во всех случаях не 0.
+        """
         startupinfo = subprocess.STARTUPINFO(
             dwFlags=subprocess.STARTF_USESHOWWINDOW, wShowWindow=0
         )

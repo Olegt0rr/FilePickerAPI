@@ -27,7 +27,14 @@ import pytest
 from fastapi import FastAPI
 
 import app
-from app import event_tracking, instance_check, logging_setup, runner, stop_signals
+from app import (
+    event_tracking,
+    instance_check,
+    logging_setup,
+    runner,
+    stop_signals,
+    winapi,
+)
 from app.instance_check import Probe, ProbeResult
 from tests.conftest import child_env, flush_event_logs, start_then_stop, wait_for
 from tests.platforms import linux_only, windows_only
@@ -178,7 +185,7 @@ def unreachable_log(monkeypatch):
 @pytest.fixture
 def console_window(monkeypatch):
     """Процесс в окне консоли, как exe, запущенный из cmd."""
-    monkeypatch.setattr(runner, "has_console_window", lambda **_: True)
+    monkeypatch.setattr(winapi, "has_console_window", lambda: True)
 
 
 class TestStart:
@@ -210,29 +217,37 @@ class TestStart:
 
     @pytest.mark.usefixtures("service_env", "port", "fake_serve", "files_dir")
     @pytest.mark.parametrize(
-        ("stderr_usable", "window", "launch"),
+        ("windows", "stderr_usable", "window", "launch"),
         [
-            (True, True, "запуск из консоли"),
+            (True, True, True, "запуск из консоли"),
             # Exe Nuitka без консоли: stderr на NUL, окна нет
-            (False, False, "запуск без окна"),
+            (True, False, False, "запуск без окна"),
             # stderr в канал или файл у процесса без окна
-            (True, False, "запуск без окна"),
+            (True, True, False, "запуск без окна"),
+            # Вне Windows окно не проверяется: признак — stderr
+            (False, True, False, "запуск из консоли"),
+            (False, False, True, "запуск без окна"),
         ],
     )
-    def test_launch_mode(self, evtlog, monkeypatch, stderr_usable, window, launch):
+    def test_launch_mode(  # noqa: PLR0913, PLR0917 - параметры случая
+        self, evtlog, monkeypatch, windows, stderr_usable, window, launch
+    ):
         """Проверить: журнал идёт в stderr, если он пригоден, а способ
-        запуска в 1000 — по окну консоли, а не по stderr.
+        запуска в 1000 на Windows — по окну консоли, а не по stderr.
         """
+        monkeypatch.setattr(runner, "_windows", lambda: windows)
         monkeypatch.setattr(runner, "ensure_std_streams", lambda: stderr_usable)
         has_window = mock.Mock(return_value=window)
-        monkeypatch.setattr(runner, "has_console_window", has_window)
+        monkeypatch.setattr(winapi, "has_console_window", has_window)
+        # Перезапуск после обновления — только у собранного exe
+        monkeypatch.setattr(runner, "_compiled", lambda: False)
         setup = mock.Mock(wraps=runner.setup_logging)
         monkeypatch.setattr(runner, "setup_logging", setup)
 
         assert runner.run() == 0
 
         setup.assert_called_once_with(console=stderr_usable)
-        has_window.assert_called_once_with(stderr_usable=stderr_usable)
+        assert has_window.call_count == int(windows)
         [started] = event_texts(evtlog, 1000)
         assert launch in started
 
