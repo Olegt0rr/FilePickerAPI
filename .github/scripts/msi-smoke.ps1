@@ -678,7 +678,9 @@ try {
   if ($code -eq 0) {
     Assert-Install $Build2 'SYSTEM upgrade'
   } else {
-    $diff = @(Compare-Install $Build1 @($messageDll)) | Where-Object {
+    # Сверяются все файлы, и файл сообщений тоже: после отката он от
+    # второго MSI, и фильтр ниже его допускает
+    $diff = @(Compare-Install $Build1) | Where-Object {
       $_ -notmatch '^differs (.+)$' -or
         (Get-FileHash (Join-Path $installDir $Matches[1])).Hash -ne (Get-FileHash (Join-Path $Build2 $Matches[1])).Hash
     }
