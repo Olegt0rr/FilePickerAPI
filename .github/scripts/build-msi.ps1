@@ -38,6 +38,14 @@ function Invoke-Native([string]$what, [scriptblock]$command) {
 }
 
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { Fail "Version '$Version' is not X.Y.Z" }
+# Ограничения ProductVersion, как в scripts/msi_version.py: в релизе
+# версия берётся из имени тега без Python, и проверить её некому, кроме
+# этого скрипта
+$limits = 255, 255, 65535
+$numbers = $Version.Split('.') | ForEach-Object { [decimal]$_ }
+for ($i = 0; $i -lt 3; $i++) {
+  if ($numbers[$i] -gt $limits[$i]) { Fail "Version '$Version' exceeds the MSI limits 255.255.65535" }
+}
 if ($Branch -notmatch '^[A-Za-z0-9_-]+$') { Fail "Invalid branch name '$Branch'" }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
