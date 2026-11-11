@@ -169,8 +169,12 @@ jobs:
     name: build (${{ matrix.name }})
     runs-on: windows-latest
     needs: matrix
+    # Обычно 5–9 минут. Срок шага (timeout-minutes у «MSI smoke test»)
+    # соблюдает сам раннер: если он перестал отвечать, шаг висит до
+    # отмены вручную (прогон 43027367514). Срок джоба отменяет GitHub
     permissions:
       contents: read
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

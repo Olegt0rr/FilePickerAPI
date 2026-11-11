@@ -171,6 +171,77 @@ public sealed class Detached {
     get { uint code; GetExitCodeProcess(handle, out code); return (int)code; }
   }
 }
+
+// Кого Restart Manager закрыл бы ради замены файлов: тот же опрос
+// (RmRegisterResources и RmGetList), что делает msiexec в InstallValidate.
+// Имён в журнале msiexec при /qn нет, только «Successfully shut down»
+public static class SmokeRestartManager {
+  [StructLayout(LayoutKind.Sequential)]
+  struct UniqueProcess {
+    public int dwProcessId;
+    public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+  }
+
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct ProcessInfo {
+    public UniqueProcess Process;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+    public int ApplicationType;
+    public uint AppStatus;
+    public uint TSSessionId;
+    [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+  }
+
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  static extern int RmStartSession(out uint session, int flags, StringBuilder key);
+
+  [DllImport("rstrtmgr.dll")]
+  static extern int RmEndSession(uint session);
+
+  [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+  static extern int RmRegisterResources(uint session, uint fileCount, string[] files,
+    uint applicationCount, IntPtr applications, uint serviceCount, string[] services);
+
+  [DllImport("rstrtmgr.dll")]
+  static extern int RmGetList(uint session, out uint needed, ref uint count,
+    [In, Out] ProcessInfo[] info, out uint rebootReasons);
+
+  // Строки «PID 123 Windows Event Log: service EventLog (RmService, …)»
+  public static string[] Holders(string[] files) {
+    const int ERROR_MORE_DATA = 234;
+    uint session;
+    int error = RmStartSession(out session, 0, new StringBuilder(33));
+    if (error != 0) throw new System.ComponentModel.Win32Exception(error);
+    try {
+      error = RmRegisterResources(session, (uint)files.Length, files, 0, IntPtr.Zero, 0, null);
+      if (error != 0) throw new System.ComponentModel.Win32Exception(error);
+      uint needed, count = 0, reasons;
+      ProcessInfo[] info = new ProcessInfo[0];
+      error = RmGetList(session, out needed, ref count, null, out reasons);
+      while (error == ERROR_MORE_DATA) {
+        info = new ProcessInfo[needed];
+        count = needed;
+        error = RmGetList(session, out needed, ref count, info, out reasons);
+      }
+      if (error != 0) throw new System.ComponentModel.Win32Exception(error);
+      var result = new List<string>();
+      string[] types = { "RmUnknownApp", "RmMainWindow", "RmOtherWindow", "RmService", "RmExplorer", "RmConsole" };
+      for (int i = 0; i < count; i++) {
+        var p = info[i];
+        string type = p.ApplicationType >= 0 && p.ApplicationType < types.Length
+          ? types[p.ApplicationType] : (p.ApplicationType == 1000 ? "RmCritical" : p.ApplicationType.ToString());
+        result.Add(string.Format("PID {0} {1}{2} ({3}, restartable: {4})", p.Process.dwProcessId, p.strAppName,
+          string.IsNullOrEmpty(p.strServiceShortName) ? "" : ": service " + p.strServiceShortName,
+          type, p.bRestartable));
+      }
+      if (reasons != 0) result.Add(string.Format("reboot reasons: 0x{0:x}", reasons));
+      return result.ToArray();
+    } finally {
+      RmEndSession(session);
+    }
+  }
+}
 '@
 
 function Fail([string]$message) { throw $message }
@@ -191,21 +262,77 @@ function Wait-Until([int]$seconds, [scriptblock]$condition) {
 
 # --- msiexec ---------------------------------------------------------
 
+# Кто держит файлы папки установки, по опросу Restart Manager. Только
+# вывод: держатели — не ошибка (шаг 11 их и проверяет), а сбой опроса
+# не должен ронять проверку. Служба журнала событий в списке значит,
+# что msiexec её остановит и запустит снова: она держит файл сообщений,
+# прочитав тексты событий (шаги 4 и 5), а шаг 6 этот файл заменяет
+function Show-FilesInUse([string]$what) {
+  try {
+    if (-not (Test-Path $installDir)) { return }
+    $files = @(Get-ChildItem $installDir -Recurse -File -Force | ForEach-Object FullName)
+    if (-not $files) { return }
+    $holders = @([SmokeRestartManager]::Holders($files))
+    if (-not $holders) { Write-Host "files in use ${what}: none"; return }
+    Write-Host "files in use ${what}:"
+    $holders | ForEach-Object { Write-Host "  $_" }
+  } catch {
+    Write-Host "files in use ${what}: Restart Manager query failed: $_"
+  }
+}
+
+# Последние строки журнала msiexec, пока он пишется: журнал открыт
+# msiexec на запись, поэтому чтение — с FileShare.ReadWrite
+function Get-MsiLogTail([string]$log, [int]$count = 3) {
+  try {
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stream = [IO.FileStream]::new($log, 'Open', 'Read', $share)
+    try {
+      $reader = [IO.StreamReader]::new($stream, $true)  # журнал в UTF-16 с BOM
+      return @($reader.ReadToEnd() -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last $count)
+    } finally {
+      $stream.Dispose()
+    }
+  } catch {
+    return @("(log is not readable: $($_.Exception.Message))")
+  }
+}
+
 # Без Start-Process -Wait: он ждёт и дочерние процессы, а Restart
-# Manager запускает exe заново, и ожидание длилось бы, пока exe работает
+# Manager запускает exe заново, и ожидание длилось бы, пока exe работает.
+# Журнал с «!» сбрасывается построчно: при зависании в нём последнее
+# действие, а не буфер. Пока msiexec работает, раз в минуту в вывод
+# шага идёт хвост журнала: если раннер перестанет отвечать и журналы
+# не выгрузятся (так было в прогоне 43027367514), видно, на чём встало
 function Invoke-Msi([string]$action, [string]$package, [string]$label, [int]$seconds = 600) {
   $script:msiCount++
   $log = Join-Path $LogDir ('{0:d2}-{1}.log' -f $script:msiCount, $label)
   $script:lastMsiLog = $log
-  $arguments = @($action, "`"$package`"", '/qn', '/norestart', '/l*v', "`"$log`"")
+  Show-FilesInUse "before msiexec $action ($label)"
+  $arguments = @($action, "`"$package`"", '/qn', '/norestart', '/l*v!', "`"$log`"")
+  $started = Get-Date
   $process = Start-Process msiexec.exe -ArgumentList $arguments -PassThru
   $null = $process.Handle  # иначе ExitCode после выхода недоступен
-  if (-not $process.WaitForExit($seconds * 1000)) {
-    Show-MsiLog $log
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-    Fail "msiexec $action $label did not exit in $seconds s"
+  $deadline = $started.AddSeconds($seconds)
+  while (-not $process.WaitForExit([int][Math]::Max(0, [Math]::Min(60000, ($deadline - (Get-Date)).TotalMilliseconds)))) {
+    $elapsed = [int]((Get-Date) - $started).TotalSeconds
+    if ((Get-Date) -ge $deadline) {
+      Write-Host "::error::msiexec $action $label did not exit in $seconds s"
+      Show-FilesInUse "after $elapsed s of msiexec $action ($label)"
+      Show-MsiLog $log
+      Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+      Fail "msiexec $action $label did not exit in $seconds s"
+    }
+    Write-Host "msiexec $action ($label) still running after $elapsed s, log tail:"
+    Get-MsiLogTail $log | ForEach-Object { Write-Host "  $_" }
   }
-  Write-Host "msiexec $action $(Split-Path -Leaf $package) ($label) -> $($process.ExitCode)"
+  $elapsed = [Math]::Round(((Get-Date) - $started).TotalSeconds, 1)
+  Write-Host "msiexec $action $(Split-Path -Leaf $package) ($label) -> $($process.ExitCode) in $elapsed s"
+  # Закрывал ли Restart Manager приложения: кого — в «files in use» выше
+  Get-Content $log -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match 'RESTART MANAGER: (Successfully|Failed|Did not|Previously)' } |
+    ForEach-Object { $_ -replace '^MSI .*?\]: ', '' } | Select-Object -Unique |
+    ForEach-Object { Write-Host "  $_" }
   return $process.ExitCode
 }
 
@@ -663,7 +790,8 @@ try {
   $logMark = Get-LogLength
   $log = Join-Path $LogDir 'system-upgrade.log'
   $script:lastMsiLog = $log
-  $action = New-ScheduledTaskAction -Execute msiexec.exe -Argument "/i `"$Msi2`" /qn /norestart /l*v `"$log`""
+  Show-FilesInUse 'before msiexec /i (SYSTEM)'
+  $action = New-ScheduledTaskAction -Execute msiexec.exe -Argument "/i `"$Msi2`" /qn /norestart /l*v! `"$log`""
   Register-ScheduledTask $taskName -Action $action -User SYSTEM -RunLevel Highest -Force | Out-Null
   Start-ScheduledTask $taskName
   # 267009 — задача выполняется, 267011 — ещё не запускалась
