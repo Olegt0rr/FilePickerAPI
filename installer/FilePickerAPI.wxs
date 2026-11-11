@@ -66,9 +66,10 @@
     <ComponentGroup Id="Product" Directory="InstallDir">
       <!-- Вся папка сборки Nuitka. bat-скрипты нужны только для запуска
            по-старому из архива, файл сообщений ставится отдельно.
-           Шаблоны исключений пробной сборкой не проверены, а дымовой
-           проверки MSI в CI ещё нет: отсутствие bat-скриптов в пакете
-           должна проверять .github/scripts/msi-smoke.ps1 (задача 6.3) -->
+           Шаблоны исключений пробной сборкой не проверены: состав
+           пакета сверяет с папкой сборки .github/scripts/build-msi.ps1,
+           а отсутствие bat-скриптов после установки —
+           .github/scripts/msi-smoke.ps1 -->
       <Files Include="$(var.Dist)\**">
         <Exclude Files="$(var.Dist)\**\*.bat" />
         <Exclude Files="$(var.Dist)\FilePickerAPI.messages.dll" />

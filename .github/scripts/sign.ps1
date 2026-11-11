@@ -1,5 +1,5 @@
-# Подписывает все неподписанные PE-файлы (exe, dll, pyd) в папке сборки
-# сертификатом Authenticode и проверяет результат.
+# Подписывает все неподписанные PE-файлы (exe, dll, pyd) и пакеты MSI
+# в папке сборки сертификатом Authenticode и проверяет результат.
 #
 # Входные данные берутся из переменных окружения:
 #   CERT_PFX_BASE64 — PFX сертификата подписи кода в base64
@@ -7,6 +7,7 @@
 #   TIMESTAMP_URL   — RFC 3161 сервер меток времени
 #   SIGN_PATH       — папка со сборками (по умолчанию dist: сборки всех
 #                     филиалов, dist/FilePickerAPI-<филиал>/FilePickerAPI)
+#                     или папка с MSI (FilePickerAPI-<филиал>.msi)
 #
 # Используется в release.yml (боевой сертификат) и в build-exe.yml
 # (одноразовый сертификат, чтобы проверять логику подписи в каждом PR).
@@ -38,7 +39,7 @@ $thumbprint = $signingCert.Thumbprint
 $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
   Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
 
-$binaries = Get-ChildItem $signPath -Recurse -File -Include *.exe, *.dll, *.pyd
+$binaries = Get-ChildItem $signPath -Recurse -File -Include *.exe, *.dll, *.pyd, *.msi
 $status = @{}
 $binaries | ForEach-Object { $status[$_.FullName] = (Get-AuthenticodeSignature $_.FullName).Status }
 
