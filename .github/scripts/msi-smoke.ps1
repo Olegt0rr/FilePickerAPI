@@ -41,6 +41,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'smoke-common.ps1')
 $Msi1, $Msi2, $Msi2Rebuilt, $Build1, $Build2, $BuildDir =
   $Msi1, $Msi2, $Msi2Rebuilt, $Build1, $Build2, $BuildDir | ForEach-Object { (Resolve-Path $_).Path }
 New-Item -ItemType Directory -Force $LogDir | Out-Null
@@ -53,7 +54,6 @@ $messageDll = 'FilePickerAPI.messages.dll'
 $runKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
 $sourceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\EventLog\Application\FilePickerAPI'
 $serviceLog = Join-Path $env:LOCALAPPDATA 'FilePickerAPI\logs\FilePickerAPI.log'
-$baseUrl = 'http://127.0.0.1:8000'
 $port = 8000
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $usersSid = '*S-1-5-32-545'
@@ -154,7 +154,8 @@ function Uninstall-Msi([string]$package, [string]$label) {
 # файлы, кроме .env
 function Compare-Install([string]$build, [string[]]$exclude = @()) {
   $expected = @{}
-  Get-ChildItem $build -Recurse -File | Where-Object Extension -ne '.bat' | ForEach-Object {
+  # -Force: скрытые файлы WiX тоже включает в пакет
+  Get-ChildItem $build -Recurse -File -Force | Where-Object Extension -ne '.bat' | ForEach-Object {
     $expected[$_.FullName.Substring($build.Length + 1)] = $_.FullName
   }
   $diff = foreach ($relative in $expected.Keys) {
@@ -165,7 +166,7 @@ function Compare-Install([string]$build, [string[]]$exclude = @()) {
       "differs $relative"
     }
   }
-  $extra = Get-ChildItem $installDir -Recurse -File | ForEach-Object {
+  $extra = Get-ChildItem $installDir -Recurse -File -Force | ForEach-Object {
     $relative = $_.FullName.Substring($installDir.Length + 1)
     if ($relative -ne '.env' -and -not $expected.ContainsKey($relative)) { "extra $relative" }
   }
@@ -230,22 +231,10 @@ function Wait-Exit($process, [int]$seconds, [string]$what) {
   return $process.ExitCode
 }
 
-function Invoke-Http([string]$path) {
-  try {
-    $response = Invoke-WebRequest -Uri "$baseUrl$path" -NoProxy -TimeoutSec 5 -SkipHttpErrorCheck
-    return [pscustomobject]@{ Status = [int]$response.StatusCode; Content = [string]$response.Content }
-  } catch {
-    return $null
-  }
-}
-
-function Test-Health {
-  $response = Invoke-Http '/openapi.json'
-  return $response -and $response.Status -eq 200 -and ($response.Content | ConvertFrom-Json).info.title -eq 'File Picker API'
-}
-
+# Invoke-Http, Test-Health, Wait-HealthFor и Start-WithClosedInput —
+# из smoke-common.ps1
 function Wait-Health([int]$seconds, [string]$what) {
-  if (-not (Wait-Until $seconds { Test-Health })) { Fail "${what}: the service does not respond in $seconds s" }
+  if (-not (Wait-HealthFor $seconds)) { Fail "${what}: the service does not respond in $seconds s" }
 }
 
 function Get-PortOwner {
@@ -257,7 +246,9 @@ function Get-PortOwner {
 
 # WM_CLOSE скрытому окну экземпляра. Окно ищется по классу и PID: окно
 # того же класса есть и у второго экземпляра, пока он опрашивает порт
-function Stop-Instance([int]$id, [string]$what) {
+function Stop-Instance($id, [string]$what) {
+  # Без проверки $null стал бы PID 0 (процесс Idle)
+  if (-not $id) { Fail "${what}: no process to stop (nobody listens on port $port)" }
   $process = Get-Process -Id $id
   $null = $process.Handle
   $windows = @(Wait-Until 30 { , [SmokeWindows]::Find('FilePickerAPI.Instance', $id) })
@@ -276,22 +267,34 @@ function Stop-All {
 
 # --- журналы ---------------------------------------------------------
 
+# Отметка — размер файла в байтах: читается только дописанный хвост,
+# а не весь журнал за день
 function Get-LogLength {
-  if (Test-Path $serviceLog) { return (Get-Content $serviceLog -Raw -Encoding utf8).Length }
-  return 0
+  if (Test-Path $serviceLog) { return [long](Get-Item $serviceLog).Length }
+  return [long]0
 }
 
-# Текст файла журнала, дописанный после отметки Get-LogLength
-function Get-LogSince([int]$mark) {
+# Текст файла журнала, дописанный после отметки Get-LogLength. Файл
+# открыт сервисом на запись, поэтому чтение — с FileShare.ReadWrite
+function Get-LogSince([long]$mark) {
   if (-not (Test-Path $serviceLog)) { return '' }
-  $content = Get-Content $serviceLog -Raw -Encoding utf8
-  if ($content.Length -lt $mark) { return $content }  # ротация в полночь
-  return $content.Substring($mark)
+  $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+  $stream = [IO.FileStream]::new($serviceLog, 'Open', 'Read', $share)
+  try {
+    # Файл короче отметки — ротация в полночь: читается целиком
+    if ($stream.Length -ge $mark) { [void]$stream.Seek($mark, 'Begin') }
+    $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false))
+    return $reader.ReadToEnd()
+  } finally {
+    $stream.Dispose()
+  }
 }
 
-function Assert-Log([int]$mark, [string]$text, [string]$what) {
-  if (-not (Get-LogSince $mark).Contains($text, [StringComparison]::Ordinal)) {
-    Fail "${what}: '$text' not found in $serviceLog"
+# Строку пишет поток сервиса, иногда уже после ответа по HTTP (2004 —
+# поток создания директории): строка ждётся, а не проверяется один раз
+function Assert-Log([long]$mark, [string]$text, [string]$what, [int]$seconds = 30) {
+  if (-not (Wait-Until $seconds { (Get-LogSince $mark).Contains($text, [StringComparison]::Ordinal) })) {
+    Fail "${what}: '$text' not found in $serviceLog in $seconds s"
   }
   Pass "${what}: '$text' in the log file"
 }
@@ -357,7 +360,7 @@ try {
   Step '1. install'
   Install-Msi $Msi1 'install-1'
   Assert-Install $Build1 'install'
-  if (Get-ChildItem $installDir -Recurse -File -Filter *.bat) { Fail 'install: bat scripts are installed' }
+  if (Get-ChildItem $installDir -Recurse -File -Force -Filter *.bat) { Fail 'install: bat scripts are installed' }
   Assert-Registration 'install'
   if ((Get-FileVersion $exe) -ne $FileVersion1) { Fail "install: FILEVERSION is $(Get-FileVersion $exe), expected $FileVersion1" }
 
@@ -577,7 +580,9 @@ try {
     }
   }
   $logText = Get-LogSince $logMark
-  if ($logText -match 'ImportError|ModuleNotFoundError|DLL load failed|Traceback') {
+  # Не Traceback: повторные отказы недоступной папки пишутся в файл с
+  # трассировкой, это не ошибка загрузки
+  if ($logText -match 'ImportError|ModuleNotFoundError|DLL load failed') {
     Write-Host $logText
     Fail 'SYSTEM upgrade: module or DLL load errors in the log file'
   }
@@ -605,15 +610,8 @@ try {
   Remove-Item -Recurse -Force $runDir -ErrorAction SilentlyContinue
   New-Item -ItemType Directory $runDir | Out-Null
   Copy-Item -Recurse $BuildDir (Join-Path $runDir 'FilePickerAPI')
-  $psi = [Diagnostics.ProcessStartInfo]::new((Join-Path $env:SystemRoot 'System32\cmd.exe'))
-  $psi.ArgumentList.Add('/c')
-  $psi.ArgumentList.Add((Join-Path $runDir 'FilePickerAPI\run_test.bat'))
-  $psi.WorkingDirectory = $runDir
-  $psi.UseShellExecute = $false
-  # Ввод закрыт, чтобы pause в run_test.bat не ждал нажатия клавиши
-  $psi.RedirectStandardInput = $true
-  $bat = [Diagnostics.Process]::Start($psi)
-  $bat.StandardInput.Close()
+  $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+  $bat = Start-WithClosedInput $cmd @('/c', (Join-Path $runDir 'FilePickerAPI\run_test.bat')) $runDir
   Wait-Health 60 'run_test.bat'
   Stop-Instance (Get-PortOwner) 'run_test.bat'
   $null = Wait-Exit $bat 30 'run_test.bat after FilePickerAPI.exe stopped'

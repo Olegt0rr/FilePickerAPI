@@ -319,19 +319,7 @@ jobs:
         TIMESTAMP_URL: http://timestamp.digicert.com
         BRANCH_NAME: ${{ matrix.name }}
       run: |
-        $rsa = [System.Security.Cryptography.RSA]::Create(3072)
-        $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
-          'CN=FilePickerAPI CI MSI smoke test', $rsa, 'SHA256',
-          [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
-        $eku = [System.Security.Cryptography.OidCollection]::new()
-        [void]$eku.Add([System.Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3'))
-        $request.CertificateExtensions.Add(
-          [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($eku, $false))
-        $request.CertificateExtensions.Add(
-          [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new('DigitalSignature', $true))
-        $cert = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddDays(1))
-        $env:CERT_PASSWORD = [guid]::NewGuid().ToString()
-        $env:CERT_PFX_BASE64 = [Convert]::ToBase64String($cert.Export('Pfx', $env:CERT_PASSWORD))
+        ./.github/scripts/throwaway-cert.ps1 -Subject 'CN=FilePickerAPI CI MSI smoke test'
 
         $builds = "$env:MSI_SMOKE\builds"
         $packages = "$env:MSI_SMOKE\packages"
@@ -339,13 +327,29 @@ jobs:
         $env:SIGN_PATH = $builds
         ./.github/scripts/sign.ps1
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        # До подписи копии различались только exe и DLL сообщений, а
+        # подпись с меткой времени сделала разными все PE-файлы при
+        # одинаковых версиях. Windows Installer такие файлы при
+        # обновлении не заменяет, и сверка SHA-256 со вторым MSI не
+        # сошлась бы. Поэтому прочие файлы второй копии — подписанные
+        # файлы первой
+        $patched = 'FilePickerAPI.exe', 'FilePickerAPI.messages.dll'
+        Get-ChildItem "$builds\first" -Recurse -File -Force |
+          Where-Object { $_.FullName.Substring("$builds\first".Length + 1) -notin $patched } |
+          ForEach-Object {
+            $relative = $_.FullName.Substring("$builds\first".Length + 1)
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path "$builds\second" $relative) -Force
+          }
+        $install = $true
         foreach ($package in @(
             @("$builds\first", $env:MSI_VERSION_1, "$packages\first\$name"),
             @("$builds\second", $env:MSI_VERSION_2, "$packages\second\$name"),
             @("$builds\second", $env:MSI_VERSION_2, "$packages\second-rebuilt\$name"))) {
+          # WiX ставится один раз на три пакета
           ./.github/scripts/build-msi.ps1 -Dist $package[0] -Branch $env:BRANCH_NAME `
-            -Version $package[1] -Output $package[2]
+            -Version $package[1] -Output $package[2] -SkipToolInstall:(-not $install)
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $install = $false
         }
         $env:SIGN_PATH = $packages
         ./.github/scripts/sign.ps1
@@ -414,18 +418,5 @@ jobs:
       env:
         TIMESTAMP_URL: http://timestamp.digicert.com
       run: |
-        $rsa = [System.Security.Cryptography.RSA]::Create(3072)
-        $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
-          'CN=FilePickerAPI CI smoke test', $rsa, 'SHA256',
-          [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
-        $eku = [System.Security.Cryptography.OidCollection]::new()
-        [void]$eku.Add([System.Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3'))
-        $request.CertificateExtensions.Add(
-          [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($eku, $false))
-        $request.CertificateExtensions.Add(
-          [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new('DigitalSignature', $true))
-        $cert = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddDays(1))
-
-        $env:CERT_PASSWORD = [guid]::NewGuid().ToString()
-        $env:CERT_PFX_BASE64 = [Convert]::ToBase64String($cert.Export('Pfx', $env:CERT_PASSWORD))
+        ./.github/scripts/throwaway-cert.ps1
         ./.github/scripts/sign.ps1

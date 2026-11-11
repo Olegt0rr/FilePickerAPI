@@ -6,6 +6,7 @@
 #   -Branch  код филиала: название «File Picker API (филиал <код>)»
 #   -Version ProductVersion X.Y.Z (scripts/msi_version.py или имя тега без «v»)
 #   -Output  путь к собираемому .msi
+#   -SkipToolInstall  не ставить WiX: он уже поставлен в этом джобе
 #
 # WiX и его расширение Util ставятся той версией, что закреплена в
 # .config/dotnet-tools.json; скрипт запускается из рабочей копии
@@ -19,7 +20,9 @@ param(
   [Parameter(Mandatory)][string]$Dist,
   [Parameter(Mandatory)][string]$Branch,
   [Parameter(Mandatory)][string]$Version,
-  [Parameter(Mandatory)][string]$Output
+  [Parameter(Mandatory)][string]$Output,
+  # WiX уже поставлен предыдущим вызовом в этом джобе
+  [switch]$SkipToolInstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,10 +53,12 @@ if (-not $wixVersion) { Fail 'WiX version is not set in .config/dotnet-tools.jso
 
 Push-Location $root
 try {
-  Invoke-Native 'dotnet tool restore' { dotnet tool restore }
-  # Расширение той же версии, что WiX: новое расширение с WiX 5 несовместимо
-  Invoke-Native 'wix extension add' {
-    dotnet tool run wix extension add -g "WixToolset.Util.wixext/$wixVersion"
+  if (-not $SkipToolInstall) {
+    Invoke-Native 'dotnet tool restore' { dotnet tool restore }
+    # Расширение той же версии, что WiX: новое расширение с WiX 5 несовместимо
+    Invoke-Native 'wix extension add' {
+      dotnet tool run wix extension add -g "WixToolset.Util.wixext/$wixVersion"
+    }
   }
   Invoke-Native 'wix build' {
     dotnet tool run wix build installer\FilePickerAPI.wxs -arch x64 `
@@ -95,7 +100,8 @@ foreach ($object in $record, $view, $database, $installer) {
   if ($object) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($object) }
 }
 
-$expected = @(Get-ChildItem $Dist -Recurse -File | Where-Object Extension -ne '.bat' |
+# -Force: скрытые файлы шаблон Files тоже включает в пакет
+$expected = @(Get-ChildItem $Dist -Recurse -File -Force | Where-Object Extension -ne '.bat' |
   ForEach-Object { "$($_.Name) $($_.Length)" })
 if (-not ($packaged -match '^FilePickerAPI\.exe ')) { Fail "FilePickerAPI.exe is missing from $Output" }
 # Сравнение отсортированных списков: имена в подпапках могут повторяться

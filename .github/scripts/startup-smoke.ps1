@@ -21,7 +21,7 @@
 param([Parameter(Mandatory)][string]$BuildDir)
 
 $ErrorActionPreference = 'Stop'
-$healthUrl = 'http://127.0.0.1:8000/openapi.json'
+. (Join-Path $PSScriptRoot 'smoke-common.ps1')
 $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
 
 # Рабочая папка запусков — родительская, а не папка exe
@@ -46,19 +46,9 @@ function Fail([string]$message) {
   exit 1
 }
 
-# Вывод не перенаправляется: иначе exe, запущенный bat-скриптом,
-# унаследовал бы канал вывода, и чтение ждало бы его выхода. Ввод
-# перенаправлен и сразу закрыт, чтобы pause в run_test.bat не ждал
-# нажатия клавиши
+# Запуск из рабочей папки проверки (Start-WithClosedInput в smoke-common.ps1)
 function Start-Checked([string]$file, [string[]]$arguments) {
-  $psi = [Diagnostics.ProcessStartInfo]::new($file)
-  foreach ($argument in $arguments) { $psi.ArgumentList.Add($argument) }
-  $psi.WorkingDirectory = $workDir
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardInput = $true
-  $process = [Diagnostics.Process]::Start($psi)
-  $process.StandardInput.Close()
-  return $process
+  return Start-WithClosedInput $file $arguments $workDir
 }
 
 function Wait-Exit($process, [int]$seconds, [string]$what) {
@@ -68,15 +58,6 @@ function Wait-Exit($process, [int]$seconds, [string]$what) {
   return $process.ExitCode
 }
 
-function Test-Health {
-  try {
-    $schema = Invoke-RestMethod -Uri $healthUrl -NoProxy -TimeoutSec 2
-    return $schema.info.title -eq 'File Picker API'
-  } catch {
-    return $false
-  }
-}
-
 function Assert-ServiceLog([string]$text, [string]$what) {
   $content = Get-Content $serviceLog -Raw -Encoding utf8 -ErrorAction SilentlyContinue
   if (-not $content -or -not $content.Contains($text)) {
@@ -84,14 +65,6 @@ function Assert-ServiceLog([string]$text, [string]$what) {
   }
 }
 
-function Wait-Health([int]$seconds) {
-  $deadline = (Get-Date).AddSeconds($seconds)
-  while ((Get-Date) -lt $deadline) {
-    if (Test-Health) { return $true }
-    Start-Sleep -Seconds 1
-  }
-  return $false
-}
 
 # 0. Таблица сообщений журнала событий входит в сборку
 if (-not (Test-Path (Join-Path $dir 'FilePickerAPI.messages.dll'))) {
@@ -138,7 +111,7 @@ Write-Output "OK: $what started the service"
 # 4. run_test.bat ждёт exe, пока его не остановят
 $what = 'run_test.bat'
 $bat = Start-Checked $cmd @('/c', (Join-Path $dir 'run_test.bat'))
-if (-not (Wait-Health 60)) { Fail "${what}: the service does not respond" }
+if (-not (Wait-HealthFor 60)) { Fail "${what}: the service does not respond" }
 if ($bat.HasExited) { Fail "$what exited while the service was running" }
 Stop-Exe
 # Код выхода не проверяется: после exe скрипт выполняет только pause и
