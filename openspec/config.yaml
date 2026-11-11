@@ -161,9 +161,10 @@ context: |
     отдельном SMB-ресурсе раннера — TestSmbShare), параллельно с ними
     сборка Nuitka на Windows под каждый филиал из branches.toml
     (временные артефакты untested-FilePickerAPI-<филиал> на день),
-    затем, после тестов и всех сборок, публикация артефактов
-    FilePickerAPI-<филиал> (publish) и пробная подпись одноразовым
-    сертификатом (sign-smoke, .github/scripts/sign.ps1)
+    затем, после тестов и всех сборок, параллельно публикация
+    артефактов FilePickerAPI-<филиал> (publish) и пробная подпись
+    временных артефактов одноразовым сертификатом (sign-smoke,
+    .github/scripts/sign.ps1)
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
     проверяет зависимости (audit.yml), подписывает в окружении
     code-signing и публикует FilePickerAPI-<филиал>.zip для каждого

@@ -4,9 +4,10 @@
 
 - [x] 1.1 Обновить Nuitka до 4.3.5
 - [x] 1.2 Вынести список филиалов в джоб `matrix` (sparse checkout `scripts/` и `branches.toml`), сборке оставить `needs: matrix`
-- [x] 1.3 Сборка выкладывает `untested-FilePickerAPI-<филиал>` на один день; джоб `publish` после `build`, `test` и `test-windows` переупаковывает его в `FilePickerAPI-<филиал>` на 30 дней и удаляет временный (`actions/upload-artifact/merge`, `delete-merged`)
-- [x] 1.4 `sign-smoke` ждёт `publish`
-- [x] 1.5 Кэш pip (`actions/cache`) в `test`, `test-windows`, `build` и `audit.yml` с ключом по набору extras и коммиту; в сборке по тегу кэш не используется
+- [x] 1.3 Сборка выкладывает `untested-FilePickerAPI-<филиал>` на один день; джоб `publish` после `build`, `test` и `test-windows` копирует его в `FilePickerAPI-<филиал>` на 30 дней (`actions/upload-artifact/merge`, сжатие 1)
+- [x] 1.4 `sign-smoke` ждёт `build`, `test` и `test-windows` и подписывает временные артефакты параллельно с `publish`
+- [x] 1.5 Кэш pip (`actions/cache`) в `test`, `test-windows`, `build` и `audit.yml` с ключом по набору extras, хэшу `pyproject.toml` и коммиту; в сборке по тегу кэш не используется
+- [x] 1.6 Тесты в `tests/test_workflows.py` на порядок джобов, имена артефактов и ключи кэша pip
 
 ## 2. Документация
 
@@ -19,5 +20,5 @@
 
 ## Workflow follow-up
 
-- В PR убедиться, что сборки стартуют одновременно с тестами, `publish` создаёт `FilePickerAPI-<филиал>`, временные артефакты удалены, а `sign-smoke` их скачивает.
+- В PR убедиться, что сборки стартуют одновременно с тестами, `publish` создаёт `FilePickerAPI-<филиал>` с той же структурой (`FilePickerAPI/…`), а `sign-smoke` скачивает и подписывает временные артефакты.
 - Сравнить время Build and Test со второго-третьего прогона, когда прогреты кэши pip и Nuitka.

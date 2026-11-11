@@ -47,13 +47,13 @@ jobs:
 
     # Кэш pip ускоряет только скачивание: проверяется список
     # установленных версий, а не то, откуда взяты файлы. Ключ устроен
-    # как в build-exe.yml: свой набор extras и коммит.
+    # как в build-exe.yml: свой набор extras, хэш pyproject.toml и коммит.
     - name: Cache pip
       uses: actions/cache@v6
       with:
         path: ~\AppData\Local\pip\Cache
-        key: pip-${{ runner.os }}-audit-${{ github.sha }}
-        restore-keys: pip-${{ runner.os }}-audit-
+        key: pip-${{ runner.os }}-audit-${{ hashFiles('pyproject.toml') }}-${{ github.sha }}
+        restore-keys: pip-${{ runner.os }}-audit-${{ hashFiles('pyproject.toml') }}-
 
     # Ставим все extras: в exe попадают основные зависимости, а dev и
     # build выполняются в CI и на машинах разработчиков. setuptools и

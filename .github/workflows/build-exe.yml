@@ -68,16 +68,19 @@ jobs:
         python-version: '3.11'
     
     # Кэш pip: wheel-файлы, скачанные и собранные в прошлых запусках.
-    # Ключ — набор extras и коммит, как у кэша Nuitka: у джобов с разными
+    # Ключ — набор extras, хэш pyproject.toml и коммит. У джобов с разными
     # extras свои кэши (иначе первым сохранил бы кэш джоб без нужных
-    # другим пакетов), а каждый коммит сохраняет обновлённый кэш, и
-    # новые версии незакреплённых пакетов (ruff, pip) в нём появляются.
+    # другим пакетов; суффикс по extras сверяет tests/test_workflows.py).
+    # Каждый коммит сохраняет обновлённый кэш, и новые версии
+    # незакреплённых пакетов (ruff, pip) в нём появляются, а restore-keys
+    # с хэшем pyproject.toml не тянет кэш через смену зависимостей: иначе
+    # старые версии копились бы в нём без конца.
     - name: Cache pip
       uses: actions/cache@v6
       with:
         path: ~/.cache/pip
-        key: pip-${{ runner.os }}-dev-${{ github.sha }}
-        restore-keys: pip-${{ runner.os }}-dev-
+        key: pip-${{ runner.os }}-dev-${{ hashFiles('pyproject.toml') }}-${{ github.sha }}
+        restore-keys: pip-${{ runner.os }}-dev-${{ hashFiles('pyproject.toml') }}-
     
     - name: Install dependencies
       run: |
@@ -127,8 +130,8 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~\AppData\Local\pip\Cache
-        key: pip-${{ runner.os }}-dev-${{ github.sha }}
-        restore-keys: pip-${{ runner.os }}-dev-
+        key: pip-${{ runner.os }}-dev-${{ hashFiles('pyproject.toml') }}-${{ github.sha }}
+        restore-keys: pip-${{ runner.os }}-dev-${{ hashFiles('pyproject.toml') }}-
 
     - name: Install dependencies
       run: |
@@ -191,8 +194,8 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~\AppData\Local\pip\Cache
-        key: pip-${{ runner.os }}-build-${{ github.sha }}
-        restore-keys: pip-${{ runner.os }}-build-
+        key: pip-${{ runner.os }}-build-${{ hashFiles('pyproject.toml') }}-${{ github.sha }}
+        restore-keys: pip-${{ runner.os }}-build-${{ hashFiles('pyproject.toml') }}-
     
     # setuptools и wheel обновляем так же, как в audit.yml: иначе в
     # сборке остался бы setuptools из Python 3.11, а аудит проверял бы
@@ -446,7 +449,8 @@ jobs:
 
     # После дымовых проверок, но до тестов: они ещё могут упасть, поэтому
     # артефакт временный. Префикс untested- не подходит под шаблон
-    # FilePickerAPI-*, по которому сборки скачивают sign-smoke и release.yml
+    # FilePickerAPI-*, по которому release.yml скачивает сборки на
+    # подпись (проверяет tests/test_workflows.py)
     - name: Upload untested artifact
       uses: actions/upload-artifact@v7
       with:
@@ -456,9 +460,12 @@ jobs:
 
   # Артефакт FilePickerAPI-<филиал> появляется только у сборок, для
   # которых прошли линтер и тесты: временный артефакт сборки
-  # переупаковывается под постоянным именем и удаляется. Если тесты или
-  # любая из сборок упали, джоб пропускается, и остаются только
-  # временные артефакты, которые удалятся через день.
+  # копируется под постоянным именем. Если тесты или любая из сборок
+  # упали, джоб пропускается. Временный артефакт не удаляется (так
+  # не нужны права на удаление, а sign-smoke может скачивать его
+  # параллельно) и истекает через день. Позже перезапуск только
+  # упавших джобов его уже не найдёт: нужен перезапуск всех джобов.
+  # Сжатие 1: сборка почти не сжимается, а время уходит.
   publish:
     name: publish (${{ matrix.name }})
     runs-on: ubuntu-latest
@@ -477,14 +484,16 @@ jobs:
         name: FilePickerAPI-${{ matrix.name }}
         pattern: untested-FilePickerAPI-${{ matrix.name }}
         retention-days: 30
-        delete-merged: true
+        compression-level: 1
 
   # Прогоняет скрипт подписи из release.yml на этой же сборке, но с
   # одноразовым самоподписанным сертификатом: боевой сертификат доступен
   # только релизным тегам, а логику подписи нужно проверять в каждом PR.
+  # Ждёт те же джобы, что и publish, и идёт параллельно с ним: подписывает
+  # временные артефакты, содержимое которых publish копирует без изменений.
   sign-smoke:
     runs-on: windows-latest
-    needs: publish
+    needs: [build, test, test-windows]
     permissions:
       contents: read
 
@@ -493,11 +502,11 @@ jobs:
       with:
         sparse-checkout: .github/scripts
 
-    # Сборки всех филиалов: dist/FilePickerAPI-<филиал>/FilePickerAPI
+    # Сборки всех филиалов: dist/untested-FilePickerAPI-<филиал>/FilePickerAPI
     - name: Download builds
       uses: actions/download-artifact@v8
       with:
-        pattern: FilePickerAPI-*
+        pattern: untested-FilePickerAPI-*
         path: dist/
 
     - name: Sign with a throwaway certificate
