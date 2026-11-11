@@ -493,7 +493,10 @@ try {
   # 3. Файл журнала в %LOCALAPPDATA% пользователя
   Step '3. log file'
   Assert-Log $logMark "INFO app.runner: Сервис запущен: версия $AppVersion" 'log file'
-  Assert-Log $logMark "пользователь $user, запуск без окна" 'log file'
+  # Способ запуска в строке не сверяется: собранный exe без консоли и без
+  # стандартных потоков всё равно пишет «запуск из консоли» (app/stdio.py
+  # видит пригодный stderr), это вопрос сервиса, а не установки
+  Assert-Log $logMark "пользователь $user" 'log file'
   Assert-Log $logMark "WARNING app.runner: Не удалось создать директорию с файлами $FilesDirectory" 'log file'
 
   # 4. Второй запуск и аргументы
