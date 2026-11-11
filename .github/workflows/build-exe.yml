@@ -248,8 +248,16 @@ jobs:
         key: nuitka-${{ runner.os }}-${{ github.sha }}
         restore-keys: nuitka-${{ runner.os }}-
 
+    # CLCACHE_NODIRECT=0 — прямой режим clcache: ключ кэша считается по
+    # исходнику и хэшам его include-файлов из манифеста, без препроцессора.
+    # Nuitka по умолчанию ставит 1 (не зависеть от текста /showIncludes,
+    # который у MSVC локализован), и тогда clcache даже при попадании
+    # прогоняет cl /E по каждому из ~430 C-файлов: ~160 с на сборку. На
+    # раннере MSVC английский, а сборка по тегу кэш не использует вовсе.
     - name: Build executable with Nuitka
       shell: pwsh
+      env:
+        CLCACHE_NODIRECT: '0'
       run: |
         # Версию вычисляет setuptools-scm из git-тега при pip install.
         # Для свойств exe нужны только ведущие числа (не больше трёх):
@@ -271,6 +279,14 @@ jobs:
         # attach: запущенный из cmd или PowerShell exe пишет журнал в эту
         # консоль и останавливается по Ctrl+C, а запущенный при входе,
         # двойным щелчком или run_production.bat работает без окна
+        # --nofollow-import-to: пакеты, которые сервис не использует и
+        # которые импортируются только в try … except ImportError: uvicorn
+        # без websockets и wsproto отключает WebSocket, YAML нужен лишь
+        # для --log-config из файла, watchfiles — для --reload, pydantic.v1
+        # FastAPI ищет в try, а pydantic — только для устаревших типов с
+        # __get_validators__. Сильнее --include-package=uvicorn. Минус ~70
+        # модулей из ~420. Сборку проверяют startup-smoke и дымовая
+        # проверка MSI (/openapi.json, /files)
         python -m nuitka `
           --mode=standalone `
           --windows-console-mode=attach `
@@ -284,6 +300,15 @@ jobs:
           --include-module=app._build_config `
           --include-package=uvicorn `
           --include-module=win32timezone `
+          --nofollow-import-to=websockets `
+          --nofollow-import-to=wsproto `
+          --nofollow-import-to=uvicorn.protocols.websockets.websockets_impl `
+          --nofollow-import-to=uvicorn.protocols.websockets.websockets_sansio_impl `
+          --nofollow-import-to=uvicorn.protocols.websockets.wsproto_impl `
+          --nofollow-import-to=yaml `
+          --nofollow-import-to=watchfiles `
+          --nofollow-import-to=uvicorn.supervisors.watchfilesreload `
+          --nofollow-import-to=pydantic.v1 `
           --product-name=FilePickerAPI `
           --file-description="File Picker API" `
           --file-version=$version `

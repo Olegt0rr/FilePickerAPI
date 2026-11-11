@@ -411,9 +411,18 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
   --output-dir=build --output-folder-name=FilePickerAPI `
   --output-filename=FilePickerAPI.exe `
   --include-package=app --include-module=app._build_config `
-  --include-package=uvicorn `
+  --include-package=uvicorn --include-module=win32timezone `
+  --nofollow-import-to=websockets --nofollow-import-to=wsproto `
+  --nofollow-import-to=uvicorn.protocols.websockets.websockets_impl `
+  --nofollow-import-to=uvicorn.protocols.websockets.websockets_sansio_impl `
+  --nofollow-import-to=uvicorn.protocols.websockets.wsproto_impl `
+  --nofollow-import-to=yaml --nofollow-import-to=watchfiles `
+  --nofollow-import-to=uvicorn.supervisors.watchfilesreload `
+  --nofollow-import-to=pydantic.v1 `
   app/__main__.py
 ```
+
+Пакеты из `--nofollow-import-to` сервис не использует (WebSocket, YAML-конфигурация журнала, перезагрузка uvicorn, pydantic v1), а импортируются они только необязательно; без них сборка на ~70 модулей меньше и быстрее. Полная команда, с версией в свойствах exe, — в `.github/workflows/build-exe.yml`.
 
 Результат — папка `build/FilePickerAPI.dist/` с `FilePickerAPI.exe` и его зависимостями. Используется режим standalone (папка), а не onefile: onefile при запуске распаковывает неподписанные файлы во временную папку пользователя, что несовместимо с подписью и WDAC/AppLocker.
 
