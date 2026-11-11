@@ -167,6 +167,48 @@ class TestWxsPackage:
             assert element.get("KeyPath") == "yes"
             assert component_of(package, element).get("Permanent") == "yes"
 
+    def test_message_file_name_has_version(self, package):
+        # Обновление добавляет файл, а не заменяет тот, что держит
+        # служба журнала событий: иначе Restart Manager перезапустил бы
+        # EventLog. GUID компонента WiX выводит из пути: у каждой версии
+        # свой компонент
+        message_file = package.find(".//wix:File", NS)
+
+        assert message_file.get("Name") == "FilePickerAPI.messages.$(var.Version).dll"
+        assert component_of(package, message_file).get("Guid") is None
+
+    def test_newer_registered_message_file_is_kept(self, package):
+        source = package.find(".//util:EventSource", NS)
+        properties = [
+            p
+            for p in package.findall("wix:Property", NS)
+            if p.find("wix:RegistrySearch", NS) is not None
+        ]
+
+        assert len(properties) == 1
+        prop = properties[0]
+        # AppSearch пишет только в публичные свойства
+        assert prop.get("Id") == prop.get("Id").upper()
+        assert prop.get("Secure") == "yes"
+        searches = prop.findall("wix:RegistrySearch", NS)
+        assert len(searches) == 1
+        search = searches[0]
+        assert search.get("Root") == "HKLM"
+        assert search.get("Key") == (
+            r"SYSTEM\CurrentControlSet\Services\EventLog\Application\FilePickerAPI"
+        )
+        assert search.get("Name") == "EventMessageFile"
+        assert search.get("Type") == "file"
+        assert search.get("Bitness") == "always64"
+        file_searches = search.findall("wix:FileSearch", NS)
+        assert len(file_searches) == 1
+        # Версия DLL сообщений — X.Y.Z.0: находится только файл новее
+        assert file_searches[0].get("MinVersion") == "$(var.Version).1"
+        assert file_searches[0].get("Name")
+        assert component_of(package, source).get("Condition") == (
+            f"NOT {prop.get('Id')}"
+        )
+
     def test_major_upgrade_refuses_same_and_older_versions(self, package):
         upgrades = package.findall("wix:MajorUpgrade", NS)
 
