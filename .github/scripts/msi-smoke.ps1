@@ -129,12 +129,17 @@ public static class SmokeWindows {
   [DllImport("kernel32.dll")]
   static extern bool CloseHandle(IntPtr handle);
 
-  // Процесс без консоли (DETACHED_PROCESS) и без унаследованных
-  // дескрипторов: так запущенный им exe не прицепится к консоли раннера
+  // Процесс без консоли (DETACHED_PROCESS) и без стандартных потоков,
+  // как у Explorer: запущенный им exe не прицепится к консоли раннера, а
+  // сервис увидит непригодный stderr («запуск без окна»). Без
+  // STARTF_USESTDHANDLES с нулями cmd получил бы значения дескрипторов
+  // pwsh и передал бы их exe
   public static Detached StartDetached(string application, string commandLine, string directory) {
     const uint DETACHED_PROCESS = 0x00000008, CREATE_NEW_PROCESS_GROUP = 0x00000200;
+    const int STARTF_USESTDHANDLES = 0x00000100;
     var startup = new StartupInfo();
     startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+    startup.dwFlags = STARTF_USESTDHANDLES;
     ProcessInformation info;
     if (!CreateProcessW(application, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero,
         false, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, IntPtr.Zero, directory,
@@ -400,6 +405,8 @@ function Get-LogSince([long]$mark) {
 # поток создания директории): строка ждётся, а не проверяется один раз
 function Assert-Log([long]$mark, [string]$text, [string]$what, [int]$seconds = 30) {
   if (-not (Wait-Until $seconds { (Get-LogSince $mark).Contains($text, [StringComparison]::Ordinal) })) {
+    Write-Host "--- $serviceLog since the mark"
+    Write-Host (Get-LogSince $mark)
     Fail "${what}: '$text' not found in $serviceLog in $seconds s"
   }
   Pass "${what}: '$text' in the log file"
