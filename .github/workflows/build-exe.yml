@@ -355,8 +355,11 @@ jobs:
         ./.github/scripts/sign.ps1
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+    # Обычно несколько минут; срок — на случай зависшего msiexec или exe,
+    # иначе джоб ждал бы шесть часов
     - name: MSI smoke test
       if: strategy.job-index == 0
+      timeout-minutes: 30
       shell: pwsh
       env:
         BRANCH_NAME: ${{ matrix.name }}
@@ -377,7 +380,7 @@ jobs:
 
     # Журналы msiexec (/l*v) для разбора падения; копии и MSI сюда не входят
     - name: Upload MSI smoke test logs
-      if: failure() && strategy.job-index == 0
+      if: (failure() || cancelled()) && strategy.job-index == 0
       uses: actions/upload-artifact@v7
       with:
         name: msi-smoke-logs

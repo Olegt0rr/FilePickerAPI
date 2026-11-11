@@ -126,25 +126,51 @@ function Wait-Until([int]$seconds, [scriptblock]$condition) {
 
 # Без Start-Process -Wait: он ждёт и дочерние процессы, а Restart
 # Manager запускает exe заново, и ожидание длилось бы, пока exe работает
-function Invoke-Msi([string]$action, [string]$package, [string]$label) {
+function Invoke-Msi([string]$action, [string]$package, [string]$label, [int]$seconds = 600) {
   $script:msiCount++
   $log = Join-Path $LogDir ('{0:d2}-{1}.log' -f $script:msiCount, $label)
+  $script:lastMsiLog = $log
   $arguments = @($action, "`"$package`"", '/qn', '/norestart', '/l*v', "`"$log`"")
   $process = Start-Process msiexec.exe -ArgumentList $arguments -PassThru
   $null = $process.Handle  # иначе ExitCode после выхода недоступен
-  if (-not $process.WaitForExit(600000)) { Fail "msiexec $action $label did not exit in 10 min" }
+  if (-not $process.WaitForExit($seconds * 1000)) {
+    Show-MsiLog $log
+    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    Fail "msiexec $action $label did not exit in $seconds s"
+  }
   Write-Host "msiexec $action $(Split-Path -Leaf $package) ($label) -> $($process.ExitCode)"
   return $process.ExitCode
 }
 
+# Причина отказа — в подробном журнале msiexec: строки перед первым
+# «Return value 3» (действие, которое упало), иначе хвост журнала
+function Show-MsiLog([string]$log) {
+  if (-not $log -or -not (Test-Path $log)) { return }
+  $lines = @(Get-Content $log -ErrorAction SilentlyContinue)
+  $failed = [Array]::FindIndex([string[]]$lines, [Predicate[string]] { param($l) $l -match 'Return value 3' })
+  $range = if ($failed -ge 0) { $lines[[Math]::Max(0, $failed - 40)..[Math]::Min($lines.Count - 1, $failed + 5)] }
+           else { $lines | Select-Object -Last 40 }
+  Write-Host "--- $(Split-Path -Leaf $log)"
+  $range | ForEach-Object { Write-Host $_ }
+  # Сообщения об ошибках Windows Installer: «Error 1925.», «Note: 1: 2203»,
+  # «Product: … -- Installation failed»
+  $lines | Where-Object { $_ -match '\bError [0-9]{4}\b|Note: 1: [0-9]{4}|Product: .*(failed|Error)' } |
+    Select-Object -First 20 | ForEach-Object { Write-Host "  $_" }
+}
+
+function Assert-MsiCode([int]$code, [int[]]$expected, [string]$what) {
+  if ($code -notin $expected) {
+    Show-MsiLog $script:lastMsiLog
+    Fail "${what}: msiexec exited with $code, expected $($expected -join ' or ')"
+  }
+}
+
 function Install-Msi([string]$package, [string]$label) {
-  $code = Invoke-Msi '/i' $package $label
-  if ($code -ne 0) { Fail "msiexec /i $label exited with $code, expected 0" }
+  Assert-MsiCode (Invoke-Msi '/i' $package $label) @(0) "msiexec /i $label"
 }
 
 function Uninstall-Msi([string]$package, [string]$label) {
-  $code = Invoke-Msi '/x' $package $label
-  if ($code -ne 0) { Fail "msiexec /x $label exited with $code, expected 0" }
+  Assert-MsiCode (Invoke-Msi '/x' $package $label) @(0) "msiexec /x $label"
 }
 
 # --- файлы установки -------------------------------------------------
@@ -514,7 +540,7 @@ try {
   Wait-Health 60 'running before upgrade'
   $mark = Get-EventMark
   $code = Invoke-Msi '/i' $Msi2 'upgrade-running'
-  if ($code -notin 0, 3010) { Fail "upgrade running: msiexec exited with $code, expected 0 or 3010" }
+  Assert-MsiCode $code @(0, 3010) 'upgrade running'
   Assert-EnvFile $corsEnv 'upgrade running'
   Assert-Registration 'upgrade running'
   if ($code -eq 0) {
@@ -545,6 +571,7 @@ try {
   $mark = Get-EventMark
   $logMark = Get-LogLength
   $log = Join-Path $LogDir 'system-upgrade.log'
+  $script:lastMsiLog = $log
   $action = New-ScheduledTaskAction -Execute msiexec.exe -Argument "/i `"$Msi2`" /qn /norestart /l*v `"$log`""
   Register-ScheduledTask $taskName -Action $action -User SYSTEM -RunLevel Highest -Force | Out-Null
   Start-ScheduledTask $taskName
@@ -557,7 +584,7 @@ try {
   $code = (Get-ScheduledTaskInfo $taskName).LastTaskResult
   Unregister-ScheduledTask $taskName -Confirm:$false
   Write-Host "msiexec /i (SYSTEM) -> $code"
-  if ($code -notin 0, 3010) { Fail "SYSTEM upgrade: msiexec exited with $code, expected 0 or 3010" }
+  Assert-MsiCode $code @(0, 3010) 'SYSTEM upgrade'
   if ($code -eq 0) {
     Assert-Install $Build2 'SYSTEM upgrade'
   } else {
@@ -595,7 +622,7 @@ try {
   # 13. Удаление: значения Run нет, источник и файл сообщений остались
   Step '13. uninstall'
   $code = Invoke-Msi '/x' $Msi2 'uninstall'
-  if ($code -notin 0, 3010) { Fail "uninstall: msiexec exited with $code, expected 0 or 3010" }
+  Assert-MsiCode $code @(0, 3010) 'uninstall'
   if ($null -ne (Get-ItemProperty $runKey -ErrorAction SilentlyContinue).FilePickerAPI) { Fail 'uninstall: Run value remains' }
   if ((Get-ItemProperty $sourceKey -ErrorAction SilentlyContinue).EventMessageFile -ne (Join-Path $installDir $messageDll)) {
     Fail 'uninstall: event source registration is removed'
@@ -630,7 +657,8 @@ try {
     if (Test-Path $installDir) { & icacls.exe $installDir /remove:g $usersSid 2>&1 | Out-Null }
     foreach ($package in $Msi1, $Msi2, $Msi2Rebuilt) {
       # Не установленный пакет: 1605, это не ошибка очистки
-      try { $null = Invoke-Msi '/x' $package 'cleanup' } catch { Write-Host "cleanup: $_" }
+      # Короткое ожидание: зависший msiexec не держит джоб, он останавливается
+      try { $null = Invoke-Msi '/x' $package 'cleanup' 120 } catch { Write-Host "cleanup: $_" }
     }
   }
 }
