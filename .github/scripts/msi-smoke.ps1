@@ -531,7 +531,8 @@ try {
   if ((Get-FileVersion $exe) -ne $FileVersion2) { Fail "upgrade: FILEVERSION is $(Get-FileVersion $exe), expected $FileVersion2" }
   foreach ($case in @(@($Msi1, 'older'), @($Msi2Rebuilt, 'same-version'))) {
     $code = Invoke-Msi '/i' $case[0] "refuse-$($case[1])"
-    if ($code -eq 0) { Fail "$($case[1]) MSI over the second one was installed" }
+    # Успех — и 1641, и 3010 (установлено, нужна перезагрузка)
+    if ($code -in 0, 1641, 3010) { Fail "$($case[1]) MSI over the second one was installed ($code)" }
     Assert-Install $Build2 "$($case[1]) MSI refused ($code)"
   }
   Invoke-Rollback 'stopped service'
@@ -745,7 +746,17 @@ try {
   Stop-All
   if ($script:portHolder) { Stop-Process -Id $script:portHolder.Id -Force -ErrorAction SilentlyContinue }
   if (-not $succeeded) {
+    # Удаление задачи не останавливает её запущенный экземпляр: msiexec
+    # от SYSTEM (шаг 12 по сроку) продолжал бы установку, и /x ниже
+    # получил бы 1618. Задача останавливается, затем — ожидание конца
+    # операции Windows Installer (мьютекс _MSIExecute), не дольше 2 мин
+    Stop-ScheduledTask $taskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    $idle = Wait-Until 120 {
+      $mutex = $null
+      if ([Threading.Mutex]::TryOpenExisting('Global\_MSIExecute', [ref]$mutex)) { $mutex.Dispose(); $false } else { $true }
+    }
+    if (-not $idle) { Write-Host 'cleanup: Windows Installer is still busy, uninstall may return 1618' }
     if (Test-Path $installDir) { & icacls.exe $installDir /remove:g $usersSid 2>&1 | Out-Null }
     foreach ($package in $Msi1, $Msi2, $Msi2Rebuilt) {
       # Не установленный пакет: 1605, это не ошибка очистки
