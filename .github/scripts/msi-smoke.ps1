@@ -131,7 +131,7 @@ public static class SmokeWindows {
 
   // Процесс без консоли (DETACHED_PROCESS) и без стандартных потоков,
   // как у Explorer: запущенный им exe не прицепится к консоли раннера, а
-  // сервис увидит непригодный stderr («запуск без окна»). Без
+  // сервис не найдёт окна консоли («запуск без окна»). Без
   // STARTF_USESTDHANDLES с нулями cmd получил бы значения дескрипторов
   // pwsh и передал бы их exe
   public static Detached StartDetached(string application, string commandLine, string directory) {
@@ -493,10 +493,9 @@ try {
   # 3. Файл журнала в %LOCALAPPDATA% пользователя
   Step '3. log file'
   Assert-Log $logMark "INFO app.runner: Сервис запущен: версия $AppVersion" 'log file'
-  # Способ запуска в строке не сверяется: собранный exe без консоли и без
-  # стандартных потоков всё равно пишет «запуск из консоли» (app/stdio.py
-  # видит пригодный stderr), это вопрос сервиса, а не установки
   Assert-Log $logMark "пользователь $user" 'log file'
+  # Start-Exe запускает exe без консоли (DETACHED_PROCESS), как при входе
+  Assert-Log $logMark 'запуск без окна' 'log file'
   Assert-Log $logMark "WARNING app.runner: Не удалось создать директорию с файлами $FilesDirectory" 'log file'
 
   # 4. Второй запуск и аргументы
@@ -595,7 +594,7 @@ try {
   $early = @($all | Where-Object { $_.Id -eq 1003 -and $_.RecordId -le $permissionsMark })
   if ($early) { Fail 'event texts: 1003 before the permissions were changed' }
   $checks = @(
-    @{ Id = 1000; Level = 4; Text = @("Сервис запущен: версия $AppVersion", $FilesDirectory, "пользователь $user") },
+    @{ Id = 1000; Level = 4; Text = @("Сервис запущен: версия $AppVersion", $FilesDirectory, "пользователь $user", 'запуск без окна') },
     @{ Id = 2004; Level = 3; Text = @("Не удалось создать директорию с файлами $FilesDirectory"); Pattern = $windowsError },
     @{ Id = 2000; Level = 3; Text = @("Папка с файлами $FilesDirectory недоступна", 'Ответ клиенту: 404'); Pattern = $windowsError },
     @{ Id = 1001; Level = 4; Text = @('Сервис остановлен: сообщение WM_CLOSE') },
