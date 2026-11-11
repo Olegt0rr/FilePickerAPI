@@ -179,18 +179,21 @@ context: |
   ## CI/CD
   - .github/workflows/build-exe.yml: ruff + pytest на Ubuntu и pytest на
     Windows (test-windows: проверки только для Windows, в том числе на
-    отдельном SMB-ресурсе раннера — TestSmbShare), затем сборка
-    Nuitka на Windows под каждый филиал из branches.toml (артефакты
-    FilePickerAPI-<филиал>) и пробная подпись одноразовым сертификатом
-    (sign-smoke, .github/scripts/sign.ps1). На первом филиале джоб
-    build проверяет запуск (startup-smoke.ps1) и MSI: две копии сборки
-    вне dist/ (вторая — с версией на единицу больше,
-    scripts/set_file_version.py), подписанные одноразовым сертификатом
-    (throwaway-cert.ps1), из них MSI (WiX из .config/dotnet-tools.json,
-    .github/scripts/build-msi.ps1) и дымовая проверка
-    .github/scripts/msi-smoke.ps1 (установка, события, обновление,
-    откат, удаление; общие функции — smoke-common.ps1). Этот MSI в
-    артефакт и релиз не идёт, dist/ остаётся неподписанным
+    отдельном SMB-ресурсе раннера — TestSmbShare), параллельно с ними
+    сборка Nuitka на Windows под каждый филиал из branches.toml
+    (временные артефакты untested-FilePickerAPI-<филиал> на день),
+    затем, после тестов и всех сборок, параллельно публикация
+    артефактов FilePickerAPI-<филиал> (publish) и пробная подпись
+    временных артефактов одноразовым сертификатом (sign-smoke,
+    .github/scripts/sign.ps1). На первом филиале джоб build проверяет
+    запуск (startup-smoke.ps1) и MSI: две копии сборки вне dist/
+    (вторая — с версией на единицу больше, scripts/set_file_version.py),
+    подписанные одноразовым сертификатом (throwaway-cert.ps1), из них
+    MSI (WiX из .config/dotnet-tools.json, .github/scripts/build-msi.ps1)
+    и дымовая проверка .github/scripts/msi-smoke.ps1 (установка,
+    события, обновление, откат, удаление; общие функции —
+    smoke-common.ps1). Этот MSI в артефакт и релиз не идёт, dist/
+    остаётся неподписанным
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
     проверяет зависимости (audit.yml), подписывает в окружении
     code-signing (sign), собирает из подписанных папок MSI каждого

@@ -8,6 +8,7 @@ build-exe.yml и audit.yml не запускаются, если изменен�
 """
 
 import re
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -68,3 +69,106 @@ def test_workflows_are_not_ignored():
     for workflow in ("build-exe.yml", "audit.yml"):
         for path in anchored_list(workflow, "paths-ignore"):
             assert not path.startswith(".github/workflows"), path
+
+
+# Порядок сборки и публикации (change parallel-ci-build): сборки идут
+# параллельно с тестами, а сборки на подпись берутся только из
+# артефактов, которые публикуются после тестов.
+
+
+def workflow_jobs(workflow: str) -> dict[str, str]:
+    """Текст каждого джоба workflow: от `  имя:` до следующего джоба.
+
+    Без PyYAML: джобы — ключи с отступом в два пробела после `jobs:`.
+    """
+    text = (WORKFLOWS / workflow).read_text(encoding="utf-8")
+    jobs_text = text.split("\njobs:\n", 1)[1]
+    parts = re.split(r"^  ([\w-]+):[ \t]*$", jobs_text, flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def job_needs(job: str) -> set[str]:
+    [needs] = re.findall(r"^    needs: (.+)$", job, re.MULTILINE)
+    return {name.strip() for name in needs.strip("[] ").split(",")}
+
+
+def uploaded_names(job: str) -> list[str]:
+    return re.findall(
+        r"uses: actions/upload-artifact@v\d+\n +with:\n +name: (.+)$",
+        job,
+        re.MULTILINE,
+    )
+
+
+def release_patterns() -> list[str]:
+    """Шаблоны, по которым release.yml скачивает сборки на подпись."""
+    sign = workflow_jobs("release.yml")["sign"]
+    patterns = re.findall(r"^ +pattern: (\S+)$", sign, re.MULTILINE)
+    assert patterns
+    return patterns
+
+
+def test_build_does_not_wait_for_tests():
+    build = workflow_jobs("build-exe.yml")["build"]
+    assert job_needs(build) == {"matrix"}
+
+
+def test_build_artifacts_are_not_signed_by_release():
+    build = workflow_jobs("build-exe.yml")["build"]
+    names = uploaded_names(build)
+    # Сама сборка — временный артефакт; прочие (журналы проверок) тоже
+    # не должны подходить под шаблоны release.yml
+    assert "untested-FilePickerAPI-${{ matrix.name }}" in names
+    for name in names:
+        for pattern in release_patterns():
+            assert not fnmatch(name, pattern), (name, pattern)
+
+
+def test_published_artifacts_wait_for_tests():
+    jobs = workflow_jobs("build-exe.yml")
+    publish = jobs["publish"]
+    assert job_needs(publish) >= {"build", "test", "test-windows"}
+    [name] = re.findall(r"^ +name: (FilePickerAPI-.+)$", publish, re.MULTILINE)
+    [pattern] = re.findall(r"^ +pattern: (.+)$", publish, re.MULTILINE)
+    assert pattern == "untested-" + name
+    # release.yml подписывает именно опубликованные артефакты
+    assert any(fnmatch(name, p) for p in release_patterns())
+    # Кроме publish, под шаблоны release.yml никто ничего не выкладывает
+    for job_name, job in jobs.items():
+        for uploaded in uploaded_names(job):
+            for p in release_patterns():
+                assert not fnmatch(uploaded, p), (job_name, uploaded)
+
+
+def test_sign_smoke_waits_for_tests():
+    sign_smoke = workflow_jobs("build-exe.yml")["sign-smoke"]
+    assert job_needs(sign_smoke) >= {"build", "test", "test-windows"}
+
+
+def test_pip_cache_key_per_extras():
+    # Джобы с разным набором extras не должны делить кэш pip: его
+    # сохраняет первый завершившийся джоб, и в кэше не оказалось бы
+    # пакетов остальных
+    extras_by_suffix: dict[str, set[str]] = {}
+    for workflow in ("build-exe.yml", "audit.yml"):
+        for job_name, job in workflow_jobs(workflow).items():
+            installs = re.findall(r"pip install -e \.\[([\w,]+)\]", job)
+            if not installs:
+                continue
+            [extras] = installs
+            keys = re.findall(r"^ +key: (pip-.+)$", job, re.MULTILINE)
+            assert len(keys) == 1, f"{workflow}/{job_name}: нужен кэш pip"
+            [key] = keys
+            match = re.fullmatch(
+                r"pip-\$\{\{ runner\.os \}\}-([\w-]+)-"
+                r"\$\{\{ hashFiles\('pyproject\.toml'\) \}\}-"
+                r"\$\{\{ github\.sha \}\}",
+                key,
+            )
+            assert match, f"{workflow}/{job_name}: {key}"
+            [restore] = re.findall(r"^ +restore-keys: (pip-.+)$", job, re.MULTILINE)
+            assert restore == key.removesuffix("${{ github.sha }}")
+            extras_by_suffix.setdefault(match[1], set()).add(extras)
+    assert extras_by_suffix
+    for suffix, extras in extras_by_suffix.items():
+        assert len(extras) == 1, (suffix, extras)

@@ -40,7 +40,7 @@ dev = [
     "ruff>=0.14.9",
 ]
 build = [
-    "nuitka==4.3.4",
+    "nuitka==4.3.5",
 ]
 # Проверка зависимостей на известные уязвимости (.github/workflows/audit.yml).
 # Здесь, а не в workflow, чтобы версию обновлял Dependabot.
