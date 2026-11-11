@@ -1,7 +1,7 @@
 # distribution Specification
 
 ## Purpose
-Поставка и запуск сервиса на Windows: сборка Nuitka с bat-скриптами, подпись бинарников и автоматические релизы на GitHub с версией из git-тега.
+Поставка и запуск сервиса на Windows: сборка Nuitka с bat-скриптами и MSI, подпись бинарников и автоматические релизы на GitHub с версией из git-тега.
 
 ## Requirements
 

@@ -15,8 +15,10 @@ context: |
   - Директория с файлами зашивается в исполняемый файл при сборке, и
     пользователь на месте не может её подменить. Не предлагать и не
     добавлять переопределение пути при запуске: переменные окружения,
-    .env, аргументы, конфиги рядом с exe, параметры bat-файлов. Поэтому
-    Settings.files_directory — ClassVar, а не поле настроек. Варианты
+    .env, аргументы (в том числе аргументы FilePickerAPI.exe), конфиги
+    рядом с exe, параметры bat-файлов, значение Run в реестре, свойства
+    MSI. Поэтому Settings.files_directory — ClassVar, а не поле
+    настроек. Варианты
     «один exe + путь в конфиге рядом» отклоняются, даже если ускоряют
     сборку. Смена пути — только через branches.toml и новую сборку.
   - Доступ к сетевой папке с платёжками есть только у учётной записи
@@ -59,6 +61,15 @@ context: |
   - Поставка: Windows-сборка Nuitka в режиме standalone (папка с exe,
     не onefile), подписанная Authenticode в релизе; запуск из исходников
     для разработки. Docker не поддерживается
+  - Основной способ установки — подписанный MSI филиала (WiX):
+    C:\Program Files\FilePickerAPI\, значение FilePickerAPI в
+    HKLM\Software\Microsoft\Windows\CurrentVersion\Run (запуск при
+    входе любого пользователя от его имени, без окна), источник
+    FilePickerAPI в журнале Application; .env с CORS_ORIGINS — в папке
+    установки. Обновление — MSI новой версии (MajorUpgrade), откат и
+    смена филиала той же версии — удаление и установка. Архив с
+    run_test.bat и run_production.bat — до перевода филиала на MSI
+    (удаление — изменение remove-bat-scripts)
 
   ## Структура
   - app/__init__.py — только версия пакета: импорт пакета не создаёт
@@ -68,7 +79,7 @@ context: |
   - app/__main__.py — точка входа: только запуск без аргументов (любые
     аргументы — код 2), собранный exe переходит в свою папку
   - app/stdio.py — os.devnull вместо непригодных stdout и stderr у exe
-    без консоли
+    без консоли (на Windows поток на устройстве NUL — непригодный)
   - app/runner.py — запуск сервиса: главный поток ждёт исхода
     (остановка — 1001 и код 0, сбой — 1002 и код 1, второй экземпляр —
     1005/1006 и код 0) и завершает процесс через os._exit; рабочий
@@ -100,8 +111,10 @@ context: |
     символические ссылки в пути, текст события 1003
   - app/winapi.py — вызовы WinAPI, которых нет в pywin32, через ctypes с
     ленивой загрузкой библиотек: PID владельца порта IPv4 и IPv6
-    (GetExtendedTcpTable, разбор таблиц — чистая функция над байтами) и
-    RegisterApplicationRestart
+    (GetExtendedTcpTable, разбор таблиц — чистая функция над байтами),
+    RegisterApplicationRestart, окно консоли (GetConsoleWindow: способ
+    запуска в событии 1000) и устройство NUL
+    (NtQueryVolumeInformationFile)
   - app/settings.py — настройки (pydantic-settings, кэш через lru_cache);
     путь к файлам — из app/_build_config.py (генерируется при сборке,
     не хранится в git), без него — ./files
@@ -112,6 +125,8 @@ context: |
   - scripts/msi_version.py — перевод версии сборки (app._version.version
     или имени тега без «v») в ProductVersion MSI: первые три числа, не
     больше 255.255.65535
+  - scripts/set_file_version.py — другая версия в ресурсах exe и DLL
+    сообщений (UpdateResource) для дымовой проверки обновления MSI
   - installer/FilePickerAPI.wxs — пакет MSI (WiX): установка в
     C:\Program Files\FilePickerAPI\, значение Run в HKLM, постоянные
     источник событий и FilePickerAPI.messages.dll
@@ -128,7 +143,13 @@ context: |
     источника пути к файлам
   - tests/test_installer.py — тесты installer/FilePickerAPI.wxs как XML
     и scripts/msi_version.py; tests/script_loader.py загружает
-    скрипты из scripts/ без импорта приложения
+    скрипты из scripts/ без импорта приложения;
+    tests/test_set_file_version.py — тесты scripts/set_file_version.py
+  - tests/test_runner.py — тесты экземпляра сервиса: запуск, второй
+    экземпляр, остановка (подменённые _exit и сигналы, поддельный
+    win32evtlog, настоящий Uvicorn на свободном порте)
+  - tests/test_stdio.py — стандартные потоки и определение консоли,
+    в том числе отдельные процессы без консоли и с ней
   - tests/test_logging_setup.py — тесты журнала (поддельные модули
     pywin32); tests/conftest.py изолирует журнал и учёт ошибок каждого
     теста
@@ -164,11 +185,23 @@ context: |
     затем, после тестов и всех сборок, параллельно публикация
     артефактов FilePickerAPI-<филиал> (publish) и пробная подпись
     временных артефактов одноразовым сертификатом (sign-smoke,
-    .github/scripts/sign.ps1)
+    .github/scripts/sign.ps1). На первом филиале джоб build проверяет
+    запуск (startup-smoke.ps1) и MSI: две копии сборки вне dist/
+    (вторая — с версией на единицу больше, scripts/set_file_version.py),
+    подписанные одноразовым сертификатом (throwaway-cert.ps1), из них
+    MSI (WiX из .config/dotnet-tools.json, .github/scripts/build-msi.ps1)
+    и дымовая проверка .github/scripts/msi-smoke.ps1 (установка,
+    события, обновление, откат, удаление; общие функции —
+    smoke-common.ps1). Этот MSI в артефакт и релиз не идёт, dist/
+    остаётся неподписанным
   - .github/workflows/release.yml: по тегу vX.Y.Z из цифр собирает,
     проверяет зависимости (audit.yml), подписывает в окружении
-    code-signing и публикует FilePickerAPI-<филиал>.zip для каждого
-    филиала
+    code-signing (sign), собирает из подписанных папок MSI каждого
+    филиала тем же build-msi.ps1 в джобе msi без окружения и секретов
+    (версия — имя тега без «v»), подписывает только MSI в code-signing
+    (sign-msi, проверяет, что в артефакте только MSI) и публикует
+    FilePickerAPI-<филиал>.zip и FilePickerAPI-<филиал>.msi для
+    каждого филиала
   - .github/workflows/audit.yml: pip-audit всех установленных зависимостей
     на Windows (push, PR, ежедневно; вызывается из release.yml перед
     подписью)
