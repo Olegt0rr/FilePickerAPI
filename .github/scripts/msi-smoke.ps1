@@ -3,7 +3,8 @@
 # раздела «Тесты без Windows и проверка на Windows в CI» design.md.
 #
 # Раннер работает от администратора без интерактивного входа, поэтому
-# вход пользователя заменяет запуск exe без аргументов (Start-Process).
+# вход пользователя заменяет запуск exe без аргументов и без консоли
+# (Start-Exe: родитель — cmd с DETACHED_PROCESS, как Explorer без консоли).
 #
 # Параметры:
 #   -Msi1, -Build1          MSI версии сборки и подписанная папка, из
@@ -102,6 +103,67 @@ public static class SmokeWindows {
   public static bool Close(IntPtr hwnd) {
     const uint WM_CLOSE = 0x0010;
     return PostMessage(hwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+  }
+
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  struct StartupInfo {
+    public int cb;
+    public string lpReserved, lpDesktop, lpTitle;
+    public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+    public short wShowWindow, cbReserved2;
+    public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct ProcessInformation {
+    public IntPtr hProcess, hThread;
+    public int dwProcessId, dwThreadId;
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool CreateProcessW(string application, StringBuilder commandLine,
+    IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint flags,
+    IntPtr environment, string currentDirectory, ref StartupInfo startupInfo,
+    out ProcessInformation processInformation);
+
+  [DllImport("kernel32.dll")]
+  static extern bool CloseHandle(IntPtr handle);
+
+  // Процесс без консоли (DETACHED_PROCESS) и без унаследованных
+  // дескрипторов: так запущенный им exe не прицепится к консоли раннера
+  public static Detached StartDetached(string application, string commandLine, string directory) {
+    const uint DETACHED_PROCESS = 0x00000008, CREATE_NEW_PROCESS_GROUP = 0x00000200;
+    var startup = new StartupInfo();
+    startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+    ProcessInformation info;
+    if (!CreateProcessW(application, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero,
+        false, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, IntPtr.Zero, directory,
+        ref startup, out info)) {
+      throw new System.ComponentModel.Win32Exception();
+    }
+    CloseHandle(info.hThread);
+    return new Detached(info.hProcess, info.dwProcessId);
+  }
+}
+
+public sealed class Detached {
+  [DllImport("kernel32.dll")]
+  static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+  [DllImport("kernel32.dll")]
+  static extern bool GetExitCodeProcess(IntPtr handle, out uint code);
+
+  readonly IntPtr handle;
+  public readonly int Id;
+
+  public Detached(IntPtr handle, int id) { this.handle = handle; Id = id; }
+
+  public bool WaitForExit(int milliseconds) {
+    return WaitForSingleObject(handle, (uint)milliseconds) == 0;
+  }
+
+  public int ExitCode {
+    get { uint code; GetExitCodeProcess(handle, out code); return (int)code; }
   }
 }
 '@
@@ -244,17 +306,35 @@ function Invoke-Rollback([string]$what) {
 
 # --- экземпляры сервиса ----------------------------------------------
 
-function Start-Exe([string[]]$arguments = @()) {
-  $parameters = @{ FilePath = $exe; PassThru = $true; WorkingDirectory = $env:RUNNER_TEMP }
-  if ($arguments) { $parameters.ArgumentList = $arguments }
-  $process = Start-Process @parameters
-  $null = $process.Handle
-  return $process
+# Запуск как при входе пользователя: без консоли. Exe (attach) цепляется
+# к консоли родителя, а у Start-Process родитель — pwsh шага с консолью
+# раннера: exe работал бы «из консоли», и Restart Manager при
+# обновлении закрывал бы его консольным сигналом, который получил бы и
+# процесс раннера. Поэтому родитель exe — cmd без консоли
+# (DETACHED_PROCESS); cmd /c ждёт exe и возвращает его код выхода.
+# Id — PID exe (с -NoPid не ищется: короткий запуск успевает выйти)
+function Start-Exe([string[]]$arguments = @(), [switch]$NoPid) {
+  $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+  $line = "`"$cmd`" /d /c `"`"$exe`"$(($arguments | ForEach-Object { " $_" }) -join '')`""
+  $launcher = [SmokeWindows]::StartDetached($cmd, $line, $env:RUNNER_TEMP)
+  $id = $null
+  if (-not $NoPid) {
+    $filter = "ParentProcessId = $($launcher.Id) AND Name = 'FilePickerAPI.exe'"
+    $id = Wait-Until 15 { (Get-CimInstance Win32_Process -Filter $filter).ProcessId }
+    if (-not $id) { Fail "FilePickerAPI.exe did not start (launcher PID $($launcher.Id))" }
+  }
+  return [pscustomobject]@{ Id = $id; Launcher = $launcher }
 }
 
 function Wait-Exit($process, [int]$seconds, [string]$what) {
+  # Запуск через Start-Exe: код exe возвращает cmd
+  if ($process.Launcher) { $process = $process.Launcher }
   if (-not $process.WaitForExit($seconds * 1000)) { Fail "$what did not exit in $seconds s" }
   return $process.ExitCode
+}
+
+function Test-Running($id) {
+  return [bool]($id -and (Get-Process -Id $id -ErrorAction SilentlyContinue))
 }
 
 # Invoke-Http, Test-Health, Wait-HealthFor и Start-WithClosedInput —
@@ -406,14 +486,14 @@ try {
   # 3. Файл журнала в %LOCALAPPDATA% пользователя
   Step '3. log file'
   Assert-Log $logMark "INFO app.runner: Сервис запущен: версия $AppVersion" 'log file'
-  Assert-Log $logMark "пользователь $user" 'log file'
+  Assert-Log $logMark "пользователь $user, запуск без окна" 'log file'
   Assert-Log $logMark "WARNING app.runner: Не удалось создать директорию с файлами $FilesDirectory" 'log file'
 
   # 4. Второй запуск и аргументы
   Step '4. second instance'
   $mark = Get-EventMark
   $logMark = Get-LogLength
-  $code = Wait-Exit (Start-Exe) 15 'second instance'
+  $code = Wait-Exit (Start-Exe -NoPid) 15 'second instance'
   if ($code -ne 0) { Fail "second instance exited with $code, expected 0" }
   Assert-Log $logMark 'Сервис уже работает в другом процессе' 'second instance'
   $evt = Wait-ServiceEvent $mark 1005 15
@@ -421,7 +501,7 @@ try {
   $events = @(Get-ServiceEvents $mark @(1005, 1002))
   if ($events.Count -ne 1) { Fail "second instance: events $(($events.Id) -join ', '), expected one 1005" }
   Pass 'second instance: exit code 0 and one 1005 with the first PID'
-  $code = Wait-Exit (Start-Exe @('D:\x')) 30 'FilePickerAPI.exe D:\x'
+  $code = Wait-Exit (Start-Exe @('D:\x') -NoPid) 30 'FilePickerAPI.exe D:\x'
   if ($code -ne 2) { Fail "FilePickerAPI.exe D:\x exited with $code, expected 2" }
   Pass 'FilePickerAPI.exe D:\x -> 2'
 
@@ -461,7 +541,7 @@ try {
   $script:portHolder = $null
   # Вторая попытка — через 10 с после первой, третья — ещё через 30
   Wait-Health 30 'port released'
-  if ($busy.HasExited -or (Get-PortOwner) -ne $busy.Id) { Fail 'port released: another process answers' }
+  if (-not (Test-Running $busy.Id) -or (Get-PortOwner) -ne $busy.Id) { Fail 'port released: another process answers' }
   Pass 'port released: the service responds before the third attempt'
   Stop-Instance $busy.Id 'port released'
 
@@ -469,7 +549,7 @@ try {
   Step '8. FILES_DIRECTORY in .env'
   Set-Content $envFile 'FILES_DIRECTORY=D:\x' -Encoding utf8NoBOM
   $mark = Get-EventMark
-  $code = Wait-Exit (Start-Exe) 60 'FILES_DIRECTORY in .env'
+  $code = Wait-Exit (Start-Exe -NoPid) 60 'FILES_DIRECTORY in .env'
   if ($code -ne 1) { Fail "FILES_DIRECTORY in .env: exit code $code, expected 1" }
   $events = @(Get-ServiceEvents $mark @(1000, 1001, 1002))
   if ($events.Count -ne 1 -or $events[0].Id -ne 1002) {
@@ -599,7 +679,7 @@ try {
     }
     Pass 'SYSTEM upgrade (3010): each file matches the first or the second MSI, replacement is pending'
   }
-  if ($old.HasExited -or (Get-PortOwner) -ne $old.Id) { Fail 'SYSTEM upgrade: the old process does not hold the port' }
+  if (-not (Test-Running $old.Id) -or (Get-PortOwner) -ne $old.Id) { Fail 'SYSTEM upgrade: the old process does not hold the port' }
   if (@(Get-ServiceEvents $mark @(1001)).Count) { Fail 'SYSTEM upgrade: the old process wrote 1001' }
   foreach ($path in $paths) {
     $after = Invoke-Http $path
