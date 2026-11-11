@@ -200,8 +200,10 @@ jobs:
           exit 1
         }
         Write-Output "Building version $fullVersion (file version $version)"
-        # Та же версия — у DLL сообщений (следующий шаг)
+        # Та же версия — у DLL сообщений (следующий шаг); полная версия
+        # нужна дымовой проверке MSI (/openapi.json и событие 1000)
         "FILE_VERSION=$version" >> $env:GITHUB_ENV
+        "APP_VERSION=$fullVersion" >> $env:GITHUB_ENV
         # attach: запущенный из cmd или PowerShell exe пишет журнал в эту
         # консоль и останавливается по Ctrl+C, а запущенный при входе,
         # двойным щелчком или run_production.bat работает без окна
@@ -270,6 +272,115 @@ jobs:
       shell: pwsh
       run: ./.github/scripts/startup-smoke.ps1 dist/FilePickerAPI
 
+    # Дымовая проверка MSI (design.md, «Тесты без Windows и проверка на
+    # Windows в CI»), как и проверка выше, — на одном филиале. Две копии
+    # папки сборки вне dist/: как есть и с версией на единицу больше в
+    # ресурсах exe и DLL сообщений (для проверки обновления). Ресурсы
+    # правятся до подписи: правка сделала бы подпись недействительной,
+    # а sign.ps1 на этом останавливается. Версия приложения в app._version
+    # у копии та же, поэтому MSI различаются по SHA-256 и FILEVERSION.
+    # dist/ и артефакт остаются неподписанными: на файлах с одноразовой
+    # подписью боевой sign.ps1 остановил бы релиз
+    - name: Make build copies for MSI smoke test
+      if: strategy.job-index == 0
+      shell: pwsh
+      run: |
+        $version1 = python scripts/msi_version.py $env:APP_VERSION
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        $version2 = python scripts/msi_version.py next $env:APP_VERSION
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        # Проверка сверяет FILEVERSION exe с версией первого MSI
+        if ($version1 -ne $env:FILE_VERSION) {
+          Write-Output "::error::MSI version $version1 differs from file version $env:FILE_VERSION"
+          exit 1
+        }
+        $root = Join-Path $env:RUNNER_TEMP 'msi-smoke'
+        Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory "$root\builds" | Out-Null
+        Copy-Item -Recurse dist/FilePickerAPI "$root\builds\first"
+        Copy-Item -Recurse dist/FilePickerAPI "$root\builds\second"
+        foreach ($file in 'FilePickerAPI.exe', 'FilePickerAPI.messages.dll') {
+          python scripts/set_file_version.py "$root\builds\second\$file" $version2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        }
+        "MSI_SMOKE=$root" >> $env:GITHUB_ENV
+        "MSI_VERSION_1=$version1" >> $env:GITHUB_ENV
+        "MSI_VERSION_2=$version2" >> $env:GITHUB_ENV
+
+    # Одноразовый сертификат, как в sign-smoke: копии подписываются, из
+    # них собираются MSI, MSI подписываются тем же сертификатом. Один шаг,
+    # чтобы ключ не попал в GITHUB_ENV. Второй MSI собирается дважды:
+    # заново собранный (другой ProductCode) поверх второго ставиться не
+    # должен. Сборка MSI — тем же скриптом, что в release.yml
+    - name: Build and sign smoke-test MSI packages
+      if: strategy.job-index == 0
+      shell: pwsh
+      env:
+        TIMESTAMP_URL: http://timestamp.digicert.com
+        BRANCH_NAME: ${{ matrix.name }}
+      run: |
+        $rsa = [System.Security.Cryptography.RSA]::Create(3072)
+        $request = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+          'CN=FilePickerAPI CI MSI smoke test', $rsa, 'SHA256',
+          [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $eku = [System.Security.Cryptography.OidCollection]::new()
+        [void]$eku.Add([System.Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3'))
+        $request.CertificateExtensions.Add(
+          [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($eku, $false))
+        $request.CertificateExtensions.Add(
+          [System.Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new('DigitalSignature', $true))
+        $cert = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddDays(1))
+        $env:CERT_PASSWORD = [guid]::NewGuid().ToString()
+        $env:CERT_PFX_BASE64 = [Convert]::ToBase64String($cert.Export('Pfx', $env:CERT_PASSWORD))
+
+        $builds = "$env:MSI_SMOKE\builds"
+        $packages = "$env:MSI_SMOKE\packages"
+        $name = "FilePickerAPI-$env:BRANCH_NAME.msi"
+        $env:SIGN_PATH = $builds
+        ./.github/scripts/sign.ps1
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        foreach ($package in @(
+            @("$builds\first", $env:MSI_VERSION_1, "$packages\first\$name"),
+            @("$builds\second", $env:MSI_VERSION_2, "$packages\second\$name"),
+            @("$builds\second", $env:MSI_VERSION_2, "$packages\second-rebuilt\$name"))) {
+          ./.github/scripts/build-msi.ps1 -Dist $package[0] -Branch $env:BRANCH_NAME `
+            -Version $package[1] -Output $package[2]
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+        }
+        $env:SIGN_PATH = $packages
+        ./.github/scripts/sign.ps1
+        if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+    - name: MSI smoke test
+      if: strategy.job-index == 0
+      shell: pwsh
+      env:
+        BRANCH_NAME: ${{ matrix.name }}
+        BRANCH_DIRECTORY: ${{ matrix.files_directory }}
+      run: |
+        $builds = "$env:MSI_SMOKE\builds"
+        $packages = "$env:MSI_SMOKE\packages"
+        $name = "FilePickerAPI-$env:BRANCH_NAME.msi"
+        ./.github/scripts/msi-smoke.ps1 `
+          -Msi1 "$packages\first\$name" -Build1 "$builds\first" `
+          -Msi2 "$packages\second\$name" -Build2 "$builds\second" `
+          -Msi2Rebuilt "$packages\second-rebuilt\$name" `
+          -BuildDir dist/FilePickerAPI -FilesDirectory $env:BRANCH_DIRECTORY `
+          -AppVersion $env:APP_VERSION `
+          -FileVersion1 $env:MSI_VERSION_1 -FileVersion2 $env:MSI_VERSION_2 `
+          -LogDir "$env:MSI_SMOKE\logs"
+        exit $LASTEXITCODE
+
+    # Журналы msiexec (/l*v) для разбора падения; копии и MSI сюда не входят
+    - name: Upload MSI smoke test logs
+      if: failure() && strategy.job-index == 0
+      uses: actions/upload-artifact@v7
+      with:
+        name: msi-smoke-logs
+        path: ${{ runner.temp }}/msi-smoke/logs/
+        retention-days: 7
+
+    # После дымовых проверок: в артефакт идёт только проверенная сборка
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
