@@ -482,7 +482,8 @@ try {
     @{ Id = 2004; Level = 3; Text = @("Не удалось создать директорию с файлами $FilesDirectory"); Pattern = $windowsError },
     @{ Id = 2000; Level = 3; Text = @("Папка с файлами $FilesDirectory недоступна", 'Ответ клиенту: 404'); Pattern = $windowsError },
     @{ Id = 1001; Level = 4; Text = @('Сервис остановлен: сообщение WM_CLOSE') },
-    @{ Id = 1002; Level = 2; Text = @('Ошибка настроек, сервис не запущен', 'FILES_DIRECTORY', 'Traceback (most recent call last)') }
+    # FILES_DIRECTORY из .env pydantic называет по полю: files_directory
+    @{ Id = 1002; Level = 2; Text = @('Ошибка настроек, сервис не запущен', 'files_directory', 'extra_forbidden', 'Traceback (most recent call last)') }
   )
   foreach ($check in $checks) {
     $candidates = @($all | Where-Object Id -eq $check.Id)
