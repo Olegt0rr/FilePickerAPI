@@ -9,6 +9,7 @@ import os
 import socket
 import struct
 import sys
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -60,9 +61,11 @@ def clear_libraries():
     """Сбросить кэш загруженных библиотек до и после теста."""
     winapi._iphlpapi.cache_clear()  # noqa: SLF001 - кэш модуля
     winapi._kernel32.cache_clear()  # noqa: SLF001 - кэш модуля
+    winapi._ntdll.cache_clear()  # noqa: SLF001 - кэш модуля
     yield
     winapi._iphlpapi.cache_clear()  # noqa: SLF001 - кэш модуля
     winapi._kernel32.cache_clear()  # noqa: SLF001 - кэш модуля
+    winapi._ntdll.cache_clear()  # noqa: SLF001 - кэш модуля
 
 
 class TestParseTcpTable:
@@ -331,6 +334,50 @@ class TestRegisterApplicationRestart:
             winapi.register_application_restart()
 
 
+@pytest.fixture
+def msvcrt():
+    """Подменить msvcrt: дескриптор Windows — 1000 + номер fd."""
+    module = mock.Mock()
+    module.get_osfhandle.side_effect = lambda fd: 1000 + fd
+    with mock.patch.dict(sys.modules, {"msvcrt": module}):
+        yield module
+
+
+class TestConsole:
+    @pytest.mark.parametrize(
+        ("window", "expected"), [(0, False), (None, False), (0x1234, True)]
+    )
+    def test_has_console_window(self, kernel32, window, expected):
+        kernel32.GetConsoleWindow.return_value = window
+        assert winapi.has_console_window() is expected
+        assert kernel32.GetConsoleWindow.restype is ctypes.c_void_p
+
+    @pytest.mark.parametrize(
+        ("status", "device_type", "null"),
+        [
+            # Не NUL: файл на диске и консоль
+            (0, 0x07, False),
+            (0, 0x50, False),
+            (0, winapi.FILE_DEVICE_NULL, True),
+            # Тип узнать не удалось (STATUS_INVALID_HANDLE): не NUL
+            (-1073741816, winapi.FILE_DEVICE_NULL, False),
+        ],
+    )
+    @pytest.mark.usefixtures("msvcrt")
+    def test_is_null_device(self, kernel32, status, device_type, null):
+        def query(handle, _io_status, info, size, info_class):
+            device = info._obj  # noqa: SLF001 - структура за ctypes.byref
+            assert (handle, info_class) == (1002, 4)
+            assert size == ctypes.sizeof(device)
+            device.device_type = device_type
+            return status
+
+        kernel32.NtQueryVolumeInformationFile.side_effect = query
+        assert winapi.is_null_device(2) is null
+        kernel32.win_dll.assert_called_once_with("ntdll")
+        assert kernel32.NtQueryVolumeInformationFile.restype is ctypes.c_long
+
+
 @windows_only
 class TestWindows:
     def test_listener_pid(self):
@@ -373,3 +420,9 @@ class TestWindows:
         assert result == 0
         assert command_line.value == ""
         assert flags.value == winapi.RESTART_FLAGS
+
+    def test_null_device(self, tmp_path):
+        with Path(os.devnull).open("w", encoding="utf-8") as null:
+            assert winapi.is_null_device(null.fileno()) is True
+        with (tmp_path / "log.txt").open("w", encoding="utf-8") as file:
+            assert winapi.is_null_device(file.fileno()) is False

@@ -20,6 +20,11 @@ RESTART_NO_HANG = 0x2
 RESTART_NO_REBOOT = 0x8
 RESTART_FLAGS = RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT
 
+# NtQueryVolumeInformationFile: класс FileFsDeviceInformation и тип
+# устройства NUL (ntifs.h, devioctl.h)
+_FILE_FS_DEVICE_INFORMATION = 4
+FILE_DEVICE_NULL = 0x15
+
 AF_INET = 2
 AF_INET6 = 23
 # TCP_TABLE_CLASS.TCP_TABLE_OWNER_PID_LISTENER: только слушающие сокеты
@@ -112,7 +117,7 @@ def _iphlpapi() -> ctypes.CDLL:
 
 @functools.cache
 def _kernel32() -> ctypes.CDLL:
-    """Загрузить kernel32, описать сигнатуру RegisterApplicationRestart.
+    """Загрузить kernel32 и описать сигнатуры нужных функций.
 
     Отдельный объект библиотеки, а не _kernel32() из
     app/handlers/files.py: сигнатуры — состояние объекта, и модули не
@@ -121,7 +126,36 @@ def _kernel32() -> ctypes.CDLL:
     kernel32 = ctypes.WinDLL("kernel32")
     kernel32.RegisterApplicationRestart.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32)
     kernel32.RegisterApplicationRestart.restype = ctypes.c_long
+    kernel32.GetConsoleWindow.argtypes = ()
+    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
     return kernel32
+
+
+class _IoStatusBlock(ctypes.Structure):
+    """IO_STATUS_BLOCK: состояние (объединение с указателем) и число."""
+
+    _fields_ = (("status", ctypes.c_void_p), ("information", ctypes.c_size_t))
+
+
+class _DeviceInformation(ctypes.Structure):
+    """FILE_FS_DEVICE_INFORMATION: тип устройства и его свойства."""
+
+    _fields_ = (("device_type", ctypes.c_uint32), ("characteristics", ctypes.c_uint32))
+
+
+@functools.cache
+def _ntdll() -> ctypes.CDLL:
+    """Загрузить ntdll, описать NtQueryVolumeInformationFile."""
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtQueryVolumeInformationFile.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_IoStatusBlock),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_int,
+    )
+    ntdll.NtQueryVolumeInformationFile.restype = ctypes.c_long
+    return ntdll
 
 
 def tcp_listeners() -> list[TcpRow]:
@@ -230,3 +264,38 @@ def register_application_restart() -> None:
     if result:
         msg = f"RegisterApplicationRestart failed: HRESULT 0x{result & 0xFFFFFFFF:08X}"
         raise OSError(None, msg)
+
+
+def has_console_window() -> bool:
+    """Проверить: у процесса есть окно консоли (GetConsoleWindow).
+
+    В сборке Nuitka с --windows-console-mode=attach окно есть, если exe
+    присоединился к консоли родителя: запущен из cmd, PowerShell,
+    Windows Terminal или bat-файла. При входе пользователя и двойным
+    щелчком консоли нет. Консоль, созданная без окна (CREATE_NO_WINDOW),
+    окна тоже не даёт.
+    """
+    return bool(_kernel32().GetConsoleWindow())
+
+
+def is_null_device(fd: int) -> bool:
+    """Проверить: дескриптор ведёт на устройство NUL.
+
+    По типу устройства (FileFsDeviceInformation): у NUL он
+    FILE_DEVICE_NULL, у консоли — FILE_DEVICE_CONSOLE. Запрос не требует
+    прав на чтение, поэтому консоль, открытая только на запись, за NUL
+    не принимается. Если тип узнать не удалось — не NUL: поток лучше
+    оставить, чем потерять вывод.
+    """
+    import msvcrt
+
+    io_status = _IoStatusBlock()
+    info = _DeviceInformation()
+    status = _ntdll().NtQueryVolumeInformationFile(
+        msvcrt.get_osfhandle(fd),
+        ctypes.byref(io_status),
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+        _FILE_FS_DEVICE_INFORMATION,
+    )
+    return status == 0 and info.device_type == FILE_DEVICE_NULL
