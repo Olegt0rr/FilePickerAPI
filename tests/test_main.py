@@ -77,8 +77,7 @@ def fail_for(method, name, error):
     """Вернуть патч метода Path, который падает только для файла name.
 
     name — имя или кортеж имён. Падать на всех путях нельзя: ошибка
-    случилась бы уже на базовой директории (на Python 3.11 resolve()
-    сам вызывает stat()).
+    случилась бы уже на базовой директории.
     """
     original = getattr(Path, method)
     names = {name} if isinstance(name, str) else set(name)
@@ -96,7 +95,7 @@ def fail_stat_for(name, error):
     """Подменить Path.stat и Path.lstat: падают только для name.
 
     lstat() тоже: на Windows атрибуты скачиваемого файла сервис читает
-    через него (на Python 3.12+ lstat() не вызывает stat()).
+    через него (lstat() не вызывает stat()).
     """
     with fail_for("stat", name, error), fail_for("lstat", name, error):
         yield
@@ -201,7 +200,6 @@ class TimedEntry:
             st_mode=real.st_mode,
             st_size=real.st_size,
             st_birthtime=self._timestamp,
-            st_ctime=self._timestamp,
             st_mtime=self._timestamp,
         )
 
@@ -649,18 +647,6 @@ class TestSecurityDirectoryTraversal:
         names = [f["name"] for f in data["availableFiles"] + data["unavailableFiles"]]
         assert "link.txt" not in names
 
-    def test_symlink_loop_skipped_in_listing(self, test_files_dir):
-        """Проверить: петля ссылок на Python 3.11 не роняет список."""
-        symlink_or_skip(Path(test_files_dir) / "loop.txt", "test1.txt")
-        client = TestClient(reload_app(files_directory=test_files_dir))
-
-        error = RuntimeError("Symlink loop from 'loop.txt'")
-        with fail_for("resolve", "loop.txt", error):
-            response = client.get("/files")
-        assert response.status_code == 200
-        names = [f["name"] for f in response.json()["availableFiles"]]
-        assert "loop.txt" not in names
-
     def test_directory_traversal_with_dotdot(self, client):
         """Проверить, что обход директорий с .. предотвращен."""
         response = client.get("/files/../main.py")
@@ -719,8 +705,8 @@ class TestWindowsSymlinks:
 
         # resolve(), stat() или DirEntry.stat() ссылки с переходом — уже
         # переход по ней: AssertionError даст 500.
-        # stat(follow_symlinks=False) — это lstat() (так он устроен на
-        # Python 3.11), ссылку он не раскрывает
+        # stat(follow_symlinks=False) — это lstat(), ссылку он не
+        # раскрывает
         error = AssertionError("symlink must not be followed")
         original_stat = Path.stat
 
@@ -1887,15 +1873,6 @@ class TestExceptionHandling:
         assert response.status_code == 400
         assert response.json()["detail"] == "Invalid filename"
 
-    @resolves_paths
-    def test_download_symlink_loop_on_python_311(self, client):
-        """Проверить RuntimeError из resolve() при петле ссылок."""
-        error = RuntimeError("Symlink loop from 'loop.txt'")
-        with fail_for("resolve", "loop.txt", error):
-            response = client.get("/files/loop.txt")
-        assert response.status_code == 400
-        assert response.json()["detail"] == "Invalid filename"
-
     @pytest.mark.parametrize("file_id", ["..", ".", "../outside.txt"])
     def test_security_rejects_paths_outside_directory(self, test_files_dir, file_id):
         """Проверить отказ для путей, не указывающих на файл директории.
@@ -2098,7 +2075,7 @@ class TestExceptionHandling:
         "error",
         [
             OSError(errno.EIO, "Network error", "/secret/share"),
-            RuntimeError("Symlink loop from '/secret/share'"),
+            OSError(errno.ELOOP, "Too many levels of symbolic links", "/secret/share"),
         ],
     )
     @resolves_paths
@@ -2198,22 +2175,20 @@ class TestCreatedAt:
     """Тесты выбора времени для createdAt."""
 
     @pytest.mark.parametrize(
-        ("platform", "fields", "expected"),
+        ("fields", "expected"),
         [
-            ("linux", {"st_birthtime": 1.0}, 1.0),
-            ("win32", {}, 2.0),
-            ("linux", {}, 3.0),
+            ({"st_birthtime": 1.0}, 1.0),
+            ({}, 3.0),
             # FILETIME 0 (1601 год): fromtimestamp на Windows тут падает
-            ("win32", {"st_ctime": -11644473600.0}, -11644473600.0),
+            ({"st_birthtime": -11644473600.0}, -11644473600.0),
         ],
     )
-    def test_created_at_source(self, platform, fields, expected):
-        """Проверить: birthtime, на Windows ctime, иначе mtime."""
+    def test_created_at_source(self, fields, expected):
+        """Проверить: birthtime, а без него mtime, но не ctime."""
         from app.handlers import files
 
         file_stat = SimpleNamespace(**{"st_ctime": 2.0, "st_mtime": 3.0, **fields})
-        with mock.patch.object(files.sys, "platform", platform):
-            created_at = files.file_created_at(file_stat)
+        created_at = files.file_created_at(file_stat)
         expected_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=expected)
         assert created_at == expected_at
 
@@ -2228,9 +2203,8 @@ class TestCreatedAt:
         """Проверить, что повреждённая метка не роняет список."""
         from app.handlers import files
 
-        file_stat = SimpleNamespace(st_ctime=timestamp, st_mtime=timestamp)
-        with mock.patch.object(files.sys, "platform", "linux"):
-            assert files.file_created_at(file_stat) == expected
+        file_stat = SimpleNamespace(st_mtime=timestamp)
+        assert files.file_created_at(file_stat) == expected
 
     @pytest.mark.parametrize(
         ("timestamp", "expected"),
@@ -2297,6 +2271,21 @@ class TestListingScandir:
         assert response.status_code == 200
         names = [f["name"] for f in response.json()["availableFiles"]]
         assert sorted(names) == ["test1.txt", "test2.txt"]
+
+    @follows_symlinks
+    def test_download_symlink_loop(self, test_files_dir):
+        """Проверить: скачивание петли ссылок — 400 «Invalid filename».
+
+        Нестрогий resolve() петлю не раскрывает и не падает, ошибку
+        ELOOP даёт stat().
+        """
+        loop = Path(test_files_dir) / "loop.txt"
+        symlink_or_skip(loop, loop)
+        client = TestClient(reload_app(files_directory=test_files_dir))
+
+        response = client.get("/files/loop.txt")
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Invalid filename"
 
     def test_list_files_created_at_matches_stat(self, test_files_dir):
         """Проверить: createdAt тот же, что из os.stat() файла."""
@@ -2555,7 +2544,7 @@ class TestFilesDirectoryCache:
         "error",
         [
             OSError(errno.EIO, "Network error", "/secret/share"),
-            RuntimeError("Symlink loop from '/secret/share'"),
+            OSError(errno.ELOOP, "Too many levels of symbolic links", "/secret/share"),
         ],
     )
     def test_refresh_error_is_server_error(self, test_files_dir, error):
