@@ -424,9 +424,8 @@ def _file_errors(file_id: str, directory: Path) -> Iterator[None]:
     """
     try:
         yield
-    except (ValueError, RuntimeError) as e:
-        # ValueError — NUL-байт в имени, RuntimeError — петля
-        # символических ссылок в resolve() на Python 3.11
+    except ValueError as e:
+        # NUL-байт в имени
         raise _invalid_filename() from e
     except OSError as e:
         if _is_invalid_name_error(e):
@@ -458,8 +457,8 @@ _DATETIME_MIN = datetime.min.replace(tzinfo=UTC)
 def file_created_at(file_stat: os.stat_result) -> datetime:
     """Вернуть время создания файла, а без него — время изменения.
 
-    На Windows до Python 3.12 время создания лежит в st_ctime, с 3.12 —
-    в st_birthtime. На Linux время создания недоступно.
+    На Windows время создания лежит в st_birthtime, на Linux оно
+    недоступно.
 
     Для файла в сетевой папке время создания отдаёт файловый сервер:
     это время появления файла на ресурсе (или время, сохранённое при
@@ -467,8 +466,6 @@ def file_created_at(file_stat: os.stat_result) -> datetime:
     """
     if hasattr(file_stat, "st_birthtime"):
         timestamp = file_stat.st_birthtime
-    elif sys.platform == "win32":
-        timestamp = file_stat.st_ctime
     else:
         timestamp = file_stat.st_mtime
     # Не datetime.fromtimestamp: на Windows она падает на времени до
@@ -518,9 +515,6 @@ def _stat_listed_item(
         # отсеивается ниже, а для обычного файла атрибуты те же, что
         # получены при перечислении
         file_stat = entry.stat(follow_symlinks=sys.platform != "win32")
-    except RuntimeError:
-        # Петля ссылок в resolve() на Python 3.11
-        return None, False
     except OSError as e:
         # Как и прежний is_file(), пропускаем битые ссылки, петли
         # ссылок и файлы, удалённые после чтения списка
@@ -712,7 +706,7 @@ def _resolve_files_directory(files_directory: Path, *, refresh: bool = False) ->
             # Папка недоступна: нестрогий resolve(), как и раньше, но
             # без кэша — он может вернуть неразрешённый путь
             return files_directory.resolve()
-    except (OSError, RuntimeError, ValueError) as e:
+    except (OSError, ValueError) as e:
         _real_path_cache.pop(files_directory, None)
         msg = "OS error when reading file"
         event_tracking.directory_error(files_directory, e, 500)

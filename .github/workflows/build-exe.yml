@@ -44,7 +44,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
-        python-version: '3.11'
+        python-version: '3.13'
 
     - name: Read branch list from branches.toml
       id: matrix
@@ -65,7 +65,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
-        python-version: '3.11'
+        python-version: '3.13'
     
     # Кэш pip: wheel-файлы, скачанные и собранные в прошлых запусках.
     # Ключ — набор extras, хэш pyproject.toml и коммит. У джобов с разными
@@ -123,7 +123,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
-        python-version: '3.11'
+        python-version: '3.13'
 
     # Кэш pip, ключ устроен как в джобе test
     - name: Cache pip
@@ -135,7 +135,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip setuptools wheel
+        python -m pip install --upgrade pip
         pip install -e .[dev]
 
     # Отдельный SMB-ресурс этого же раннера для тестов сетевой папки
@@ -188,7 +188,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v7
       with:
-        python-version: '3.11'
+        python-version: '3.13'
     
     # Кэш pip, ключ устроен как в джобе test. Релизная сборка (по тегу)
     # идёт на подпись и, как и без кэша Nuitka ниже, ставит пакеты без
@@ -201,12 +201,11 @@ jobs:
         key: pip-${{ runner.os }}-build-${{ hashFiles('pyproject.toml') }}-${{ github.sha }}
         restore-keys: pip-${{ runner.os }}-build-${{ hashFiles('pyproject.toml') }}-
     
-    # setuptools и wheel обновляем так же, как в audit.yml: иначе в
-    # сборке остался бы setuptools из Python 3.11, а аудит проверял бы
-    # уже обновлённый.
+    # Набор пакетов тот же, что проверяет audit.yml: только pip и
+    # зависимости проекта, без setuptools и wheel.
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip setuptools wheel
+        python -m pip install --upgrade pip
         pip install -e .[build]
 
     - name: Configure files directory for branch ${{ matrix.name }}
@@ -245,8 +244,11 @@ jobs:
         # Один ключ на все филиалы: сборки отличаются только
         # app._build_config, поэтому сохраняет кэш первый завершившийся
         # джоб, а не каждый филиал свою почти одинаковую копию.
-        key: nuitka-${{ runner.os }}-${{ github.sha }}
-        restore-keys: nuitka-${{ runner.os }}-
+        # Версия Python в ключе: объекты, собранные под другую версию,
+        # не подходят и только раздували бы кэш (меняется вместе с
+        # python-version выше).
+        key: nuitka-${{ runner.os }}-py3.13-${{ github.sha }}
+        restore-keys: nuitka-${{ runner.os }}-py3.13-
 
     # CLCACHE_NODIRECT=0 — прямой режим clcache: ключ кэша считается по
     # исходнику и хэшам его include-файлов из манифеста, без препроцессора.
