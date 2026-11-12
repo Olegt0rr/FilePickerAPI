@@ -1,6 +1,6 @@
 # FilePickerAPI
 
-[![Python Version](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Python Version](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![Code Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](https://github.com/Olegt0rr/FilePickerAPI)
 [![Build and Test](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/build-exe.yml/badge.svg)](https://github.com/Olegt0rr/FilePickerAPI/actions/workflows/build-exe.yml)
@@ -428,7 +428,7 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 ### Подпись кода
 
-Бинарники подписываются только при релизе, в отдельном джобе `sign` воркфлоу `release.yml`. Подписываются все `exe`/`dll`/`pyd` сборки сертификатом Authenticode; уже подписанные сторонние файлы (например, `python311.dll`) не трогаются. MSI собирается из уже подписанных файлов в джобе `msi` без сертификата и подписывается тем же скриптом в джобе `sign-msi`. Обычные сборки из push и PR остаются неподписанными (MSI для дымовой проверки подписывается одноразовым сертификатом и в артефакт не попадает).
+Бинарники подписываются только при релизе, в отдельном джобе `sign` воркфлоу `release.yml`. Подписываются все `exe`/`dll`/`pyd` сборки сертификатом Authenticode; уже подписанные сторонние файлы (например, `python313.dll`) не трогаются. MSI собирается из уже подписанных файлов в джобе `msi` без сертификата и подписывается тем же скриптом в джобе `sign-msi`. Обычные сборки из push и PR остаются неподписанными (MSI для дымовой проверки подписывается одноразовым сертификатом и в артефакт не попадает).
 
 Сертификат хранится в секретах GitHub Environment `code-signing` (не в секретах репозитория):
 
@@ -443,7 +443,7 @@ python -m nuitka --mode=standalone --msvc=latest --assume-yes-for-downloads --re
 
 Без секретов в окружении релиз падает: неподписанный релиз не публикуется.
 
-Подпись сама по себе не мешает запустить изменённый файл: она только позволяет это обнаружить. Чтобы подменённый или пропатченный бинарник не запускался, на рабочих местах нужно включить WDAC или AppLocker с правилом «разрешить только файлы, подписанные нашим сертификатом» (через доменную GPO), а пользователи не должны быть локальными администраторами. В политике также нужно разрешить издателей Microsoft и Python Software Foundation: их подписи остаются на `vcruntime*.dll`, `python311.dll` и других сторонних файлах сборки. Если в AppLocker включены правила для Windows Installer, разрешите MSI по издателю (нашему сертификату). Bat-файлы подписать нельзя, поэтому до перевода филиала на MSI при правилах AppLocker для скриптов разрешите `run_*.bat` правилом по пути к папке установки.
+Подпись сама по себе не мешает запустить изменённый файл: она только позволяет это обнаружить. Чтобы подменённый или пропатченный бинарник не запускался, на рабочих местах нужно включить WDAC или AppLocker с правилом «разрешить только файлы, подписанные нашим сертификатом» (через доменную GPO), а пользователи не должны быть локальными администраторами. В политике также нужно разрешить издателей Microsoft и Python Software Foundation: их подписи остаются на `vcruntime*.dll`, `python313.dll` и других сторонних файлах сборки. Если в AppLocker включены правила для Windows Installer, разрешите MSI по издателю (нашему сертификату). Bat-файлы подписать нельзя, поэтому до перевода филиала на MSI при правилах AppLocker для скриптов разрешите `run_*.bat` правилом по пути к папке установки.
 
 ## GitHub Actions
 
