@@ -9,10 +9,10 @@ description = "FastAPI приложение для просмотра списк
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastapi==0.162.0",
+    "fastapi==0.162.7",
     "uvicorn[standard]==0.54.0",
     "pydantic==2.14.3",
-    "pydantic-settings==2.16.2",
+    "pydantic-settings==2.16.3",
     # Транзитивная зависимость FastAPI (он допускает starlette>=0.46):
     # точная версия не даёт оставить уязвимую Starlette < 1.0.1 и
     # позволяет Dependabot видеть её advisory
